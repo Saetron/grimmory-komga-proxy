@@ -967,11 +967,100 @@ def test_japanese_series_collision_disambiguation_and_navigation():
 
         # 7. Self-healing: clear custom_series cache, simulate server restart, fetch series
         grimmory_client.custom_series.clear()
+        grimmory_client.custom_series_books_cache.clear()
         assert id_rakuten not in grimmory_client.custom_series
         s_detail = client.get(f"/api/v1/series/{id_rakuten}", headers=AUTH_HEADER)
         assert s_detail.status_code == 200
         assert s_detail.json()["id"] == id_rakuten
         assert s_detail.json()["name"] == "COMIC快楽天"
+
+
+def test_series_books_pagination_exceeding_20_books():
+    """Verify that series with more than 20 books fetch all pages from Grimmory native API and support Komic pagination seamlessly."""
+    from app.dto_utils import disambiguate_series_dto
+
+    s_penguin = {"id": "25-comic-", "libraryId": "25", "name": "COMICペンギンクラブ", "booksCount": 45}
+    unique_id = disambiguate_series_dto(s_penguin)
+    assert unique_id.startswith("25-u-")
+
+    # Clear custom_series_books_cache to start fresh
+    grimmory_client.custom_series_books_cache.clear()
+
+    # Create 45 books
+    all_45_books = [
+        {"id": 1000 + i, "title": f"COMICペンギンクラブ #{i+1}", "seriesName": "COMICペンギンクラブ", "seriesNumber": float(i+1), "libraryId": 25}
+        for i in range(45)
+    ]
+
+    requested_pages = []
+
+    async def mock_native_get(url, **kwargs):
+        if "COMIC%E3%83%9A%E3%83%B3%E3%82%AE%E3%83%B3%E3%82%AF%E3%83%A9%E3%83%96" in url or "COMICペンギンクラブ" in url:
+            params = kwargs.get("params", {})
+            page = params.get("page", 0)
+            requested_pages.append(page)
+            size = 20  # simulate backend having pageSize=20
+            start = page * size
+            page_slice = all_45_books[start:start + size]
+            return httpx.Response(200, json={
+                "content": page_slice,
+                "totalElements": 45,
+                "totalPages": 3,
+                "number": page,
+                "size": size
+            })
+        return httpx.Response(404)
+
+    mock_client = AsyncMock()
+    mock_client.get = AsyncMock(side_effect=mock_native_get)
+
+    with patch.object(grimmory_client, "get_client", return_value=mock_client), \
+         patch.object(grimmory_client, "get_native_token", new_callable=AsyncMock, return_value="dummy-token"):
+
+        # 1. Komic requests page 0 (size 20)
+        p0 = client.post(
+            "/api/v1/books/list?page=0&size=20&sort=metadata.numberSort,asc",
+            json={"series_id": unique_id},
+            headers=AUTH_HEADER
+        )
+        assert p0.status_code == 200
+        d0 = p0.json()
+        assert d0["totalElements"] == 45
+        assert d0["totalPages"] == 3
+        assert len(d0["content"]) == 20
+        assert d0["content"][0]["id"] == "1000"
+        assert d0["content"][19]["id"] == "1019"
+
+        # 2. Komic requests page 1 (size 20)
+        p1 = client.post(
+            "/api/v1/books/list?page=1&size=20&sort=metadata.numberSort,asc",
+            json={"series_id": unique_id},
+            headers=AUTH_HEADER
+        )
+        assert p1.status_code == 200
+        d1 = p1.json()
+        assert d1["totalElements"] == 45
+        assert len(d1["content"]) == 20
+        assert d1["content"][0]["id"] == "1020"
+        assert d1["content"][19]["id"] == "1039"
+
+        # 3. Komic requests page 2 (remaining 5 books)
+        p2 = client.post(
+            "/api/v1/books/list?page=2&size=20&sort=metadata.numberSort,asc",
+            json={"series_id": unique_id},
+            headers=AUTH_HEADER
+        )
+        assert p2.status_code == 200
+        d2 = p2.json()
+        assert d2["totalElements"] == 45
+        assert len(d2["content"]) == 5
+        assert d2["content"][0]["id"] == "1040"
+        assert d2["content"][4]["id"] == "1044"
+
+        # Verify all pages (0, 1, 2) were fetched from Grimmory native API
+        assert 0 in requested_pages
+        assert 1 in requested_pages
+        assert 2 in requested_pages
 
 
 if __name__ == "__main__":

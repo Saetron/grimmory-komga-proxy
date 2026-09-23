@@ -29,6 +29,7 @@ class GrimmoryClient:
         self._client: Optional[httpx.AsyncClient] = None
         self._client_loop = None
         self.custom_series: Dict[str, Dict[str, Any]] = {}
+        self.custom_series_books_cache: TTLCache = TTLCache(maxsize=1000, ttl=300)
 
     def get_client(self) -> httpx.AsyncClient:
         try:
@@ -804,6 +805,9 @@ class GrimmoryClient:
         pwd: str
     ) -> List[Dict[str, Any]]:
         """Fetch books for a disambiguated non-ASCII series."""
+        if unique_id in self.custom_series_books_cache:
+            return self.custom_series_books_cache[unique_id]
+
         if unique_id not in self.custom_series and "-u-" in unique_id:
             await self.ensure_custom_series_loaded(unique_id, user, pwd)
 
@@ -815,25 +819,49 @@ class GrimmoryClient:
         s_name = info["name"]
         native_headers = await self.get_native_headers(user, pwd)
 
-        # 1. Try native Grimmory /api/v1/app/series/{name}/books
+        # 1. Try native Grimmory /api/v1/app/series/{name}/books (fetching all pages)
         enc = urllib.parse.quote(s_name, safe="")
         try:
-            resp = await self.client.get(f"/api/v1/app/series/{enc}/books", headers=native_headers)
-            if resp.status_code == 200:
+            page_idx = 0
+            all_content = []
+            while True:
+                resp = await self.client.get(
+                    f"/api/v1/app/series/{enc}/books",
+                    params={"size": 500, "page": page_idx},
+                    headers=native_headers
+                )
+                if resp.status_code != 200:
+                    break
                 data = resp.json()
-                content = data.get("content", []) if isinstance(data, dict) else data if isinstance(data, list) else []
-                if content:
-                    filtered = [b for b in content if str(b.get("libraryId", lib_id)) == str(lib_id)]
-                    chosen = filtered if filtered else content
-                    dtos = [raw_app_book_to_dto(b, series_id_override=unique_id) for b in chosen if b.get("id")]
-                    dtos.sort(key=lambda x: x.get("metadata", {}).get("numberSort", 1.0))
-                    return dtos
+                if isinstance(data, list):
+                    all_content.extend(data)
+                    break
+                elif isinstance(data, dict):
+                    page_books = data.get("content", [])
+                    all_content.extend(page_books)
+                    total_pages = data.get("totalPages", 1)
+                    page_idx += 1
+                    if page_idx >= total_pages or not page_books:
+                        break
+                else:
+                    break
+
+            if all_content:
+                filtered = [b for b in all_content if str(b.get("libraryId", lib_id)) == str(lib_id)]
+                chosen = filtered if filtered else all_content
+                dtos = [raw_app_book_to_dto(b, series_id_override=unique_id) for b in chosen if b.get("id")]
+                dtos.sort(key=lambda x: x.get("metadata", {}).get("numberSort", 1.0))
+                self.custom_series_books_cache[unique_id] = dtos
+                if unique_id in self.custom_series:
+                    self.custom_series[unique_id]["dto"]["booksCount"] = len(dtos)
+                    self.custom_series[unique_id]["dto"].setdefault("metadata", {})["totalBookCount"] = len(dtos)
+                return dtos
         except Exception:
             pass
 
         # 2. Try search: /api/v1/app/books/search?q={name}
         try:
-            resp = await self.client.get(f"/api/v1/app/books/search?q={enc}&size=100", headers=native_headers)
+            resp = await self.client.get(f"/api/v1/app/books/search?q={enc}&size=500", headers=native_headers)
             if resp.status_code == 200:
                 data = resp.json()
                 content = data.get("content", []) if isinstance(data, dict) else data if isinstance(data, list) else []
@@ -841,13 +869,17 @@ class GrimmoryClient:
                 if matched:
                     dtos = [raw_app_book_to_dto(b, series_id_override=unique_id) for b in matched if b.get("id")]
                     dtos.sort(key=lambda x: x.get("metadata", {}).get("numberSort", 1.0))
+                    self.custom_series_books_cache[unique_id] = dtos
+                    if unique_id in self.custom_series:
+                        self.custom_series[unique_id]["dto"]["booksCount"] = len(dtos)
+                        self.custom_series[unique_id]["dto"].setdefault("metadata", {})["totalBookCount"] = len(dtos)
                     return dtos
         except Exception:
             pass
 
         # 3. If no books under series, search books in library where title or seriesName matches
         try:
-            resp = await self.client.get(f"/api/v1/app/books?libraryId={lib_id}&size=200", headers=native_headers)
+            resp = await self.client.get(f"/api/v1/app/books?libraryId={lib_id}&size=500", headers=native_headers)
             if resp.status_code == 200:
                 data = resp.json()
                 all_books = data.get("content", []) if isinstance(data, dict) else data if isinstance(data, list) else []
@@ -855,13 +887,17 @@ class GrimmoryClient:
                 if matched:
                     dtos = [raw_app_book_to_dto(b, series_id_override=unique_id) for b in matched if b.get("id")]
                     dtos.sort(key=lambda x: x.get("metadata", {}).get("numberSort", 1.0))
+                    self.custom_series_books_cache[unique_id] = dtos
+                    if unique_id in self.custom_series:
+                        self.custom_series[unique_id]["dto"]["booksCount"] = len(dtos)
+                        self.custom_series[unique_id]["dto"].setdefault("metadata", {})["totalBookCount"] = len(dtos)
                     return dtos
         except Exception:
             pass
 
         # 4. Fallback: filter Grimmory Komga books by seriesTitle == s_name
         try:
-            resp = await self.komga_request("GET", f"/api/v1/books?library_id={lib_id}&size=500", user, pwd)
+            resp = await self.komga_request("GET", f"/api/v1/books?library_id={lib_id}&size=1000", user, pwd)
             if resp.status_code == 200:
                 data = resp.json()
                 all_komga_books = data.get("content", []) if isinstance(data, dict) else []
@@ -871,6 +907,10 @@ class GrimmoryClient:
                         b["seriesId"] = unique_id
                         ensure_book_dto(b)
                     matched.sort(key=lambda x: x.get("metadata", {}).get("numberSort", 1.0))
+                    self.custom_series_books_cache[unique_id] = matched
+                    if unique_id in self.custom_series:
+                        self.custom_series[unique_id]["dto"]["booksCount"] = len(matched)
+                        self.custom_series[unique_id]["dto"].setdefault("metadata", {})["totalBookCount"] = len(matched)
                     return matched
         except Exception:
             pass
