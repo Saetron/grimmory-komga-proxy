@@ -1,0 +1,20 @@
+services:
+  grimmory-komga-bridge:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: ghcr.io/saetron/grimmory-komga-proxy:latest
+    container_name: grimmory-komga-bridge
+    restart: unless-stopped
+    ports:
+      - "8080:8080"
+    environment:
+      # URL to your Grimmory server (without trailing slash)
+      - GRIMMORY_URL=http://your-grimmory-server:8080
+      - PORT=8080
+      - HOST=0.0.0.0
+      - LOG_LEVEL=info
+      - CACHE_TTL=300
+      # Optional: set default credentials if client does not provide basic auth
+      # - GRIMMORY_USERNAME=your_username
+      # - GRIMMORY_PASSWORD=your_password
