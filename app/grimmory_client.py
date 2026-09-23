@@ -148,67 +148,88 @@ class GrimmoryClient:
 
         native_headers = await self.get_native_headers(user, pwd)
 
-        # 1. Try CBX page dimensions & page info
-        dimensions_list: List[Dict[str, Any]] = []
-        info_dict: Dict[int, str] = {}
+        # 1. Try CBX pages list: /api/v1/cbx/{book_id}/pages returns array of page numbers e.g. [1, 2, 3, ...]
+        page_numbers: List[int] = []
         try:
-            dim_resp = await self.client.get(f"/api/v1/cbx/{book_id}/page-dimensions", headers=native_headers)
-            if dim_resp.status_code == 200:
-                dimensions_list = dim_resp.json()
+            pages_resp = await self.client.get(f"/api/v1/cbx/{book_id}/pages", headers=native_headers)
+            if pages_resp.status_code == 200:
+                data = pages_resp.json()
+                if isinstance(data, list) and len(data) > 0:
+                    page_numbers = [int(p) for p in data if str(p).isdigit()]
         except Exception:
             pass
 
+        # 2. Try CBX page dimensions: /api/v1/cbx/{book_id}/page-dimensions
+        dimensions_list: List[Dict[str, Any]] = []
+        try:
+            dim_resp = await self.client.get(f"/api/v1/cbx/{book_id}/page-dimensions", headers=native_headers)
+            if dim_resp.status_code == 200:
+                d = dim_resp.json()
+                if isinstance(d, list):
+                    dimensions_list = d
+        except Exception:
+            pass
+
+        # 3. Try CBX page info: /api/v1/cbx/{book_id}/page-info
+        info_dict: Dict[int, str] = {}
         try:
             info_resp = await self.client.get(f"/api/v1/cbx/{book_id}/page-info", headers=native_headers)
             if info_resp.status_code == 200:
-                for item in info_resp.json():
-                    p_num = item.get("pageNumber")
-                    p_name = item.get("displayName")
-                    if p_num is not None:
-                        info_dict[p_num] = p_name or f"{p_num:03d}"
+                d = info_resp.json()
+                if isinstance(d, list):
+                    for item in d:
+                        if isinstance(item, dict):
+                            p_num = item.get("pageNumber") if item.get("pageNumber") is not None else item.get("page")
+                            p_name = item.get("displayName") or item.get("fileName")
+                            if p_num is not None:
+                                try:
+                                    info_dict[int(p_num)] = p_name or f"{int(p_num):03d}"
+                                except Exception:
+                                    pass
         except Exception:
             pass
 
         pages: List[Dict[str, Any]] = []
-        if dimensions_list:
-            for item in dimensions_list:
-                num = item.get("pageNumber", 1)
+
+        if page_numbers:
+            for idx, p_num in enumerate(page_numbers, start=1):
+                num = p_num if p_num > 0 else idx
+                dim = dimensions_list[idx - 1] if idx - 1 < len(dimensions_list) and isinstance(dimensions_list[idx - 1], dict) else {}
                 file_name = info_dict.get(num, f"{num:03d}")
                 if not any(file_name.lower().endswith(ext) for ext in [".jpg", ".jpeg", ".png", ".webp"]):
                     file_name = f"{file_name}.jpg"
-                
-                page_dto = {
+                pages.append({
                     "number": num,
                     "fileName": file_name,
                     "mediaType": "image/jpeg",
-                    "width": item.get("width", 1080),
-                    "height": item.get("height", 1920),
+                    "width": dim.get("width", 1080),
+                    "height": dim.get("height", 1920),
                     "sizeBytes": 0,
                     "size": "0 B"
-                }
-                pages.append(page_dto)
+                })
+        elif dimensions_list:
+            for idx, dim in enumerate(dimensions_list, start=1):
+                raw_num = dim.get("pageNumber") if isinstance(dim, dict) and dim.get("pageNumber") is not None else dim.get("page") if isinstance(dim, dict) else None
+                try:
+                    num = int(raw_num) if raw_num is not None and int(raw_num) > 0 else idx
+                except Exception:
+                    num = idx
+                width = dim.get("width", 1080) if isinstance(dim, dict) else 1080
+                height = dim.get("height", 1920) if isinstance(dim, dict) else 1920
+                file_name = info_dict.get(num, f"{num:03d}")
+                if not any(file_name.lower().endswith(ext) for ext in [".jpg", ".jpeg", ".png", ".webp"]):
+                    file_name = f"{file_name}.jpg"
+                pages.append({
+                    "number": num,
+                    "fileName": file_name,
+                    "mediaType": "image/jpeg",
+                    "width": width,
+                    "height": height,
+                    "sizeBytes": 0,
+                    "size": "0 B"
+                })
         else:
-            # 2. Try CBX raw pages list (array of ints)
-            try:
-                pages_resp = await self.client.get(f"/api/v1/cbx/{book_id}/pages", headers=native_headers)
-                if pages_resp.status_code == 200:
-                    page_numbers = pages_resp.json()
-                    if isinstance(page_numbers, list) and len(page_numbers) > 0:
-                        for p in page_numbers:
-                            pages.append({
-                                "number": int(p),
-                                "fileName": f"{int(p):03d}.jpg",
-                                "mediaType": "image/jpeg",
-                                "width": 1080,
-                                "height": 1920,
-                                "sizeBytes": 0,
-                                "size": "0 B"
-                            })
-            except Exception:
-                pass
-
-        if not pages:
-            # 3. Try PDF pages
+            # 4. Try PDF pages: /api/v1/pdf/{book_id}/pages
             try:
                 pdf_resp = await self.client.get(f"/api/v1/pdf/{book_id}/pages", headers=native_headers)
                 if pdf_resp.status_code == 200:
@@ -227,8 +248,40 @@ class GrimmoryClient:
             except Exception:
                 pass
 
-        if pages:
-            page_cache[book_id] = pages
+        if not pages:
+            # 5. Try Grimmory Komga layer: /komga/api/v1/books/{book_id}/pages
+            try:
+                komga_resp = await self.komga_request("GET", f"/api/v1/books/{book_id}/pages", user, pwd)
+                if komga_resp.status_code == 200:
+                    k_data = komga_resp.json()
+                    if isinstance(k_data, list) and len(k_data) > 0:
+                        for idx, p in enumerate(k_data, start=1):
+                            num = p.get("number") or idx
+                            pages.append({
+                                "number": num,
+                                "fileName": p.get("fileName") or f"{num:03d}.jpg",
+                                "mediaType": p.get("mediaType", "image/jpeg"),
+                                "width": p.get("width", 1080),
+                                "height": p.get("height", 1920),
+                                "sizeBytes": 0,
+                                "size": "0 B"
+                            })
+            except Exception:
+                pass
+
+        if not pages:
+            # Fallback 1 page
+            pages = [{
+                "number": 1,
+                "fileName": "001.jpg",
+                "mediaType": "image/jpeg",
+                "width": 1080,
+                "height": 1920,
+                "sizeBytes": 0,
+                "size": "0 B"
+            }]
+
+        page_cache[book_id] = pages
         return pages
 
     async def get_book_dto(self, book_id: str, user: str, pwd: str) -> Optional[Dict[str, Any]]:
@@ -460,7 +513,7 @@ class GrimmoryClient:
         native_headers = await self.get_native_headers(user, pwd)
 
         # 1. Try native Grimmory /api/v1/app/series/{name}/books
-        enc = urllib.parse.quote(s_name)
+        enc = urllib.parse.quote(s_name, safe="")
         try:
             resp = await self.client.get(f"/api/v1/app/series/{enc}/books", headers=native_headers)
             if resp.status_code == 200:
@@ -471,7 +524,19 @@ class GrimmoryClient:
         except Exception:
             pass
 
-        # 2. If no books under series, search books in library where title or seriesName matches
+        # 2. Try search: /api/v1/app/books/search?q={name}
+        try:
+            resp = await self.client.get(f"/api/v1/app/books/search?q={enc}&size=50", headers=native_headers)
+            if resp.status_code == 200:
+                data = resp.json()
+                content = data.get("content", []) if isinstance(data, dict) else data if isinstance(data, list) else []
+                matched = [b for b in content if (b.get("title") == s_name or b.get("seriesName") == s_name) and str(b.get("libraryId", lib_id)) == str(lib_id)]
+                if matched:
+                    return [raw_app_book_to_dto(b) for b in matched if b.get("id")]
+        except Exception:
+            pass
+
+        # 3. If no books under series, search books in library where title or seriesName matches
         try:
             resp = await self.client.get(f"/api/v1/app/books?libraryId={lib_id}&size=100", headers=native_headers)
             if resp.status_code == 200:

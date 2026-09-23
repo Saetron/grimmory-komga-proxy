@@ -459,9 +459,10 @@ def test_progression_alias_endpoints():
 def test_series_disambiguation_non_ascii():
     from app.dto_utils import disambiguate_series_dto
 
-    # Normal series ID remains unchanged
+    # Normal series ID remains unchanged and is NOT registered in custom_series
     normal_s = {"id": "16-chainsaw-man", "libraryId": "16", "name": "Chainsaw Man"}
     assert disambiguate_series_dto(normal_s) == "16-chainsaw-man"
+    assert "16-chainsaw-man" not in grimmory_client.custom_series
 
     # Clashing non-ASCII series with empty slug ("16--")
     series_a = {"id": "16--", "libraryId": "16", "name": "たまや大玉"}
@@ -590,6 +591,90 @@ def test_disambiguated_series_integration_mock():
         assert resp_thumb.content == b"fake-image"
         # Ensure it called /api/v1/books/359/thumbnail
         assert mock_komga.call_args[0][1] == "/api/v1/books/359/thumbnail"
+
+
+def test_normal_series_books_routing():
+    """Verify normal series queries Grimmory's /komga/api/v1/series/{id}/books directly."""
+    mock_komga_resp = httpx.Response(200, json={
+        "content": [{"id": "145", "name": "Book 145", "media": {"status": "READY", "pagesCount": 0}}],
+        "totalElements": 1,
+        "totalPages": 1
+    })
+
+    with patch.object(grimmory_client, "komga_request", new_callable=AsyncMock) as mock_komga:
+        mock_komga.return_value = mock_komga_resp
+
+        # POST /api/v1/books/list for normal series
+        resp = client.post(
+            "/api/v1/books/list",
+            json={"seriesId": ["17-blade-runner-2029"]},
+            headers=AUTH_HEADER
+        )
+        assert resp.status_code == 200
+        data = resp.json()
+        assert len(data["content"]) == 1
+        assert data["content"][0]["id"] == "145"
+
+        # Ensure it called Grimmory's /api/v1/series/{id}/books
+        mock_komga.assert_called_once()
+        assert mock_komga.call_args[0][1] == "/api/v1/series/17-blade-runner-2029/books"
+
+
+def test_cbx_page_dimensions_sequential_indexing():
+    """Verify that when page-dimensions has no pageNumber key, pages get sequential 1-based numbers."""
+    dims_data = [
+        {"width": 1080, "height": 1920, "isWide": False},
+        {"width": 1080, "height": 1920, "isWide": False},
+        {"width": 1080, "height": 1920, "isWide": False},
+    ]
+
+    async def mock_get(url, **kwargs):
+        if "page-dimensions" in url:
+            return httpx.Response(200, json=dims_data)
+        elif "page-info" in url:
+            return httpx.Response(200, json=[])
+        elif "pages" in url:
+            return httpx.Response(404)
+        return httpx.Response(404)
+
+    mock_client = AsyncMock()
+    mock_client.get = AsyncMock(side_effect=mock_get)
+
+    with patch.object(grimmory_client, "get_client", return_value=mock_client), \
+         patch.object(grimmory_client, "get_native_token", new_callable=AsyncMock, return_value="dummy-token"):
+
+        resp = client.get("/api/v1/books/book-sequential/pages", headers=AUTH_HEADER)
+        assert resp.status_code == 200
+        pages = resp.json()
+        assert len(pages) == 3
+        # Must be sequential 1, 2, 3 (NOT all 1!)
+        assert pages[0]["number"] == 1
+        assert pages[1]["number"] == 2
+        assert pages[2]["number"] == 3
+
+
+def test_cbx_pages_list_indexing():
+    """Verify that when /api/v1/cbx/{id}/pages returns [1, 2, 3, 4, 5], pages are correctly built."""
+    async def mock_get(url, **kwargs):
+        if "cbx" in url and url.endswith("/pages"):
+            return httpx.Response(200, json=[1, 2, 3, 4, 5])
+        elif "page-dimensions" in url:
+            return httpx.Response(200, json=[])
+        elif "page-info" in url:
+            return httpx.Response(200, json=[])
+        return httpx.Response(404)
+
+    mock_client = AsyncMock()
+    mock_client.get = AsyncMock(side_effect=mock_get)
+
+    with patch.object(grimmory_client, "get_client", return_value=mock_client), \
+         patch.object(grimmory_client, "get_native_token", new_callable=AsyncMock, return_value="dummy-token"):
+
+        resp = client.get("/api/v1/books/book-pages-list/pages", headers=AUTH_HEADER)
+        assert resp.status_code == 200
+        pages = resp.json()
+        assert len(pages) == 5
+        assert [p["number"] for p in pages] == [1, 2, 3, 4, 5]
 
 
 if __name__ == "__main__":

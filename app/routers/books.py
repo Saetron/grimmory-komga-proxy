@@ -31,7 +31,7 @@ async def list_books(
             content = [ensure_book_dto(book)] if book else []
             return ensure_page_dto({"content": content}, default_page=page, default_size=size)
 
-        if "-u-" in series_id or series_id in grimmory_client.custom_series:
+        if "-u-" in series_id:
             books = await grimmory_client.get_series_books_custom(series_id, user, pwd)
             start = page * size
             paged_content = books[start:start + size]
@@ -98,7 +98,7 @@ async def list_books_post(
             content = [ensure_book_dto(book)] if book else []
             return ensure_page_dto({"content": content}, default_page=page, default_size=size)
 
-        if "-u-" in series_id or series_id in grimmory_client.custom_series:
+        if "-u-" in series_id:
             books = await grimmory_client.get_series_books_custom(series_id, user, pwd)
             start = page * size
             paged_content = books[start:start + size]
@@ -245,18 +245,23 @@ async def get_book_page(
             media_type=komga_resp.headers.get("Content-Type", "image/jpeg")
         )
 
-    # Fallback to Grimmory native CBX page image
+    # Fallback to Grimmory native page image endpoints
     native_headers = await grimmory_client.get_native_headers(user, pwd)
-    native_resp = await grimmory_client.client.get(
+    for path in [
+        f"/api/v1/media/book/{book_id}/cbx/pages/{page_number}",
         f"/api/v1/cbx/{book_id}/pages/{page_number}",
-        headers=native_headers
-    )
-    if native_resp.status_code == 200:
-        return StreamingResponse(
-            content=iter([native_resp.content]),
-            status_code=200,
-            media_type=native_resp.headers.get("Content-Type", "image/jpeg")
-        )
+        f"/api/v1/pdf/{book_id}/pages/{page_number}"
+    ]:
+        try:
+            native_resp = await grimmory_client.client.get(path, headers=native_headers)
+            if native_resp.status_code == 200:
+                return StreamingResponse(
+                    content=iter([native_resp.content]),
+                    status_code=200,
+                    media_type=native_resp.headers.get("Content-Type", "image/jpeg")
+                )
+        except Exception:
+            pass
 
     raise HTTPException(status_code=404, detail="Page not found")
 

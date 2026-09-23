@@ -139,7 +139,7 @@ async def get_series(
             })
 
     # Handle custom disambiguated series
-    if series_id in grimmory_client.custom_series:
+    if "-u-" in series_id and series_id in grimmory_client.custom_series:
         return ensure_series_dto(grimmory_client.custom_series[series_id]["dto"])
 
     resp = await grimmory_client.komga_request("GET", f"/api/v1/series/{series_id}", user, pwd)
@@ -177,7 +177,7 @@ async def get_series_books(
         return ensure_page_dto({"content": content}, default_page=page, default_size=size)
 
     # Handle custom disambiguated series
-    if "-u-" in series_id or series_id in grimmory_client.custom_series:
+    if "-u-" in series_id:
         books = await grimmory_client.get_series_books_custom(series_id, user, pwd)
         start = page * size
         paged_content = books[start:start + size]
@@ -218,7 +218,7 @@ async def get_series_thumbnail(
         )
 
     # Handle custom disambiguated series: use first book's thumbnail
-    if "-u-" in series_id or series_id in grimmory_client.custom_series:
+    if "-u-" in series_id:
         books = await grimmory_client.get_series_books_custom(series_id, user, pwd)
         if books:
             first_b_id = str(books[0]["id"])

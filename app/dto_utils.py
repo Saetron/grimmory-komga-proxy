@@ -151,7 +151,11 @@ def ensure_book_dto(book: Dict[str, Any]) -> Dict[str, Any]:
     media.setdefault("status", "READY")
     media.setdefault("mediaType", "application/x-cbz")
     media.setdefault("mediaProfile", "DIVINA")
-    if "pagesCount" not in media or media["pagesCount"] is None or media["pagesCount"] <= 0:
+    b_id = str(book.get("id"))
+    from app.grimmory_client import page_cache
+    if b_id in page_cache and len(page_cache[b_id]) > 0:
+        media["pagesCount"] = len(page_cache[b_id])
+    elif "pagesCount" not in media or media["pagesCount"] is None or media["pagesCount"] <= 0:
         media["pagesCount"] = 1
     media.setdefault("comment", "")
     media.setdefault("epubDivinaCompatible", False)
@@ -335,10 +339,8 @@ def disambiguate_series_dto(s: Dict[str, Any]) -> str:
         from app.grimmory_client import grimmory_client
         grimmory_client.register_custom_series(unique_id, lib_id, s_name, s)
         return unique_id
-    else:
-        from app.grimmory_client import grimmory_client
-        grimmory_client.register_custom_series(s_id, lib_id, s_name, s)
-        return s_id
+
+    return s_id
 
 
 
