@@ -4,7 +4,7 @@ from unittest.mock import AsyncMock, patch
 import httpx
 from fastapi.testclient import TestClient
 from app.main import app
-from app.grimmory_client import grimmory_client, token_cache, page_cache, page_count_cache, book_cache
+from app.grimmory_client import grimmory_client, token_cache, page_cache, page_count_cache, read_progress_cache, book_cache, active_sessions
 
 client = TestClient(app)
 
@@ -17,7 +17,9 @@ def clear_caches():
     token_cache.clear()
     page_cache.clear()
     page_count_cache.clear()
+    read_progress_cache.clear()
     book_cache.clear()
+    active_sessions.clear()
     grimmory_client.custom_series.clear()
 
 
@@ -741,6 +743,112 @@ def test_cbx_pages_list_indexing():
         pages = resp.json()
         assert len(pages) == 5
         assert [p["number"] for p in pages] == [1, 2, 3, 4, 5]
+
+
+def test_book_next_and_previous_in_series():
+    """Verify GET /api/v1/books/{id}/next and /previous navigate within series."""
+    series_books = [
+        {"id": "book-vol-1", "seriesId": "series-123", "number": 1, "metadata": {"numberSort": 1.0}},
+        {"id": "book-vol-2", "seriesId": "series-123", "number": 2, "metadata": {"numberSort": 2.0}},
+        {"id": "book-vol-3", "seriesId": "series-123", "number": 3, "metadata": {"numberSort": 3.0}},
+    ]
+
+    async def mock_komga(method, path, user, pwd, **kwargs):
+        if path == "/api/v1/books/book-vol-2":
+            return httpx.Response(200, json=series_books[1])
+        elif path == "/api/v1/books/book-vol-1":
+            return httpx.Response(200, json=series_books[0])
+        elif path == "/api/v1/books/book-vol-3":
+            return httpx.Response(200, json=series_books[2])
+        elif path == "/api/v1/series/series-123/books":
+            return httpx.Response(200, json={"content": series_books, "totalElements": 3})
+        elif "/next" in path or "/previous" in path:
+            return httpx.Response(404) # Grimmory returns 404
+        return httpx.Response(404)
+
+    mock_client = AsyncMock()
+    mock_client.get = AsyncMock(return_value=httpx.Response(404))
+
+    with patch.object(grimmory_client, "komga_request", side_effect=mock_komga), \
+         patch.object(grimmory_client, "get_client", return_value=mock_client), \
+         patch.object(grimmory_client, "get_native_token", new_callable=AsyncMock, return_value="dummy-token"):
+
+        # 1. From book 2, next should be book 3
+        resp_next = client.get("/api/v1/books/book-vol-2/next", headers=AUTH_HEADER)
+        assert resp_next.status_code == 200
+        assert resp_next.json()["id"] == "book-vol-3"
+
+        # 2. From book 2, previous should be book 1
+        resp_prev = client.get("/api/v1/books/book-vol-2/previous", headers=AUTH_HEADER)
+        assert resp_prev.status_code == 200
+        assert resp_prev.json()["id"] == "book-vol-1"
+
+        # 3. From book 3 (last), next should be 404
+        resp_last_next = client.get("/api/v1/books/book-vol-3/next", headers=AUTH_HEADER)
+        assert resp_last_next.status_code == 404
+
+        # 4. From book 1 (first), previous should be 404
+        resp_first_prev = client.get("/api/v1/books/book-vol-1/previous", headers=AUTH_HEADER)
+        assert resp_first_prev.status_code == 404
+
+
+def test_read_sync_auto_completion_and_session_tracking():
+    """Verify progress auto-completion on final page, percentage calc, and session logging."""
+    page_count_cache["book-test-sync"] = 20
+
+    put_payloads = []
+    session_payloads = []
+
+    async def mock_put(url, **kwargs):
+        if "/progress" in url:
+            put_payloads.append(kwargs.get("json"))
+            return httpx.Response(200)
+        return httpx.Response(404)
+
+    async def mock_post(url, **kwargs):
+        if "reading-sessions" in url:
+            session_payloads.append(kwargs.get("json"))
+            return httpx.Response(200)
+        return httpx.Response(404)
+
+    mock_client = AsyncMock()
+    mock_client.put = AsyncMock(side_effect=mock_put)
+    mock_client.post = AsyncMock(side_effect=mock_post)
+
+    with patch.object(grimmory_client, "get_client", return_value=mock_client), \
+         patch.object(grimmory_client, "get_native_token", new_callable=AsyncMock, return_value="dummy-token"):
+
+        # 1. Reading page 10 of 20: 50%, completed = False
+        resp = client.patch(
+            "/api/v1/books/book-test-sync/read-progress",
+            json={"page": 10, "completed": False},
+            headers=AUTH_HEADER
+        )
+        assert resp.status_code == 204
+        assert len(put_payloads) == 1
+        assert put_payloads[0]["cbxProgress"]["percentage"] == 50
+        assert put_payloads[0]["dateFinished"] is None
+
+        # Cache check
+        cached = read_progress_cache["book-test-sync"]
+        assert cached["page"] == 10
+        assert cached["completed"] is False
+
+        # 2. Reading page 20 of 20: auto-completes to 100% and dateFinished set
+        resp2 = client.patch(
+            "/api/v1/books/book-test-sync/read-progress",
+            json={"page": 20, "completed": False},
+            headers=AUTH_HEADER
+        )
+        assert resp2.status_code == 204
+        assert len(put_payloads) == 2
+        assert put_payloads[1]["cbxProgress"]["percentage"] == 100
+        assert put_payloads[1]["dateFinished"] is not None
+
+        # Cache check
+        cached2 = read_progress_cache["book-test-sync"]
+        assert cached2["page"] == 20
+        assert cached2["completed"] is True
 
 
 if __name__ == "__main__":

@@ -15,8 +15,12 @@ token_cache: TTLCache = TTLCache(maxsize=100, ttl=3600)
 page_cache: TTLCache = TTLCache(maxsize=5000, ttl=3600)
 # Cache page count per book (24 hour TTL)
 page_count_cache: TTLCache = TTLCache(maxsize=10000, ttl=86400)
+# Cache read progress per book (5 min TTL)
+read_progress_cache: TTLCache = TTLCache(maxsize=10000, ttl=300)
 # Cache book DTOs (5 min TTL)
 book_cache: TTLCache = TTLCache(maxsize=5000, ttl=300)
+# Active reading sessions: session_key -> dict
+active_sessions: Dict[str, Dict[str, Any]] = {}
 
 
 class GrimmoryClient:
@@ -349,7 +353,7 @@ class GrimmoryClient:
         return 1
 
     async def enrich_books_page_count(self, books: List[Dict[str, Any]], user: str, pwd: str) -> None:
-        """Concurrently populate accurate pagesCount for a list of book DTOs."""
+        """Concurrently populate accurate pagesCount and readProgress for a list of book DTOs."""
         if not books:
             return
 
@@ -362,6 +366,14 @@ class GrimmoryClient:
                 book["media"] = {"status": "READY", "mediaType": "application/x-cbz", "mediaProfile": "DIVINA"}
             if count > 0:
                 book["media"]["pagesCount"] = count
+
+            # Attach read progress if missing or null
+            if "readProgress" not in book or book.get("readProgress") is None:
+                progress = await self.get_read_progress(book_id, user, pwd)
+                if progress:
+                    book["readProgress"] = progress
+                else:
+                    book["readProgress"] = None
 
         await asyncio.gather(*[_enrich_one(b) for b in books], return_exceptions=True)
 
@@ -391,37 +403,59 @@ class GrimmoryClient:
                 book["media"] = {"status": "READY", "mediaType": "application/x-cbz", "mediaProfile": "DIVINA"}
             book["media"]["pagesCount"] = page_count_cache[book_id]
 
-        # Check and attach readProgress if fetched or in cache
-        if "readProgress" not in book and (fetch_dimensions or book_id in book_cache):
+        # Check and attach readProgress if missing or None
+        if "readProgress" not in book or book.get("readProgress") is None:
             progress = await self.get_read_progress(book_id, user, pwd)
             if progress:
                 book["readProgress"] = progress
+            else:
+                book["readProgress"] = None
 
         ensure_book_dto(book)
 
     async def get_read_progress(self, book_id: str, user: str, pwd: str) -> Optional[Dict[str, Any]]:
         """Fetch read progress from Grimmory native API and format as Komga ReadProgressDto."""
+        if book_id in read_progress_cache:
+            return read_progress_cache[book_id]
+
         native_headers = await self.get_native_headers(user, pwd)
         try:
             resp = await self.client.get(f"/api/v1/app/books/{book_id}/progress", headers=native_headers)
             if resp.status_code == 200:
                 data = resp.json()
-                if not data:
+                if not data or not isinstance(data, dict):
+                    read_progress_cache[book_id] = None
                     return None
                 
                 page = 1
                 completed = False
-                if "cbxProgress" in data and data["cbxProgress"]:
+                pct = 0
+                if "cbxProgress" in data and isinstance(data["cbxProgress"], dict):
                     page = data["cbxProgress"].get("page", 1)
-                elif "pdfProgress" in data and data["pdfProgress"]:
+                    pct = data["cbxProgress"].get("percentage", 0)
+                elif "pdfProgress" in data and isinstance(data["pdfProgress"], dict):
                     page = data["pdfProgress"].get("page", 1)
+                    pct = data["pdfProgress"].get("percentage", 0)
+                elif "epubProgress" in data and isinstance(data["epubProgress"], dict):
+                    page = data["epubProgress"].get("page", 1)
+                    pct = data["epubProgress"].get("percentage", 0)
 
                 date_finished = data.get("dateFinished")
-                if date_finished:
+                if date_finished or data.get("completed") or data.get("isRead") or pct == 100:
                     completed = True
 
+                # Check if total pages is known and page >= total pages
+                if book_id in page_count_cache and page_count_cache[book_id] > 1:
+                    if page >= page_count_cache[book_id]:
+                        completed = True
+
+                # If book has never been opened or started (page 1, 0%, not finished, not valid)
+                if not completed and pct == 0 and page <= 1 and (date_finished is None) and data.get("progressValid") is False:
+                    read_progress_cache[book_id] = None
+                    return None
+
                 now_iso = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
-                return {
+                progress_dto = {
                     "page": page,
                     "completed": completed,
                     "readDate": date_finished or now_iso,
@@ -430,38 +464,156 @@ class GrimmoryClient:
                     "deviceId": "komic",
                     "deviceName": "Komic"
                 }
+                read_progress_cache[book_id] = progress_dto
+                return progress_dto
         except Exception:
             pass
+
+        read_progress_cache[book_id] = None
         return None
 
-    async def update_read_progress(self, book_id: str, page: int, completed: bool, user: str, pwd: str) -> bool:
-        """Update read progress in Grimmory."""
+    async def record_reading_session(
+        self,
+        book_id: str,
+        user: str,
+        pwd: str,
+        start_iso: str,
+        end_iso: str,
+        duration: int,
+        start_page: int,
+        end_page: int
+    ) -> None:
+        """Report reading session to Grimmory."""
         native_headers = await self.get_native_headers(user, pwd)
-        now_iso = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+        b_id = int(book_id) if str(book_id).isdigit() else book_id
+        session_payload = {
+            "bookId": b_id,
+            "startTime": start_iso,
+            "endTime": end_iso,
+            "durationSeconds": duration,
+            "startPage": start_page,
+            "endPage": end_page,
+            "device": "Komic"
+        }
+        for ep in ["/api/v1/reading-sessions", "/api/v1/app/reading-sessions"]:
+            try:
+                resp = await self.client.post(ep, json=session_payload, headers=native_headers)
+                if resp.status_code in [200, 201, 204]:
+                    break
+            except Exception:
+                pass
+
+    async def update_read_progress(self, book_id: str, page: int, completed: bool, user: str, pwd: str) -> bool:
+        """Update read progress in Grimmory and record reading session."""
+        native_headers = await self.get_native_headers(user, pwd)
+        now_time = time.time()
+        now_iso = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now_time))
+
+        total_pages = await self.get_book_page_count(book_id, user, pwd)
+
+        is_completed = completed or (total_pages > 1 and page >= total_pages)
+        if is_completed:
+            percentage = 100
+            date_finished = now_iso
+        else:
+            percentage = max(1, min(99, round((page / total_pages) * 100))) if total_pages > 1 else (100 if completed else 0)
+            date_finished = None
+
+        # Update cache immediately so next read is instant
+        progress_dto = {
+            "page": page,
+            "completed": is_completed,
+            "readDate": date_finished or now_iso,
+            "created": now_iso,
+            "lastModified": now_iso,
+            "deviceId": "komic",
+            "deviceName": "Komic"
+        }
+        read_progress_cache[book_id] = progress_dto
+        if book_id in book_cache:
+            book_cache[book_id]["readProgress"] = progress_dto
+
+        # Reading session tracking
+        session_key = f"{user}:{book_id}"
+        prev_session = active_sessions.get(session_key)
+        start_page = page
+        start_iso = now_iso
+        duration = 10 # default minimum session duration
+
+        if prev_session and (now_time - prev_session["last_update"]) < 1800:
+            start_page = prev_session["start_page"]
+            start_iso = prev_session["start_iso"]
+            duration = max(1, int(now_time - prev_session["start_time"]))
+            prev_session["last_page"] = page
+            prev_session["last_update"] = now_time
+        else:
+            active_sessions[session_key] = {
+                "start_time": now_time,
+                "start_iso": now_iso,
+                "start_page": page,
+                "last_page": page,
+                "last_update": now_time
+            }
+
+        # 1. Update native Grimmory progress
         payload = {
             "cbxProgress": {
                 "page": page,
-                "percentage": 100 if completed else 0
+                "percentage": percentage
             },
             "pdfProgress": {
                 "page": page,
-                "percentage": 100 if completed else 0
+                "percentage": percentage
             },
-            "dateFinished": now_iso if completed else None,
+            "epubProgress": {
+                "page": page,
+                "percentage": percentage
+            },
+            "dateFinished": date_finished,
             "progressValid": True
         }
+
+        success = False
         try:
             resp = await self.client.put(
                 f"/api/v1/app/books/{book_id}/progress",
                 json=payload,
                 headers=native_headers
             )
-            return resp.status_code in [200, 204]
+            success = resp.status_code in [200, 204]
         except Exception:
-            return False
+            pass
+
+        # 2. Record reading session to Grimmory (non-blocking)
+        try:
+            asyncio.create_task(
+                self.record_reading_session(
+                    book_id=book_id,
+                    user=user,
+                    pwd=pwd,
+                    start_iso=start_iso,
+                    end_iso=now_iso,
+                    duration=duration,
+                    start_page=start_page,
+                    end_page=page
+                )
+            )
+        except Exception:
+            pass
+
+        # 3. If completed, clear session
+        if is_completed:
+            active_sessions.pop(session_key, None)
+
+        return success
 
     async def reset_read_progress(self, book_id: str, user: str, pwd: str) -> bool:
         """Reset progress in Grimmory."""
+        read_progress_cache.pop(book_id, None)
+        active_sessions.pop(f"{user}:{book_id}", None)
+        if book_id in book_cache:
+            book_cache[book_id]["readProgress"] = None
+
         native_headers = await self.get_native_headers(user, pwd)
         try:
             resp = await self.client.post(
@@ -472,6 +624,58 @@ class GrimmoryClient:
             return resp.status_code in [200, 204]
         except Exception:
             return False
+
+    async def get_adjacent_book(
+        self,
+        book_id: str,
+        direction: str,
+        user: str,
+        pwd: str
+    ) -> Optional[Dict[str, Any]]:
+        """Find the previous or next book in the series for book_id."""
+        current_book = await self.get_book_dto(book_id, user, pwd)
+        if not current_book:
+            return None
+
+        series_id = current_book.get("seriesId")
+        if not series_id or "-standalone-" in series_id:
+            return None
+
+        if "-u-" in series_id:
+            books = await self.get_series_books_custom(series_id, user, pwd)
+        else:
+            resp = await self.komga_request("GET", f"/api/v1/series/{series_id}/books", user, pwd, params={"size": 1000})
+            if resp.status_code != 200:
+                return None
+            data = resp.json()
+            books = data.get("content", []) if isinstance(data, dict) else data if isinstance(data, list) else []
+
+        if not books:
+            return None
+
+        def _sort_key(b):
+            meta = b.get("metadata") or {}
+            num = meta.get("numberSort")
+            if num is None:
+                try:
+                    num = float(b.get("number", 0))
+                except Exception:
+                    num = 0.0
+            return (float(num), str(b.get("id")))
+
+        books.sort(key=_sort_key)
+
+        curr_idx = next((i for i, b in enumerate(books) if str(b.get("id")) == str(book_id)), None)
+        if curr_idx is None:
+            return None
+
+        target_idx = curr_idx - 1 if direction == "previous" else curr_idx + 1
+        if 0 <= target_idx < len(books):
+            target_book = books[target_idx]
+            await self.enrich_book(target_book, user, pwd, fetch_dimensions=True)
+            return target_book
+
+        return None
 
     async def get_ondeck_books(
         self,

@@ -203,6 +203,48 @@ async def get_book(
     return ensure_book_dto(book)
 
 
+@router.get("/{book_id}/previous")
+async def get_book_previous(
+    book_id: str,
+    authorization: Optional[str] = Header(None)
+) -> Dict[str, Any]:
+    user, pwd = grimmory_client.extract_credentials(authorization)
+    try:
+        resp = await grimmory_client.komga_request("GET", f"/api/v1/books/{book_id}/previous", user, pwd)
+        if resp.status_code == 200:
+            book = resp.json()
+            await grimmory_client.enrich_book(book, user, pwd, fetch_dimensions=True)
+            return ensure_book_dto(book)
+    except Exception:
+        pass
+
+    book = await grimmory_client.get_adjacent_book(book_id, direction="previous", user=user, pwd=pwd)
+    if not book:
+        raise HTTPException(status_code=404, detail="No previous book")
+    return ensure_book_dto(book)
+
+
+@router.get("/{book_id}/next")
+async def get_book_next(
+    book_id: str,
+    authorization: Optional[str] = Header(None)
+) -> Dict[str, Any]:
+    user, pwd = grimmory_client.extract_credentials(authorization)
+    try:
+        resp = await grimmory_client.komga_request("GET", f"/api/v1/books/{book_id}/next", user, pwd)
+        if resp.status_code == 200:
+            book = resp.json()
+            await grimmory_client.enrich_book(book, user, pwd, fetch_dimensions=True)
+            return ensure_book_dto(book)
+    except Exception:
+        pass
+
+    book = await grimmory_client.get_adjacent_book(book_id, direction="next", user=user, pwd=pwd)
+    if not book:
+        raise HTTPException(status_code=404, detail="No next book")
+    return ensure_book_dto(book)
+
+
 @router.get("/{book_id}/thumbnail")
 async def get_book_thumbnail(
     book_id: str,
