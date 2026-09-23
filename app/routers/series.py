@@ -1,7 +1,7 @@
 from fastapi import APIRouter, Header, Request, Response, HTTPException, status
 from typing import Optional, Dict, Any, List
 from app.grimmory_client import grimmory_client
-from app.dto_utils import ensure_page_dto, ensure_series_dto, ensure_book_dto, extract_search_filters
+from app.dto_utils import ensure_page_dto, ensure_series_dto, ensure_book_dto, extract_search_filters, disambiguate_series_dto
 
 router = APIRouter(prefix="/api/v1/series", tags=["Series"])
 
@@ -25,6 +25,7 @@ async def list_series(
     data = resp.json()
     if "content" in data and isinstance(data["content"], list):
         for s in data["content"]:
+            disambiguate_series_dto(s)
             ensure_series_dto(s)
     return ensure_page_dto(data, default_page=page, default_size=size)
 
@@ -62,10 +63,12 @@ async def list_series_post(
         data = resp.json()
         if "content" in data and isinstance(data["content"], list):
             for s in data["content"]:
+                disambiguate_series_dto(s)
                 ensure_series_dto(s)
         return ensure_page_dto(data, default_page=page, default_size=size)
 
     return ensure_page_dto({"content": []}, default_page=page, default_size=size)
+
 
 
 @router.get("/latest")
@@ -91,6 +94,7 @@ async def list_series_special(
         data = resp.json()
         if "content" in data and isinstance(data["content"], list):
             for s in data["content"]:
+                disambiguate_series_dto(s)
                 ensure_series_dto(s)
         return ensure_page_dto(data, default_page=page, default_size=size)
     return ensure_page_dto({"content": []}, default_page=page, default_size=size)
@@ -134,10 +138,16 @@ async def get_series(
                 "oneshot": True
             })
 
+    # Handle custom disambiguated series
+    if series_id in grimmory_client.custom_series:
+        return ensure_series_dto(grimmory_client.custom_series[series_id]["dto"])
+
     resp = await grimmory_client.komga_request("GET", f"/api/v1/series/{series_id}", user, pwd)
     if resp.status_code != 200:
         raise HTTPException(status_code=resp.status_code, detail="Series not found")
-    return ensure_series_dto(resp.json())
+    data = resp.json()
+    disambiguate_series_dto(data)
+    return ensure_series_dto(data)
 
 
 @router.get("/{series_id}/collections")
@@ -166,6 +176,20 @@ async def get_series_books(
         content = [ensure_book_dto(book)] if book else []
         return ensure_page_dto({"content": content}, default_page=page, default_size=size)
 
+    # Handle custom disambiguated series
+    if "-u-" in series_id or series_id in grimmory_client.custom_series:
+        books = await grimmory_client.get_series_books_custom(series_id, user, pwd)
+        start = page * size
+        paged_content = books[start:start + size]
+        for b in paged_content:
+            ensure_book_dto(b)
+        return ensure_page_dto({
+            "content": paged_content,
+            "totalElements": len(books),
+            "number": page,
+            "size": size
+        }, default_page=page, default_size=size)
+
     resp = await grimmory_client.komga_request("GET", f"/api/v1/series/{series_id}/books", user, pwd, params=params)
     if resp.status_code != 200:
         raise HTTPException(status_code=resp.status_code, detail="Failed to fetch books for series")
@@ -193,9 +217,23 @@ async def get_series_thumbnail(
             headers={"Content-Type": resp.headers.get("Content-Type", "image/jpeg")}
         )
 
+    # Handle custom disambiguated series: use first book's thumbnail
+    if "-u-" in series_id or series_id in grimmory_client.custom_series:
+        books = await grimmory_client.get_series_books_custom(series_id, user, pwd)
+        if books:
+            first_b_id = str(books[0]["id"])
+            resp = await grimmory_client.komga_request("GET", f"/api/v1/books/{first_b_id}/thumbnail", user, pwd)
+            if resp.status_code == 200:
+                return Response(
+                    content=resp.content,
+                    status_code=200,
+                    headers={"Content-Type": resp.headers.get("Content-Type", "image/jpeg")}
+                )
+
     resp = await grimmory_client.komga_request("GET", f"/api/v1/series/{series_id}/thumbnail", user, pwd)
     return Response(
         content=resp.content,
         status_code=resp.status_code,
         headers={"Content-Type": resp.headers.get("Content-Type", "image/jpeg")}
     )
+

@@ -31,6 +31,19 @@ async def list_books(
             content = [ensure_book_dto(book)] if book else []
             return ensure_page_dto({"content": content}, default_page=page, default_size=size)
 
+        if "-u-" in series_id or series_id in grimmory_client.custom_series:
+            books = await grimmory_client.get_series_books_custom(series_id, user, pwd)
+            start = page * size
+            paged_content = books[start:start + size]
+            for b in paged_content:
+                ensure_book_dto(b)
+            return ensure_page_dto({
+                "content": paged_content,
+                "totalElements": len(books),
+                "number": page,
+                "size": size
+            }, default_page=page, default_size=size)
+
         resp = await grimmory_client.komga_request("GET", f"/api/v1/series/{series_id}/books", user, pwd, params=params)
         if resp.status_code == 200:
             data = resp.json()
@@ -85,6 +98,19 @@ async def list_books_post(
             content = [ensure_book_dto(book)] if book else []
             return ensure_page_dto({"content": content}, default_page=page, default_size=size)
 
+        if "-u-" in series_id or series_id in grimmory_client.custom_series:
+            books = await grimmory_client.get_series_books_custom(series_id, user, pwd)
+            start = page * size
+            paged_content = books[start:start + size]
+            for b in paged_content:
+                ensure_book_dto(b)
+            return ensure_page_dto({
+                "content": paged_content,
+                "totalElements": len(books),
+                "number": page,
+                "size": size
+            }, default_page=page, default_size=size)
+
         # Grimmory ONLY returns books for a series via /series/{id}/books
         params.pop("series_id", None)
         params.pop("seriesId", None)
@@ -96,6 +122,7 @@ async def list_books_post(
                     ensure_book_dto(b)
             return ensure_page_dto(data, default_page=page, default_size=size)
         return ensure_page_dto({"content": []}, default_page=page, default_size=size)
+
 
     # Extract library filter
     if "library_id" in filters:

@@ -1,6 +1,7 @@
 import base64
 import time
 import httpx
+import urllib.parse
 from typing import Optional, Dict, Any, List, Tuple
 from cachetools import TTLCache
 from app.config import settings
@@ -21,6 +22,7 @@ class GrimmoryClient:
         self.base_url = settings.GRIMMORY_URL
         self._client: Optional[httpx.AsyncClient] = None
         self._client_loop = None
+        self.custom_series: Dict[str, Dict[str, Any]] = {}
 
     def get_client(self) -> httpx.AsyncClient:
         try:
@@ -421,4 +423,67 @@ class GrimmoryClient:
 
         return ensure_page_dto({"content": []}, default_page=page, default_size=size)
 
+    def register_custom_series(self, unique_id: str, lib_id: str, name: str, dto: Dict[str, Any]) -> None:
+        """Register a disambiguated series mapping."""
+        self.custom_series[unique_id] = {
+            "lib_id": str(lib_id),
+            "name": name,
+            "dto": dto
+        }
+
+    async def get_series_books_custom(
+        self,
+        unique_id: str,
+        user: str,
+        pwd: str
+    ) -> List[Dict[str, Any]]:
+        """Fetch books for a disambiguated non-ASCII series."""
+        info = self.custom_series.get(unique_id)
+        if not info and "-u-" in unique_id:
+            # Self-healing: if server restarted, fetch library series to populate custom_series
+            lib_id = unique_id.split("-u-")[0]
+            try:
+                from app.dto_utils import disambiguate_series_dto
+                resp = await self.komga_request("GET", f"/api/v1/series?library_id={lib_id}&size=100", user, pwd)
+                if resp.status_code == 200:
+                    for s in resp.json().get("content", []):
+                        disambiguate_series_dto(s)
+            except Exception:
+                pass
+            info = self.custom_series.get(unique_id)
+
+        if not info:
+            return []
+
+        lib_id = info["lib_id"]
+        s_name = info["name"]
+        native_headers = await self.get_native_headers(user, pwd)
+
+        # 1. Try native Grimmory /api/v1/app/series/{name}/books
+        enc = urllib.parse.quote(s_name)
+        try:
+            resp = await self.client.get(f"/api/v1/app/series/{enc}/books", headers=native_headers)
+            if resp.status_code == 200:
+                data = resp.json()
+                content = data.get("content", []) if isinstance(data, dict) else data if isinstance(data, list) else []
+                if content:
+                    return [raw_app_book_to_dto(b) for b in content if b.get("id")]
+        except Exception:
+            pass
+
+        # 2. If no books under series, search books in library where title or seriesName matches
+        try:
+            resp = await self.client.get(f"/api/v1/app/books?libraryId={lib_id}&size=100", headers=native_headers)
+            if resp.status_code == 200:
+                data = resp.json()
+                all_books = data.get("content", []) if isinstance(data, dict) else data if isinstance(data, list) else []
+                matched = [b for b in all_books if b.get("title") == s_name or b.get("seriesName") == s_name]
+                if matched:
+                    return [raw_app_book_to_dto(b) for b in matched if b.get("id")]
+        except Exception:
+            pass
+
+        return []
+
 grimmory_client = GrimmoryClient()
+

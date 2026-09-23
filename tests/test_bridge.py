@@ -17,6 +17,7 @@ def clear_caches():
     token_cache.clear()
     page_cache.clear()
     book_cache.clear()
+    grimmory_client.custom_series.clear()
 
 
 # ============================================================================
@@ -453,6 +454,142 @@ def test_progression_alias_endpoints():
         r_get = client.get("/api/v1/books/book-200/progression", headers=AUTH_HEADER)
         assert r_get.status_code == 200
         assert r_get.json()["page"] == 3
+
+
+def test_series_disambiguation_non_ascii():
+    from app.dto_utils import disambiguate_series_dto
+
+    # Normal series ID remains unchanged
+    normal_s = {"id": "16-chainsaw-man", "libraryId": "16", "name": "Chainsaw Man"}
+    assert disambiguate_series_dto(normal_s) == "16-chainsaw-man"
+
+    # Clashing non-ASCII series with empty slug ("16--")
+    series_a = {"id": "16--", "libraryId": "16", "name": "たまや大玉"}
+    series_b = {"id": "16--", "libraryId": "16", "name": "シタギスキマ"}
+
+    id_a = disambiguate_series_dto(series_a)
+    id_b = disambiguate_series_dto(series_b)
+
+    assert id_a.startswith("16-u-")
+    assert id_b.startswith("16-u-")
+    assert id_a != id_b
+    assert series_a["id"] == id_a
+    assert series_b["id"] == id_b
+    assert series_a["url"] == f"/api/v1/series/{id_a}"
+
+    # Verify both are registered in custom_series
+    assert id_a in grimmory_client.custom_series
+    assert id_b in grimmory_client.custom_series
+    assert grimmory_client.custom_series[id_a]["name"] == "たまや大玉"
+    assert grimmory_client.custom_series[id_b]["name"] == "シタギスキマ"
+
+
+def test_book_pages_count_normalization():
+    from app.dto_utils import ensure_book_dto
+
+    # pagesCount: 0 should be normalized to 1 to prevent division by zero in Swift/Kotlin
+    b0 = {"id": "b0", "media": {"pagesCount": 0}}
+    ensure_book_dto(b0)
+    assert b0["media"]["pagesCount"] == 1
+
+    # pagesCount: None should be normalized to 1
+    b_none = {"id": "b1", "media": {"pagesCount": None}}
+    ensure_book_dto(b_none)
+    assert b_none["media"]["pagesCount"] == 1
+
+    # pagesCount: negative should be normalized to 1
+    b_neg = {"id": "b2", "media": {"pagesCount": -5}}
+    ensure_book_dto(b_neg)
+    assert b_neg["media"]["pagesCount"] == 1
+
+    # pagesCount: 15 should remain 15
+    b15 = {"id": "b3", "media": {"pagesCount": 15}}
+    ensure_book_dto(b15)
+    assert b15["media"]["pagesCount"] == 15
+
+
+def test_disambiguated_series_integration_mock():
+    # 1. Mock series list with clashing "16--" series
+    mock_series_data = {
+        "content": [
+            {"id": "16--", "libraryId": "16", "name": "シタギスキマ", "booksCount": 1},
+            {"id": "16--", "libraryId": "16", "name": "たまや大玉", "booksCount": 1}
+        ],
+        "totalElements": 2,
+        "totalPages": 1
+    }
+
+    mock_app_books = {
+        "content": [
+            {
+                "id": 359,
+                "libraryId": 16,
+                "seriesName": "シタギスキマ",
+                "title": "シタギスキマ",
+                "seriesNumber": 1.0,
+                "addedOn": "2026-09-20T12:00:00Z",
+                "primaryFileType": "CBX",
+                "fileSizeKb": 10240
+            }
+        ]
+    }
+
+    async def mock_app_get(url, **kwargs):
+        if "app/series" in url or "app/books" in url:
+            return httpx.Response(200, json=mock_app_books)
+        return httpx.Response(404)
+
+    mock_client = AsyncMock()
+    mock_client.get = AsyncMock(side_effect=mock_app_get)
+
+    with patch.object(grimmory_client, "komga_request", new_callable=AsyncMock) as mock_komga, \
+         patch.object(grimmory_client, "get_client", return_value=mock_client), \
+         patch.object(grimmory_client, "get_native_token", new_callable=AsyncMock, return_value="dummy-token"):
+
+        mock_komga.return_value = httpx.Response(200, json=mock_series_data)
+
+        # GET /api/v1/series
+        resp = client.get("/api/v1/series?library_id=16", headers=AUTH_HEADER)
+        assert resp.status_code == 200
+        data = resp.json()
+        assert len(data["content"]) == 2
+        id1 = data["content"][0]["id"]
+        id2 = data["content"][1]["id"]
+        assert id1.startswith("16-u-")
+        assert id2.startswith("16-u-")
+        assert id1 != id2
+
+        # GET /api/v1/series/{id}
+        resp_single = client.get(f"/api/v1/series/{id1}", headers=AUTH_HEADER)
+        assert resp_single.status_code == 200
+        assert resp_single.json()["id"] == id1
+
+        # GET /api/v1/series/{id}/books
+        resp_books = client.get(f"/api/v1/series/{id1}/books", headers=AUTH_HEADER)
+        assert resp_books.status_code == 200
+        books_data = resp_books.json()
+        assert len(books_data["content"]) == 1
+        assert books_data["content"][0]["id"] == "359"
+        assert books_data["content"][0]["media"]["pagesCount"] >= 1
+
+        # POST /api/v1/books/list with series_id filter
+        resp_post_books = client.post(
+            "/api/v1/books/list",
+            json={"seriesId": [id1]},
+            headers=AUTH_HEADER
+        )
+        assert resp_post_books.status_code == 200
+        post_books_data = resp_post_books.json()
+        assert len(post_books_data["content"]) == 1
+        assert post_books_data["content"][0]["id"] == "359"
+
+        # GET /api/v1/series/{id}/thumbnail (should fetch thumbnail of first book 359)
+        mock_komga.return_value = httpx.Response(200, content=b"fake-image", headers={"Content-Type": "image/jpeg"})
+        resp_thumb = client.get(f"/api/v1/series/{id1}/thumbnail", headers=AUTH_HEADER)
+        assert resp_thumb.status_code == 200
+        assert resp_thumb.content == b"fake-image"
+        # Ensure it called /api/v1/books/359/thumbnail
+        assert mock_komga.call_args[0][1] == "/api/v1/books/359/thumbnail"
 
 
 if __name__ == "__main__":

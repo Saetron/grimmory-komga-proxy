@@ -1,4 +1,6 @@
+import hashlib
 from typing import Dict, Any, List, Optional
+
 
 def ensure_page_dto(data: Dict[str, Any], default_page: int = 0, default_size: int = 20) -> Dict[str, Any]:
     """Ensure a paginated response has Spring Data Pageable & Sort structures expected by Komga clients."""
@@ -149,7 +151,7 @@ def ensure_book_dto(book: Dict[str, Any]) -> Dict[str, Any]:
     media.setdefault("status", "READY")
     media.setdefault("mediaType", "application/x-cbz")
     media.setdefault("mediaProfile", "DIVINA")
-    if "pagesCount" not in media or media["pagesCount"] is None:
+    if "pagesCount" not in media or media["pagesCount"] is None or media["pagesCount"] <= 0:
         media["pagesCount"] = 1
     media.setdefault("comment", "")
     media.setdefault("epubDivinaCompatible", False)
@@ -317,5 +319,26 @@ def extract_search_filters(body: Any) -> Dict[str, Any]:
 
     walk(body)
     return filters
+
+
+def disambiguate_series_dto(s: Dict[str, Any]) -> str:
+    """Ensure every series has a unique, deterministic ID, fixing Grimmory's non-ASCII '--' clashing bug."""
+    s_id = str(s.get("id", ""))
+    lib_id = str(s.get("libraryId", "0"))
+    s_name = s.get("name") or s.get("metadata", {}).get("title", "")
+
+    if s_id.endswith("--") or s_id == f"{lib_id}--":
+        name_hash = hashlib.md5(s_name.encode("utf-8")).hexdigest()[:8]
+        unique_id = f"{lib_id}-u-{name_hash}"
+        s["id"] = unique_id
+        s["url"] = f"/api/v1/series/{unique_id}"
+        from app.grimmory_client import grimmory_client
+        grimmory_client.register_custom_series(unique_id, lib_id, s_name, s)
+        return unique_id
+    else:
+        from app.grimmory_client import grimmory_client
+        grimmory_client.register_custom_series(s_id, lib_id, s_name, s)
+        return s_id
+
 
 
