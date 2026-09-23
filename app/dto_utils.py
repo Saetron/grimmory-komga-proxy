@@ -251,3 +251,57 @@ def raw_app_book_to_dto(raw: Dict[str, Any]) -> Dict[str, Any]:
         "oneshot": False
     }
     return ensure_book_dto(dto)
+
+
+def extract_search_filters(body: Any) -> Dict[str, Any]:
+    """Recursively extract series_id, library_id, read_status, search from Komga search payloads."""
+    filters = {}
+    if not isinstance(body, (dict, list)):
+        return filters
+
+    def walk(obj):
+        if isinstance(obj, dict):
+            for k, v in obj.items():
+                k_lower = k.lower()
+                if k_lower in ["seriesid", "seriesids", "series_id"]:
+                    if isinstance(v, dict):
+                        vals = v.get("values", [])
+                        if vals and "series_id" not in filters:
+                            filters["series_id"] = str(vals[0])
+                    elif isinstance(v, list) and v and "series_id" not in filters:
+                        filters["series_id"] = str(v[0])
+                    elif isinstance(v, (str, int)) and "series_id" not in filters:
+                        filters["series_id"] = str(v)
+
+                elif k_lower in ["libraryid", "libraryids", "library_id"]:
+                    if isinstance(v, dict):
+                        vals = v.get("values", [])
+                        if vals and "library_id" not in filters:
+                            filters["library_id"] = str(vals[0])
+                    elif isinstance(v, list) and v and "library_id" not in filters:
+                        filters["library_id"] = str(v[0])
+                    elif isinstance(v, (str, int)) and "library_id" not in filters:
+                        filters["library_id"] = str(v)
+
+                elif k_lower in ["readstatus", "read_status"]:
+                    if isinstance(v, dict):
+                        vals = v.get("values", [])
+                        if vals:
+                            filters["read_status"] = vals
+                    elif isinstance(v, list):
+                        filters["read_status"] = v
+                    elif isinstance(v, str):
+                        filters["read_status"] = [v]
+
+                elif k_lower in ["searchterm", "fulltextsearch", "search"]:
+                    if isinstance(v, str) and v and "search" not in filters:
+                        filters["search"] = v
+
+                walk(v)
+        elif isinstance(obj, list):
+            for item in obj:
+                walk(item)
+
+    walk(body)
+    return filters
+

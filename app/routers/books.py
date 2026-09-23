@@ -2,7 +2,7 @@ from fastapi import APIRouter, Header, Request, Response, HTTPException, status
 from fastapi.responses import StreamingResponse
 from typing import Optional, Dict, Any, List
 from app.grimmory_client import grimmory_client
-from app.dto_utils import ensure_page_dto, ensure_book_dto
+from app.dto_utils import ensure_page_dto, ensure_book_dto, extract_search_filters
 
 router = APIRouter(prefix="/api/v1/books", tags=["Books"])
 
@@ -16,6 +16,28 @@ async def list_books(
     page = int(params.get("page", 0))
     size = int(params.get("size", 20))
     sort = params.get("sort", "")
+
+    # Normalize libraryId to library_id
+    if "libraryId" in params:
+        params["library_id"] = params.pop("libraryId")
+
+    # If series_id is specified in query, Grimmory requires querying /series/{id}/books
+    series_id = params.pop("series_id", None) or params.pop("seriesId", None)
+    if series_id:
+        if "-standalone-" in series_id:
+            b_id = series_id.split("-standalone-")[-1]
+            book = await grimmory_client.get_book_dto(b_id, user, pwd)
+            content = [ensure_book_dto(book)] if book else []
+            return ensure_page_dto({"content": content}, default_page=page, default_size=size)
+
+        resp = await grimmory_client.komga_request("GET", f"/api/v1/series/{series_id}/books", user, pwd, params=params)
+        if resp.status_code == 200:
+            data = resp.json()
+            if "content" in data and isinstance(data["content"], list):
+                for b in data["content"]:
+                    ensure_book_dto(b)
+            return ensure_page_dto(data, default_page=page, default_size=size)
+        return ensure_page_dto({"content": []}, default_page=page, default_size=size)
 
     if "readProgress.readDate" in sort:
         return await grimmory_client.get_ondeck_books(user, pwd, page=page, size=size)
@@ -51,20 +73,43 @@ async def list_books_post(
     except Exception:
         pass
 
-    read_status = body.get("readStatus", [])
-    if isinstance(read_status, list) and "IN_PROGRESS" in read_status:
+    filters = extract_search_filters(body)
+
+    # 1. Check if filtering by series
+    series_id = filters.get("series_id") or params.get("series_id") or params.get("seriesId")
+    if series_id:
+        if "-standalone-" in series_id:
+            b_id = series_id.split("-standalone-")[-1]
+            book = await grimmory_client.get_book_dto(b_id, user, pwd)
+            content = [ensure_book_dto(book)] if book else []
+            return ensure_page_dto({"content": content}, default_page=page, default_size=size)
+
+        # Grimmory ONLY returns books for a series via /series/{id}/books
+        resp = await grimmory_client.komga_request("GET", f"/api/v1/series/{series_id}/books", user, pwd, params=params)
+        if resp.status_code == 200:
+            data = resp.json()
+            if "content" in data and isinstance(data["content"], list):
+                for b in data["content"]:
+                    ensure_book_dto(b)
+            return ensure_page_dto(data, default_page=page, default_size=size)
+        return ensure_page_dto({"content": []}, default_page=page, default_size=size)
+
+    # 2. Check if filtering by read status / in-progress
+    read_status = filters.get("read_status", [])
+    if "IN_PROGRESS" in read_status or "readProgress.readDate" in sort:
         return await grimmory_client.get_ondeck_books(user, pwd, page=page, size=size)
-    if "readProgress.readDate" in sort:
-        return await grimmory_client.get_ondeck_books(user, pwd, page=page, size=size)
+
+    # 3. Check if sorting by recently added or released
     if "createdDate" in sort or "metadata.releaseDate" in sort:
         return await grimmory_client.get_latest_books(user, pwd, page=page, size=size)
 
-    if "seriesIds" in body and body["seriesIds"]:
-        params["series_id"] = body["seriesIds"][0]
-    if "libraryIds" in body and body["libraryIds"]:
-        params["library_id"] = body["libraryIds"][0]
-    if "searchTerm" in body and body["searchTerm"]:
-        params["search"] = body["searchTerm"]
+    # 4. Check library filter
+    if "library_id" in filters:
+        params["library_id"] = filters["library_id"]
+    if "libraryId" in params:
+        params["library_id"] = params.pop("libraryId")
+    if "search" in filters:
+        params["search"] = filters["search"]
 
     resp = await grimmory_client.komga_request("GET", "/api/v1/books", user, pwd, params=params)
     if resp.status_code == 200:
@@ -199,7 +244,9 @@ async def download_book_file(
     raise HTTPException(status_code=resp.status_code, detail="Failed to download book file")
 
 
+# Support both /read-progress and /progression (Komga & Komic variants)
 @router.get("/{book_id}/read-progress")
+@router.get("/{book_id}/progression")
 async def get_read_progress(
     book_id: str,
     authorization: Optional[str] = Header(None)
@@ -212,6 +259,8 @@ async def get_read_progress(
 
 
 @router.patch("/{book_id}/read-progress", status_code=status.HTTP_204_NO_CONTENT)
+@router.put("/{book_id}/progression", status_code=status.HTTP_204_NO_CONTENT)
+@router.patch("/{book_id}/progression", status_code=status.HTTP_204_NO_CONTENT)
 async def update_read_progress(
     book_id: str,
     request: Request,
@@ -233,6 +282,7 @@ async def update_read_progress(
 
 
 @router.delete("/{book_id}/read-progress", status_code=status.HTTP_204_NO_CONTENT)
+@router.delete("/{book_id}/progression", status_code=status.HTTP_204_NO_CONTENT)
 async def delete_read_progress(
     book_id: str,
     authorization: Optional[str] = Header(None)

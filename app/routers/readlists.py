@@ -3,13 +3,13 @@ from typing import Optional, Dict, Any, List
 from app.grimmory_client import grimmory_client
 from app.dto_utils import ensure_page_dto
 
-router = APIRouter(prefix="/api/v1", tags=["ReadLists & Collections"])
+router = APIRouter(tags=["ReadLists, Collections & Metadata"])
 
-@router.get("/readlists")
+@router.get("/api/v1/readlists")
 async def get_readlists() -> Dict[str, Any]:
     return ensure_page_dto({"content": []})
 
-@router.get("/collections")
+@router.get("/api/v1/collections")
 async def get_collections(
     request: Request,
     authorization: Optional[str] = Header(None)
@@ -22,8 +22,8 @@ async def get_collections(
         return ensure_page_dto(data)
     return ensure_page_dto({"content": []})
 
-@router.get("/authors")
-@router.get("/authors/names")
+@router.get("/api/v1/authors")
+@router.get("/api/v1/authors/names")
 async def get_authors(
     authorization: Optional[str] = Header(None)
 ) -> List[Any]:
@@ -39,10 +39,54 @@ async def get_authors(
         pass
     return []
 
-@router.get("/authors/roles")
+@router.get("/api/v2/authors")
+async def get_authors_v2(
+    request: Request,
+    authorization: Optional[str] = Header(None)
+) -> Dict[str, Any]:
+    user, pwd = grimmory_client.extract_credentials(authorization)
+    params = dict(request.query_params)
+    page = int(params.get("page", 0))
+    size = int(params.get("size", 20))
+    native_headers = await grimmory_client.get_native_headers(user, pwd)
+    authors_content = []
+    try:
+        resp = await grimmory_client.client.get("/api/v1/app/authors", headers=native_headers)
+        if resp.status_code == 200:
+            authors_data = resp.json()
+            if isinstance(authors_data, list):
+                for a in authors_data:
+                    name = a.get("name") if isinstance(a, dict) else str(a)
+                    if name:
+                        authors_content.append({"name": name, "role": "WRITER"})
+    except Exception:
+        pass
+    return ensure_page_dto({"content": authors_content}, default_page=page, default_size=size)
+
+@router.get("/api/v1/authors/roles")
 async def get_author_roles() -> List[str]:
     return ["WRITER", "PENCILLER", "INKER", "COLORIST", "LETTERER", "COVER", "EDITOR", "TRANSLATOR"]
 
-@router.get("/age-ratings")
+@router.get("/api/v1/genres")
+async def get_genres() -> List[str]:
+    return []
+
+@router.get("/api/v1/tags")
+async def get_tags() -> List[str]:
+    return []
+
+@router.get("/api/v1/publishers")
+async def get_publishers() -> List[str]:
+    return []
+
+@router.get("/api/v1/languages")
+async def get_languages() -> List[str]:
+    return []
+
+@router.get("/api/v1/sharing-labels")
+async def get_sharing_labels() -> List[str]:
+    return []
+
+@router.get("/api/v1/age-ratings")
 async def get_age_ratings() -> List[int]:
     return []

@@ -324,6 +324,107 @@ def test_books_post_list_in_progress_routing():
         assert "isbn" in book["metadata"]
 
 
+def test_books_post_list_series_filter_routing():
+    mock_books = {
+        "content": [{
+            "id": "book-in-series-1",
+            "name": "Chapter 1",
+            "seriesId": "series-abc"
+        }],
+        "totalElements": 1,
+        "totalPages": 1
+    }
+    with patch.object(grimmory_client, "komga_request", new_callable=AsyncMock) as mock_komga:
+        mock_komga.return_value = httpx.Response(200, json=mock_books)
+
+        # 1. Test POST /books/list with condition.seriesId
+        resp = client.post(
+            "/api/v1/books/list?sort=metadata.numberSort,asc",
+            json={"condition": {"seriesId": {"operator": "is", "values": ["series-abc"]}}},
+            headers=AUTH_HEADER
+        )
+        assert resp.status_code == 200
+        data = resp.json()
+        assert len(data["content"]) == 1
+        assert data["content"][0]["id"] == "book-in-series-1"
+
+        # Verify it routed specifically to /api/v1/series/series-abc/books
+        assert mock_komga.call_args[0][1] == "/api/v1/series/series-abc/books"
+
+
+def test_series_post_list_library_id_normalization():
+    with patch.object(grimmory_client, "komga_request", new_callable=AsyncMock) as mock_komga:
+        mock_komga.return_value = httpx.Response(200, json={"content": [], "totalElements": 0, "totalPages": 0})
+
+        # Test POST /series/list with nested condition.libraryId
+        resp = client.post(
+            "/api/v1/series/list",
+            json={"condition": {"libraryId": {"operator": "is", "values": ["lib-42"]}}},
+            headers=AUTH_HEADER
+        )
+        assert resp.status_code == 200
+        call_params = mock_komga.call_args[1].get("params", {})
+        assert call_params.get("library_id") == "lib-42"
+
+        # Test GET /series?libraryId=lib-42 query param normalization
+        resp_get = client.get("/api/v1/series?libraryId=lib-42", headers=AUTH_HEADER)
+        assert resp_get.status_code == 200
+        call_params_get = mock_komga.call_args[1].get("params", {})
+        assert call_params_get.get("library_id") == "lib-42"
+        assert "libraryId" not in call_params_get
+
+
+def test_auxiliary_metadata_endpoints():
+    with patch.object(grimmory_client, "get_native_token", new_callable=AsyncMock, return_value="dummy-token"):
+        # Authors V2
+        resp = client.get("/api/v2/authors?unpaged=true", headers=AUTH_HEADER)
+        assert resp.status_code == 200
+        data = resp.json()
+        assert "content" in data
+        assert "pageable" in data
+
+        # Auxiliary metadata arrays
+        for endpoint in ["genres", "tags", "publishers", "languages", "sharing-labels"]:
+            r = client.get(f"/api/v1/{endpoint}", headers=AUTH_HEADER)
+            assert r.status_code == 200
+            assert r.json() == []
+
+        # Series collections and release dates
+        r_dates = client.get("/api/v1/series/release-dates", headers=AUTH_HEADER)
+        assert r_dates.status_code == 200
+        assert r_dates.json() == []
+
+        r_colls = client.get("/api/v1/series/s-1/collections", headers=AUTH_HEADER)
+        assert r_colls.status_code == 200
+        assert r_colls.json() == []
+
+
+def test_progression_alias_endpoints():
+    mock_client = AsyncMock()
+    mock_client.put = AsyncMock(return_value=httpx.Response(204))
+    mock_client.get = AsyncMock(return_value=httpx.Response(200, json={
+        "cbxProgress": {"page": 3, "percentage": 30},
+        "dateFinished": None
+    }))
+
+    with patch.object(grimmory_client, "get_client", return_value=mock_client), \
+         patch.object(grimmory_client, "get_native_token", new_callable=AsyncMock, return_value="dummy-token"):
+
+        # PUT /books/{id}/progression
+        r_put = client.put(
+            "/api/v1/books/book-200/progression",
+            json={"page": 3, "completed": False},
+            headers=AUTH_HEADER
+        )
+        assert r_put.status_code == 204
+
+        # GET /books/{id}/progression
+        r_get = client.get("/api/v1/books/book-200/progression", headers=AUTH_HEADER)
+        assert r_get.status_code == 200
+        assert r_get.json()["page"] == 3
+
+
 if __name__ == "__main__":
     pytest.main(["-v", __file__])
+
 

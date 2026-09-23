@@ -1,7 +1,7 @@
 from fastapi import APIRouter, Header, Request, Response, HTTPException, status
 from typing import Optional, Dict, Any, List
 from app.grimmory_client import grimmory_client
-from app.dto_utils import ensure_page_dto, ensure_series_dto, ensure_book_dto
+from app.dto_utils import ensure_page_dto, ensure_series_dto, ensure_book_dto, extract_search_filters
 
 router = APIRouter(prefix="/api/v1/series", tags=["Series"])
 
@@ -14,6 +14,11 @@ async def list_series(
     params = dict(request.query_params)
     page = int(params.get("page", 0))
     size = int(params.get("size", 20))
+
+    # Normalize libraryId to library_id for Grimmory compatibility
+    if "libraryId" in params:
+        params["library_id"] = params.pop("libraryId")
+
     resp = await grimmory_client.komga_request("GET", "/api/v1/series", user, pwd, params=params)
     if resp.status_code != 200:
         raise HTTPException(status_code=resp.status_code, detail="Failed to fetch series")
@@ -37,13 +42,18 @@ async def list_series_post(
     params = dict(request.query_params)
     page = int(params.get("page", 0))
     size = int(params.get("size", 20))
+
+    # Normalize libraryId in query
+    if "libraryId" in params:
+        params["library_id"] = params.pop("libraryId")
+
     try:
         body = await request.json()
-        if isinstance(body, dict):
-            if "libraryIds" in body and body["libraryIds"]:
-                params["library_id"] = body["libraryIds"][0]
-            if "searchTerm" in body and body["searchTerm"]:
-                params["search"] = body["searchTerm"]
+        filters = extract_search_filters(body)
+        if "library_id" in filters:
+            params["library_id"] = filters["library_id"]
+        if "search" in filters:
+            params["search"] = filters["search"]
     except Exception:
         pass
 
@@ -69,6 +79,11 @@ async def list_series_special(
     params = dict(request.query_params)
     page = int(params.get("page", 0))
     size = int(params.get("size", 20))
+
+    # Normalize libraryId
+    if "libraryId" in params:
+        params["library_id"] = params.pop("libraryId")
+
     if "sort" not in params:
         params["sort"] = "lastModified,desc"
     resp = await grimmory_client.komga_request("GET", "/api/v1/series", user, pwd, params=params)
@@ -88,6 +103,11 @@ async def get_alphabetical_groups() -> List[Dict[str, Any]]:
 
 @router.get("/genres")
 async def get_genres() -> List[str]:
+    return []
+
+
+@router.get("/release-dates")
+async def get_series_release_dates() -> List[str]:
     return []
 
 
@@ -118,6 +138,14 @@ async def get_series(
     if resp.status_code != 200:
         raise HTTPException(status_code=resp.status_code, detail="Series not found")
     return ensure_series_dto(resp.json())
+
+
+@router.get("/{series_id}/collections")
+async def get_series_collections(
+    series_id: str,
+    authorization: Optional[str] = Header(None)
+) -> List[Dict[str, Any]]:
+    return []
 
 
 @router.get("/{series_id}/books")
