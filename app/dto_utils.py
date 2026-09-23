@@ -255,7 +255,7 @@ def raw_app_book_to_dto(raw: Dict[str, Any]) -> Dict[str, Any]:
 
 def extract_search_filters(body: Any) -> Dict[str, Any]:
     """Recursively extract series_id, library_id, read_status, search from Komga search payloads."""
-    filters = {}
+    filters: Dict[str, Any] = {}
     if not isinstance(body, (dict, list)):
         return filters
 
@@ -265,28 +265,37 @@ def extract_search_filters(body: Any) -> Dict[str, Any]:
                 k_lower = k.lower()
                 if k_lower in ["seriesid", "seriesids", "series_id"]:
                     if isinstance(v, dict):
-                        vals = v.get("values", [])
-                        if vals and "series_id" not in filters:
+                        val = v.get("value")
+                        vals = v.get("values")
+                        if val is not None and "series_id" not in filters:
+                            filters["series_id"] = str(val)
+                        elif vals and isinstance(vals, list) and len(vals) > 0 and "series_id" not in filters:
                             filters["series_id"] = str(vals[0])
-                    elif isinstance(v, list) and v and "series_id" not in filters:
+                    elif isinstance(v, list) and len(v) > 0 and "series_id" not in filters:
                         filters["series_id"] = str(v[0])
                     elif isinstance(v, (str, int)) and "series_id" not in filters:
                         filters["series_id"] = str(v)
 
                 elif k_lower in ["libraryid", "libraryids", "library_id"]:
                     if isinstance(v, dict):
-                        vals = v.get("values", [])
-                        if vals and "library_id" not in filters:
+                        val = v.get("value")
+                        vals = v.get("values")
+                        if val is not None and "library_id" not in filters:
+                            filters["library_id"] = str(val)
+                        elif vals and isinstance(vals, list) and len(vals) > 0 and "library_id" not in filters:
                             filters["library_id"] = str(vals[0])
-                    elif isinstance(v, list) and v and "library_id" not in filters:
+                    elif isinstance(v, list) and len(v) > 0 and "library_id" not in filters:
                         filters["library_id"] = str(v[0])
                     elif isinstance(v, (str, int)) and "library_id" not in filters:
                         filters["library_id"] = str(v)
 
                 elif k_lower in ["readstatus", "read_status"]:
                     if isinstance(v, dict):
-                        vals = v.get("values", [])
-                        if vals:
+                        val = v.get("value")
+                        vals = v.get("values")
+                        if val:
+                            filters["read_status"] = [val] if isinstance(val, str) else list(val)
+                        elif vals and isinstance(vals, list):
                             filters["read_status"] = vals
                     elif isinstance(v, list):
                         filters["read_status"] = v
@@ -296,6 +305,10 @@ def extract_search_filters(body: Any) -> Dict[str, Any]:
                 elif k_lower in ["searchterm", "fulltextsearch", "search"]:
                     if isinstance(v, str) and v and "search" not in filters:
                         filters["search"] = v
+                elif k_lower == "title" and isinstance(v, dict):
+                    val = v.get("value")
+                    if isinstance(val, str) and val and "search" not in filters:
+                        filters["search"] = val
 
                 walk(v)
         elif isinstance(obj, list):
@@ -304,4 +317,5 @@ def extract_search_filters(body: Any) -> Dict[str, Any]:
 
     walk(body)
     return filters
+
 

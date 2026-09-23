@@ -153,7 +153,10 @@ def test_book_detail_and_pages_mock():
 
 
 def test_books_ondeck_mock():
-    raw_reading = [{"id": 101, "name": "Book 101"}]
+    raw_reading = [
+        {"id": 101, "name": "Book 101", "libraryId": 14},
+        {"id": 102, "name": "Book 102", "libraryId": 19}
+    ]
     book_dto = {
         "id": "101",
         "name": "Book 101",
@@ -172,12 +175,19 @@ def test_books_ondeck_mock():
     with patch.object(grimmory_client, "get_client", return_value=mock_client), \
          patch.object(grimmory_client, "get_book_dto", new_callable=AsyncMock, return_value=book_dto), \
          patch.object(grimmory_client, "get_native_token", new_callable=AsyncMock, return_value="dummy-token"):
+        # Without filter
         resp = client.get("/api/v1/books/ondeck", headers=AUTH_HEADER)
         assert resp.status_code == 200
         data = resp.json()
-        assert "content" in data
-        assert len(data["content"]) == 1
-        assert data["content"][0]["id"] == "101"
+        assert len(data["content"]) == 2
+
+        # With library_id=14 filter
+        resp_lib = client.get("/api/v1/books/ondeck?library_id=14", headers=AUTH_HEADER)
+        assert resp_lib.status_code == 200
+        data_lib = resp_lib.json()
+        assert len(data_lib["content"]) == 1
+        assert data_lib["content"][0]["id"] == "101"
+
 
 
 def test_read_progress_lifecycle_mock():
@@ -337,10 +347,10 @@ def test_books_post_list_series_filter_routing():
     with patch.object(grimmory_client, "komga_request", new_callable=AsyncMock) as mock_komga:
         mock_komga.return_value = httpx.Response(200, json=mock_books)
 
-        # 1. Test POST /books/list with condition.seriesId
+        # 1. Test POST /books/list with condition.seriesId using 'value' (Komga SearchOperatorIs)
         resp = client.post(
             "/api/v1/books/list?sort=metadata.numberSort,asc",
-            json={"condition": {"seriesId": {"operator": "is", "values": ["series-abc"]}}},
+            json={"condition": {"seriesId": {"operator": "is", "value": "series-abc"}}},
             headers=AUTH_HEADER
         )
         assert resp.status_code == 200
@@ -350,21 +360,41 @@ def test_books_post_list_series_filter_routing():
 
         # Verify it routed specifically to /api/v1/series/series-abc/books
         assert mock_komga.call_args[0][1] == "/api/v1/series/series-abc/books"
+        # Verify series_id was not duplicated in params
+        assert "series_id" not in mock_komga.call_args[1].get("params", {})
+
+        # 2. Test with 'values' array
+        resp2 = client.post(
+            "/api/v1/books/list?sort=metadata.numberSort,asc",
+            json={"condition": {"seriesId": {"operator": "is", "values": ["series-abc"]}}},
+            headers=AUTH_HEADER
+        )
+        assert resp2.status_code == 200
 
 
 def test_series_post_list_library_id_normalization():
     with patch.object(grimmory_client, "komga_request", new_callable=AsyncMock) as mock_komga:
         mock_komga.return_value = httpx.Response(200, json={"content": [], "totalElements": 0, "totalPages": 0})
 
-        # Test POST /series/list with nested condition.libraryId
+        # Test POST /series/list with nested condition.libraryId using 'value'
         resp = client.post(
             "/api/v1/series/list",
-            json={"condition": {"libraryId": {"operator": "is", "values": ["lib-42"]}}},
+            json={"condition": {"libraryId": {"operator": "is", "value": "lib-42"}}},
             headers=AUTH_HEADER
         )
         assert resp.status_code == 200
         call_params = mock_komga.call_args[1].get("params", {})
         assert call_params.get("library_id") == "lib-42"
+
+        # Test with condition.allOf
+        resp_allof = client.post(
+            "/api/v1/series/list",
+            json={"condition": {"allOf": [{"libraryId": {"operator": "is", "value": "lib-42"}}]}},
+            headers=AUTH_HEADER
+        )
+        assert resp_allof.status_code == 200
+        call_params_allof = mock_komga.call_args[1].get("params", {})
+        assert call_params_allof.get("library_id") == "lib-42"
 
         # Test GET /series?libraryId=lib-42 query param normalization
         resp_get = client.get("/api/v1/series?libraryId=lib-42", headers=AUTH_HEADER)
@@ -372,6 +402,7 @@ def test_series_post_list_library_id_normalization():
         call_params_get = mock_komga.call_args[1].get("params", {})
         assert call_params_get.get("library_id") == "lib-42"
         assert "libraryId" not in call_params_get
+
 
 
 def test_auxiliary_metadata_endpoints():

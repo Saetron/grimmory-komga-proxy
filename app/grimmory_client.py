@@ -333,7 +333,14 @@ class GrimmoryClient:
         except Exception:
             return False
 
-    async def get_ondeck_books(self, user: str, pwd: str, page: int = 0, size: int = 20) -> Dict[str, Any]:
+    async def get_ondeck_books(
+        self,
+        user: str,
+        pwd: str,
+        page: int = 0,
+        size: int = 20,
+        library_id: Optional[str] = None
+    ) -> Dict[str, Any]:
         """Fetch books currently reading (on deck)."""
         native_headers = await self.get_native_headers(user, pwd)
         try:
@@ -341,6 +348,11 @@ class GrimmoryClient:
             if resp.status_code == 200:
                 raw_books = resp.json()
                 if isinstance(raw_books, list):
+                    if library_id:
+                        raw_books = [
+                            b for b in raw_books
+                            if str(b.get("libraryId") or b.get("library_id")) == str(library_id)
+                        ]
                     total = len(raw_books)
                     start = page * size
                     page_items = raw_books[start:start + size]
@@ -356,7 +368,14 @@ class GrimmoryClient:
 
         return ensure_page_dto({"content": []}, default_page=page, default_size=size)
 
-    async def get_latest_books(self, user: str, pwd: str, page: int = 0, size: int = 20) -> Dict[str, Any]:
+    async def get_latest_books(
+        self,
+        user: str,
+        pwd: str,
+        page: int = 0,
+        size: int = 20,
+        library_id: Optional[str] = None
+    ) -> Dict[str, Any]:
         """Fetch recently added books."""
         native_headers = await self.get_native_headers(user, pwd)
         try:
@@ -364,6 +383,11 @@ class GrimmoryClient:
             if resp.status_code == 200:
                 raw_books = resp.json()
                 if isinstance(raw_books, list) and len(raw_books) > 0:
+                    if library_id:
+                        raw_books = [
+                            b for b in raw_books
+                            if str(b.get("libraryId") or b.get("library_id")) == str(library_id)
+                        ]
                     total = len(raw_books)
                     start = page * size
                     page_items = raw_books[start:start + size]
@@ -378,12 +402,15 @@ class GrimmoryClient:
             pass
 
         # Fallback to standard /komga/api/v1/books
+        params = {"page": page, "size": size}
+        if library_id:
+            params["library_id"] = library_id
         resp = await self.komga_request(
             "GET",
             "/api/v1/books",
             user,
             pwd,
-            params={"page": page, "size": size}
+            params=params
         )
         if resp.status_code == 200:
             data = resp.json()
