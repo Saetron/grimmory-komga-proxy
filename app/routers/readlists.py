@@ -1,31 +1,13 @@
 from fastapi import APIRouter, Header, Request, HTTPException
 from typing import Optional, Dict, Any, List
 from app.grimmory_client import grimmory_client
+from app.dto_utils import ensure_page_dto
 
 router = APIRouter(prefix="/api/v1", tags=["ReadLists & Collections"])
 
 @router.get("/readlists")
 async def get_readlists() -> Dict[str, Any]:
-    return {
-        "content": [],
-        "pageable": {
-            "sort": {"sorted": False, "unsorted": True, "empty": True},
-            "offset": 0,
-            "pageNumber": 0,
-            "pageSize": 20,
-            "paged": True,
-            "unpaged": False
-        },
-        "totalElements": 0,
-        "totalPages": 0,
-        "last": True,
-        "number": 0,
-        "sort": {"sorted": False, "unsorted": True, "empty": True},
-        "size": 20,
-        "numberOfElements": 0,
-        "first": True,
-        "empty": True
-    }
+    return ensure_page_dto({"content": []})
 
 @router.get("/collections")
 async def get_collections(
@@ -36,27 +18,9 @@ async def get_collections(
     params = dict(request.query_params)
     resp = await grimmory_client.komga_request("GET", "/api/v1/collections", user, pwd, params=params)
     if resp.status_code == 200:
-        return resp.json()
-    return {
-        "content": [],
-        "pageable": {
-            "sort": {"sorted": False, "unsorted": True, "empty": True},
-            "offset": 0,
-            "pageNumber": 0,
-            "pageSize": 20,
-            "paged": True,
-            "unpaged": False
-        },
-        "totalElements": 0,
-        "totalPages": 0,
-        "last": True,
-        "number": 0,
-        "sort": {"sorted": False, "unsorted": True, "empty": True},
-        "size": 20,
-        "numberOfElements": 0,
-        "first": True,
-        "empty": True
-    }
+        data = resp.json()
+        return ensure_page_dto(data)
+    return ensure_page_dto({"content": []})
 
 @router.get("/authors")
 @router.get("/authors/names")

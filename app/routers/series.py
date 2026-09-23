@@ -1,33 +1,9 @@
 from fastapi import APIRouter, Header, Request, Response, HTTPException, status
 from typing import Optional, Dict, Any, List
 from app.grimmory_client import grimmory_client
+from app.dto_utils import ensure_page_dto, ensure_series_dto, ensure_book_dto
 
 router = APIRouter(prefix="/api/v1/series", tags=["Series"])
-
-def ensure_series_dto(series: Dict[str, Any]) -> Dict[str, Any]:
-    """Ensure all required Komga SeriesDto fields are present."""
-    series.setdefault("booksCount", 0)
-    series.setdefault("booksReadCount", 0)
-    series.setdefault("booksUnreadCount", series.get("booksCount", 0))
-    series.setdefault("booksInProgressCount", 0)
-    series.setdefault("deleted", False)
-    series.setdefault("oneshot", False)
-    series.setdefault("metadata", {
-        "status": "ONGOING",
-        "created": series.get("created", ""),
-        "lastModified": series.get("lastModified", ""),
-        "title": series.get("name", ""),
-        "titleSort": series.get("name", ""),
-        "summary": "",
-        "readingDirection": "RIGHT_TO_LEFT",
-        "publisher": "",
-        "ageRating": None,
-        "language": "en",
-        "genres": [],
-        "tags": [],
-        "totalBookCount": series.get("booksCount", 0)
-    })
-    return series
 
 @router.get("")
 async def list_series(
@@ -36,6 +12,8 @@ async def list_series(
 ) -> Dict[str, Any]:
     user, pwd = grimmory_client.extract_credentials(authorization)
     params = dict(request.query_params)
+    page = int(params.get("page", 0))
+    size = int(params.get("size", 20))
     resp = await grimmory_client.komga_request("GET", "/api/v1/series", user, pwd, params=params)
     if resp.status_code != 200:
         raise HTTPException(status_code=resp.status_code, detail="Failed to fetch series")
@@ -43,7 +21,8 @@ async def list_series(
     if "content" in data and isinstance(data["content"], list):
         for s in data["content"]:
             ensure_series_dto(s)
-    return data
+    return ensure_page_dto(data, default_page=page, default_size=size)
+
 
 @router.post("/list")
 async def list_series_post(
@@ -56,6 +35,8 @@ async def list_series_post(
     """
     user, pwd = grimmory_client.extract_credentials(authorization)
     params = dict(request.query_params)
+    page = int(params.get("page", 0))
+    size = int(params.get("size", 20))
     try:
         body = await request.json()
         if isinstance(body, dict):
@@ -72,21 +53,10 @@ async def list_series_post(
         if "content" in data and isinstance(data["content"], list):
             for s in data["content"]:
                 ensure_series_dto(s)
-        return data
+        return ensure_page_dto(data, default_page=page, default_size=size)
 
-    return {
-        "content": [],
-        "pageable": {"sort": {"sorted": False, "unsorted": True, "empty": True}, "offset": 0, "pageNumber": 0, "pageSize": 20, "paged": True, "unpaged": False},
-        "totalElements": 0,
-        "totalPages": 0,
-        "last": True,
-        "number": 0,
-        "sort": {"sorted": False, "unsorted": True, "empty": True},
-        "size": 20,
-        "numberOfElements": 0,
-        "first": True,
-        "empty": True
-    }
+    return ensure_page_dto({"content": []}, default_page=page, default_size=size)
+
 
 @router.get("/latest")
 @router.get("/new")
@@ -97,6 +67,8 @@ async def list_series_special(
 ) -> Dict[str, Any]:
     user, pwd = grimmory_client.extract_credentials(authorization)
     params = dict(request.query_params)
+    page = int(params.get("page", 0))
+    size = int(params.get("size", 20))
     if "sort" not in params:
         params["sort"] = "lastModified,desc"
     resp = await grimmory_client.komga_request("GET", "/api/v1/series", user, pwd, params=params)
@@ -105,28 +77,19 @@ async def list_series_special(
         if "content" in data and isinstance(data["content"], list):
             for s in data["content"]:
                 ensure_series_dto(s)
-        return data
-    return {
-        "content": [],
-        "pageable": {"sort": {"sorted": False, "unsorted": True, "empty": True}, "offset": 0, "pageNumber": 0, "pageSize": 20, "paged": True, "unpaged": False},
-        "totalElements": 0,
-        "totalPages": 0,
-        "last": True,
-        "number": 0,
-        "sort": {"sorted": False, "unsorted": True, "empty": True},
-        "size": 20,
-        "numberOfElements": 0,
-        "first": True,
-        "empty": True
-    }
+        return ensure_page_dto(data, default_page=page, default_size=size)
+    return ensure_page_dto({"content": []}, default_page=page, default_size=size)
+
 
 @router.get("/alphabetical-groups")
 async def get_alphabetical_groups() -> List[Dict[str, Any]]:
     return []
 
+
 @router.get("/genres")
 async def get_genres() -> List[str]:
     return []
+
 
 @router.get("/{series_id}")
 async def get_series(
@@ -156,6 +119,7 @@ async def get_series(
         raise HTTPException(status_code=resp.status_code, detail="Series not found")
     return ensure_series_dto(resp.json())
 
+
 @router.get("/{series_id}/books")
 async def get_series_books(
     series_id: str,
@@ -163,35 +127,26 @@ async def get_series_books(
     authorization: Optional[str] = Header(None)
 ) -> Dict[str, Any]:
     user, pwd = grimmory_client.extract_credentials(authorization)
+    params = dict(request.query_params)
+    page = int(params.get("page", 0))
+    size = int(params.get("size", 20))
 
     # Handle virtual standalone series
     if "-standalone-" in series_id:
         b_id = series_id.split("-standalone-")[-1]
         book = await grimmory_client.get_book_dto(b_id, user, pwd)
-        content = [book] if book else []
-        return {
-            "content": content,
-            "pageable": {"sort": {"sorted": False, "unsorted": True, "empty": True}, "offset": 0, "pageNumber": 0, "pageSize": 20, "paged": True, "unpaged": False},
-            "totalElements": len(content),
-            "totalPages": 1 if content else 0,
-            "last": True,
-            "number": 0,
-            "sort": {"sorted": False, "unsorted": True, "empty": True},
-            "size": 20,
-            "numberOfElements": len(content),
-            "first": True,
-            "empty": len(content) == 0
-        }
+        content = [ensure_book_dto(book)] if book else []
+        return ensure_page_dto({"content": content}, default_page=page, default_size=size)
 
-    params = dict(request.query_params)
     resp = await grimmory_client.komga_request("GET", f"/api/v1/series/{series_id}/books", user, pwd, params=params)
     if resp.status_code != 200:
         raise HTTPException(status_code=resp.status_code, detail="Failed to fetch books for series")
     data = resp.json()
     if "content" in data and isinstance(data["content"], list):
         for b in data["content"]:
-            await grimmory_client.enrich_book(b, user, pwd)
-    return data
+            ensure_book_dto(b)
+    return ensure_page_dto(data, default_page=page, default_size=size)
+
 
 @router.get("/{series_id}/thumbnail")
 async def get_series_thumbnail(

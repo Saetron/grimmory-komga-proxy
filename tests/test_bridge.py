@@ -250,5 +250,80 @@ def test_book_manifest_mock():
         assert len(manifest["readingOrder"]) == 1
 
 
+def test_page_dto_and_series_dto_compliance():
+    mock_series_raw = {
+        "content": [{
+            "id": "s-1",
+            "name": "Series 1",
+            "metadata": {
+                "title": "Series 1",
+                "status": "ONGOING"
+            }
+        }],
+        "totalElements": 1,
+        "totalPages": 1
+    }
+    with patch.object(grimmory_client, "komga_request", new_callable=AsyncMock) as mock_komga:
+        mock_komga.return_value = httpx.Response(200, json=mock_series_raw)
+        resp = client.get("/api/v1/series/new", headers=AUTH_HEADER)
+        assert resp.status_code == 200
+        data = resp.json()
+        
+        # Verify Spring Data Pageable fields exist
+        assert "pageable" in data
+        assert "sort" in data
+        assert "offset" in data["pageable"]
+        assert "pageNumber" in data["pageable"]
+        assert "pageSize" in data["pageable"]
+        assert data["first"] is True
+        assert data["last"] is True
+
+        # Verify SeriesDto required fields
+        s = data["content"][0]
+        assert "metadata" in s
+        assert "created" in s["metadata"]
+        assert "lastModified" in s["metadata"]
+        assert "alternateTitlesLock" in s["metadata"]
+        assert "linksLock" in s["metadata"]
+        assert "sharingLabelsLock" in s["metadata"]
+
+
+def test_books_post_list_in_progress_routing():
+    raw_reading = [{
+        "id": 201,
+        "title": "Reading Book",
+        "primaryFileType": "CBX",
+        "addedOn": "2026-09-23T12:00:00Z"
+    }]
+    async def mock_get(url, **kwargs):
+        if "continue-reading" in url:
+            return httpx.Response(200, json=raw_reading)
+        return httpx.Response(404)
+
+    mock_client = AsyncMock()
+    mock_client.get = AsyncMock(side_effect=mock_get)
+
+    with patch.object(grimmory_client, "get_client", return_value=mock_client), \
+         patch.object(grimmory_client, "get_native_token", new_callable=AsyncMock, return_value="dummy-token"):
+        # When Komic queries in-progress books
+        resp = client.post(
+            "/api/v1/books/list?sort=readProgress.readDate,desc",
+            json={"readStatus": ["IN_PROGRESS"]},
+            headers=AUTH_HEADER
+        )
+        assert resp.status_code == 200
+        data = resp.json()
+        assert "pageable" in data
+        assert "content" in data
+        assert len(data["content"]) == 1
+        book = data["content"][0]
+        assert book["id"] == "201"
+        assert "media" in book
+        assert "metadata" in book
+        assert "comment" in book["media"]
+        assert "isbn" in book["metadata"]
+
+
 if __name__ == "__main__":
     pytest.main(["-v", __file__])
+

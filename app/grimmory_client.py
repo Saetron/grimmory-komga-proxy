@@ -4,6 +4,8 @@ import httpx
 from typing import Optional, Dict, Any, List, Tuple
 from cachetools import TTLCache
 from app.config import settings
+from app.dto_utils import ensure_page_dto, ensure_book_dto, raw_app_book_to_dto
+import asyncio
 
 # In-memory caches:
 # Cache JWT tokens for native Grimmory API (1 hour TTL)
@@ -13,7 +15,6 @@ page_cache: TTLCache = TTLCache(maxsize=5000, ttl=3600)
 # Cache book DTOs (5 min TTL)
 book_cache: TTLCache = TTLCache(maxsize=5000, ttl=300)
 
-import asyncio
 
 class GrimmoryClient:
     def __init__(self):
@@ -236,30 +237,27 @@ class GrimmoryClient:
         if resp.status_code != 200:
             return None
         book = resp.json()
-        await self.enrich_book(book, user, pwd)
+        await self.enrich_book(book, user, pwd, fetch_dimensions=True)
         book_cache[book_id] = book
         return book
 
-    async def enrich_book(self, book: Dict[str, Any], user: str, pwd: str) -> None:
-        """Ensure media.pagesCount is accurate and attach readProgress if present."""
+    async def enrich_book(self, book: Dict[str, Any], user: str, pwd: str, fetch_dimensions: bool = False) -> None:
+        """Ensure all required BookDto fields are present and optionally attach dimensions & progress."""
         book_id = str(book.get("id"))
-        pages = await self.get_book_pages_metadata(book_id, user, pwd)
-        if pages:
-            if "media" not in book or not isinstance(book["media"], dict):
-                book["media"] = {"status": "READY", "mediaType": "application/x-cbz", "mediaProfile": "DIVINA"}
-            book["media"]["pagesCount"] = len(pages)
+        if fetch_dimensions or book_id in page_cache:
+            pages = await self.get_book_pages_metadata(book_id, user, pwd)
+            if pages:
+                if "media" not in book or not isinstance(book["media"], dict):
+                    book["media"] = {"status": "READY", "mediaType": "application/x-cbz", "mediaProfile": "DIVINA"}
+                book["media"]["pagesCount"] = len(pages)
 
-        # Fallback series info for standalone books
-        if not book.get("seriesId"):
-            lib_id = book.get("libraryId", "0")
-            book["seriesId"] = f"{lib_id}-standalone-{book_id}"
-            book.setdefault("seriesTitle", book.get("name", "Standalone"))
-            book["oneshot"] = True
+        # Check and attach readProgress if fetched or in cache
+        if "readProgress" not in book and (fetch_dimensions or book_id in book_cache):
+            progress = await self.get_read_progress(book_id, user, pwd)
+            if progress:
+                book["readProgress"] = progress
 
-        # Check and attach readProgress
-        progress = await self.get_read_progress(book_id, user, pwd)
-        if progress:
-            book["readProgress"] = progress
+        ensure_book_dto(book)
 
     async def get_read_progress(self, book_id: str, user: str, pwd: str) -> Optional[Dict[str, Any]]:
         """Fetch read progress from Grimmory native API and format as Komga ReadProgressDto."""
@@ -271,7 +269,6 @@ class GrimmoryClient:
                 if not data:
                     return None
                 
-                # Check cbxProgress, pdfProgress, or fileProgress
                 page = 1
                 completed = False
                 if "cbxProgress" in data and data["cbxProgress"]:
@@ -343,59 +340,21 @@ class GrimmoryClient:
             resp = await self.client.get("/api/v1/app/books/continue-reading", headers=native_headers)
             if resp.status_code == 200:
                 raw_books = resp.json()
-                total = len(raw_books)
-                start = page * size
-                page_items = raw_books[start:start + size]
-
-                tasks = [self.get_book_dto(str(item.get("id")), user, pwd) for item in page_items if item.get("id")]
-                results = await asyncio.gather(*tasks, return_exceptions=True)
-                paged_content = [b for b in results if isinstance(b, dict)]
-
-                total_pages = (total + size - 1) // size if total > 0 else 0
-
-                return {
-                    "content": paged_content,
-                    "pageable": {
-                        "sort": {"sorted": False, "unsorted": True, "empty": True},
-                        "offset": start,
-                        "pageNumber": page,
-                        "pageSize": size,
-                        "paged": True,
-                        "unpaged": False
-                    },
-                    "totalElements": total,
-                    "totalPages": total_pages,
-                    "last": page >= total_pages - 1,
-                    "number": page,
-                    "sort": {"sorted": False, "unsorted": True, "empty": True},
-                    "size": size,
-                    "numberOfElements": len(paged_content),
-                    "first": page == 0,
-                    "empty": len(paged_content) == 0
-                }
+                if isinstance(raw_books, list):
+                    total = len(raw_books)
+                    start = page * size
+                    page_items = raw_books[start:start + size]
+                    paged_content = [raw_app_book_to_dto(item) for item in page_items if item.get("id")]
+                    return ensure_page_dto({
+                        "content": paged_content,
+                        "totalElements": total,
+                        "number": page,
+                        "size": size
+                    }, default_page=page, default_size=size)
         except Exception:
             pass
 
-        return {
-            "content": [],
-            "pageable": {
-                "sort": {"sorted": False, "unsorted": True, "empty": True},
-                "offset": 0,
-                "pageNumber": 0,
-                "pageSize": size,
-                "paged": True,
-                "unpaged": False
-            },
-            "totalElements": 0,
-            "totalPages": 0,
-            "last": True,
-            "number": page,
-            "sort": {"sorted": False, "unsorted": True, "empty": True},
-            "size": size,
-            "numberOfElements": 0,
-            "first": True,
-            "empty": True
-        }
+        return ensure_page_dto({"content": []}, default_page=page, default_size=size)
 
     async def get_latest_books(self, user: str, pwd: str, page: int = 0, size: int = 20) -> Dict[str, Any]:
         """Fetch recently added books."""
@@ -404,72 +363,35 @@ class GrimmoryClient:
             resp = await self.client.get("/api/v1/app/books/recently-added", headers=native_headers)
             if resp.status_code == 200:
                 raw_books = resp.json()
-                total = len(raw_books)
-                start = page * size
-                page_items = raw_books[start:start + size]
-
-                tasks = [self.get_book_dto(str(item.get("id")), user, pwd) for item in page_items if item.get("id")]
-                results = await asyncio.gather(*tasks, return_exceptions=True)
-                paged_content = [b for b in results if isinstance(b, dict)]
-
-                total_pages = (total + size - 1) // size if total > 0 else 0
-
-                return {
-                    "content": paged_content,
-                    "pageable": {
-                        "sort": {"sorted": False, "unsorted": True, "empty": True},
-                        "offset": start,
-                        "pageNumber": page,
-                        "pageSize": size,
-                        "paged": True,
-                        "unpaged": False
-                    },
-                    "totalElements": total,
-                    "totalPages": total_pages,
-                    "last": page >= total_pages - 1,
-                    "number": page,
-                    "sort": {"sorted": False, "unsorted": True, "empty": True},
-                    "size": size,
-                    "numberOfElements": len(paged_content),
-                    "first": page == 0,
-                    "empty": len(paged_content) == 0
-                }
+                if isinstance(raw_books, list) and len(raw_books) > 0:
+                    total = len(raw_books)
+                    start = page * size
+                    page_items = raw_books[start:start + size]
+                    paged_content = [raw_app_book_to_dto(item) for item in page_items if item.get("id")]
+                    return ensure_page_dto({
+                        "content": paged_content,
+                        "totalElements": total,
+                        "number": page,
+                        "size": size
+                    }, default_page=page, default_size=size)
         except Exception:
             pass
 
-        # Fallback to standard /komga/api/v1/books sorted by created,desc
+        # Fallback to standard /komga/api/v1/books
         resp = await self.komga_request(
             "GET",
             "/api/v1/books",
             user,
             pwd,
-            params={"page": page, "size": size, "sort": "created,desc"}
+            params={"page": page, "size": size}
         )
         if resp.status_code == 200:
             data = resp.json()
-            for b in data.get("content", []):
-                await self.enrich_book(b, user, pwd)
-            return data
+            if "content" in data and isinstance(data["content"], list):
+                for b in data["content"]:
+                    ensure_book_dto(b)
+            return ensure_page_dto(data, default_page=page, default_size=size)
 
-        return {
-            "content": [],
-            "pageable": {
-                "sort": {"sorted": False, "unsorted": True, "empty": True},
-                "offset": 0,
-                "pageNumber": 0,
-                "pageSize": size,
-                "paged": True,
-                "unpaged": False
-            },
-            "totalElements": 0,
-            "totalPages": 0,
-            "last": True,
-            "number": page,
-            "sort": {"sorted": False, "unsorted": True, "empty": True},
-            "size": size,
-            "numberOfElements": 0,
-            "first": True,
-            "empty": True
-        }
+        return ensure_page_dto({"content": []}, default_page=page, default_size=size)
 
 grimmory_client = GrimmoryClient()
