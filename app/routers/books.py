@@ -209,6 +209,15 @@ async def get_book_previous(
     authorization: Optional[str] = Header(None)
 ) -> Dict[str, Any]:
     user, pwd = grimmory_client.extract_credentials(authorization)
+    current_book = await grimmory_client.get_book_dto(book_id, user, pwd)
+    s_id = current_book.get("seriesId", "") if current_book else ""
+
+    if not s_id or "-u-" in s_id:
+        book = await grimmory_client.get_adjacent_book(book_id, direction="previous", user=user, pwd=pwd)
+        if not book:
+            raise HTTPException(status_code=404, detail="No previous book")
+        return ensure_book_dto(book)
+
     try:
         resp = await grimmory_client.komga_request("GET", f"/api/v1/books/{book_id}/previous", user, pwd)
         if resp.status_code == 200:
@@ -230,6 +239,15 @@ async def get_book_next(
     authorization: Optional[str] = Header(None)
 ) -> Dict[str, Any]:
     user, pwd = grimmory_client.extract_credentials(authorization)
+    current_book = await grimmory_client.get_book_dto(book_id, user, pwd)
+    s_id = current_book.get("seriesId", "") if current_book else ""
+
+    if not s_id or "-u-" in s_id:
+        book = await grimmory_client.get_adjacent_book(book_id, direction="next", user=user, pwd=pwd)
+        if not book:
+            raise HTTPException(status_code=404, detail="No next book")
+        return ensure_book_dto(book)
+
     try:
         resp = await grimmory_client.komga_request("GET", f"/api/v1/books/{book_id}/next", user, pwd)
         if resp.status_code == 200:

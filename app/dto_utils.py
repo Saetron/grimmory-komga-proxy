@@ -2,6 +2,12 @@ import hashlib
 from typing import Dict, Any, List, Optional
 
 
+def compute_unique_series_id(lib_id: str, series_name: str) -> str:
+    """Generate a collision-free deterministic series ID."""
+    name_hash = hashlib.md5(series_name.encode("utf-8")).hexdigest()[:8]
+    return f"{lib_id}-u-{name_hash}"
+
+
 def ensure_page_dto(data: Dict[str, Any], default_page: int = 0, default_size: int = 20) -> Dict[str, Any]:
     """Ensure a paginated response has Spring Data Pageable & Sort structures expected by Komga clients."""
     if not isinstance(data, dict):
@@ -143,6 +149,26 @@ def ensure_book_dto(book: Dict[str, Any]) -> Dict[str, Any]:
     elif not book.get("seriesTitle"):
         book["seriesTitle"] = book.get("name", "Series")
 
+    # Disambiguate seriesId if seriesTitle has non-ASCII or seriesId has trailing dash
+    s_id = str(book.get("seriesId", ""))
+    s_title = book.get("seriesTitle", "")
+    lib_id = str(book.get("libraryId", "0"))
+    if s_title and (s_id.endswith("-") or any(ord(c) > 127 for c in s_title)):
+        unique_id = compute_unique_series_id(lib_id, s_title)
+        book["seriesId"] = unique_id
+        from app.grimmory_client import grimmory_client
+        if unique_id not in grimmory_client.custom_series:
+            grimmory_client.register_custom_series(unique_id, lib_id, s_title, {
+                "id": unique_id,
+                "libraryId": lib_id,
+                "name": s_title,
+                "url": f"/api/v1/series/{unique_id}",
+                "created": book.get("created", ""),
+                "lastModified": book.get("lastModified", ""),
+                "booksCount": 1,
+                "oneshot": False
+            })
+
     # MediaDto
     media = book.get("media")
     if not isinstance(media, dict):
@@ -197,12 +223,17 @@ def ensure_book_dto(book: Dict[str, Any]) -> Dict[str, Any]:
     return book
 
 
-def raw_app_book_to_dto(raw: Dict[str, Any]) -> Dict[str, Any]:
+def raw_app_book_to_dto(raw: Dict[str, Any], series_id_override: Optional[str] = None) -> Dict[str, Any]:
     """Convert Grimmory native /api/v1/app/books/* object into a compliant Komga BookDto."""
     b_id = str(raw["id"])
     lib_id = str(raw.get("libraryId", "1"))
     series_name = raw.get("seriesName") or "Unknown Series"
-    series_id = f"{lib_id}-{series_name.lower().replace(' ', '-')}"
+    if series_id_override:
+        series_id = series_id_override
+    elif any(ord(c) > 127 for c in series_name):
+        series_id = compute_unique_series_id(lib_id, series_name)
+    else:
+        series_id = f"{lib_id}-{series_name.lower().replace(' ', '-')}"
     num = raw.get("seriesNumber", 1.0)
     title = raw.get("title") or f"Book {b_id}"
     added_on = raw.get("addedOn") or "2026-09-23T00:00:00Z"
@@ -328,14 +359,17 @@ def extract_search_filters(body: Any) -> Dict[str, Any]:
 
 
 def disambiguate_series_dto(s: Dict[str, Any]) -> str:
-    """Ensure every series has a unique, deterministic ID, fixing Grimmory's non-ASCII '--' clashing bug."""
+    """Ensure every series has a unique, deterministic ID, fixing Grimmory's non-ASCII clashing bug."""
     s_id = str(s.get("id", ""))
     lib_id = str(s.get("libraryId", "0"))
     s_name = s.get("name") or s.get("metadata", {}).get("title", "")
 
-    if s_id.endswith("--") or s_id == f"{lib_id}--":
-        name_hash = hashlib.md5(s_name.encode("utf-8")).hexdigest()[:8]
-        unique_id = f"{lib_id}-u-{name_hash}"
+    has_non_ascii = any(ord(c) > 127 for c in s_name)
+    has_trailing_dash = s_id.endswith("-")
+
+    if has_trailing_dash or has_non_ascii:
+        name_for_hash = s_name if s_name else s_id
+        unique_id = compute_unique_series_id(lib_id, name_for_hash)
         s["id"] = unique_id
         s["url"] = f"/api/v1/series/{unique_id}"
         from app.grimmory_client import grimmory_client

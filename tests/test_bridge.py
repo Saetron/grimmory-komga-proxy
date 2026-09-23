@@ -851,6 +851,129 @@ def test_read_sync_auto_completion_and_session_tracking():
         assert cached2["completed"] is True
 
 
+def test_japanese_series_collision_disambiguation_and_navigation():
+    """Verify series sharing Grimmory slug (e.g. 25-comic-) receive unique IDs, separate books, separate covers, and working next-book navigation."""
+    from app.dto_utils import disambiguate_series_dto
+
+    # 1. Verify disambiguate_series_dto creates unique deterministic IDs for Japanese titles with clashing slugs
+    s_rakuten = {"id": "25-comic-", "libraryId": "25", "name": "COMIC快楽天", "booksCount": 2}
+    s_europa = {"id": "25-comic-", "libraryId": "25", "name": "COMICエウロパ", "booksCount": 1}
+
+    id_rakuten = disambiguate_series_dto(s_rakuten)
+    id_europa = disambiguate_series_dto(s_europa)
+
+    assert id_rakuten.startswith("25-u-")
+    assert id_europa.startswith("25-u-")
+    assert id_rakuten != id_europa
+    assert s_rakuten["id"] == id_rakuten
+    assert s_europa["id"] == id_europa
+
+    # 2. Mock Grimmory backend responses
+    mock_series_list = {
+        "content": [
+            {"id": "25-comic-", "libraryId": "25", "name": "COMIC快楽天", "booksCount": 2},
+            {"id": "25-comic-", "libraryId": "25", "name": "COMICエウロパ", "booksCount": 1}
+        ],
+        "totalElements": 2,
+        "totalPages": 1,
+        "number": 0,
+        "size": 20
+    }
+
+    rakuten_books_native = [
+        {"id": 101, "title": "COMIC快楽天 2024年01月号", "seriesName": "COMIC快楽天", "seriesNumber": 1.0, "libraryId": 25},
+        {"id": 102, "title": "COMIC快楽天 2024年02月号", "seriesName": "COMIC快楽天", "seriesNumber": 2.0, "libraryId": 25}
+    ]
+    europa_books_native = [
+        {"id": 201, "title": "COMICエウロパ Vol.1", "seriesName": "COMICエウロパ", "seriesNumber": 1.0, "libraryId": 25}
+    ]
+
+    async def mock_komga_request(method, path, user, pwd, **kwargs):
+        if path.startswith("/api/v1/series"):
+            import copy
+            return httpx.Response(200, json=copy.deepcopy(mock_series_list))
+        if path == "/api/v1/books/101":
+            return httpx.Response(200, json={"id": "101", "seriesId": "25-comic-", "seriesTitle": "COMIC快楽天", "libraryId": "25", "number": 1.0, "name": "COMIC快楽天 2024年01月号"})
+        if path == "/api/v1/books/102":
+            return httpx.Response(200, json={"id": "102", "seriesId": "25-comic-", "seriesTitle": "COMIC快楽天", "libraryId": "25", "number": 2.0, "name": "COMIC快楽天 2024年02月号"})
+        if path == "/api/v1/books/201":
+            return httpx.Response(200, json={"id": "201", "seriesId": "25-comic-", "seriesTitle": "COMICエウロパ", "libraryId": "25", "number": 1.0, "name": "COMICエウロパ Vol.1"})
+        if path == "/api/v1/books/101/thumbnail":
+            return httpx.Response(200, content=b"JPEG_COVER_RAKUTEN", headers={"Content-Type": "image/jpeg"})
+        if path == "/api/v1/books/201/thumbnail":
+            return httpx.Response(200, content=b"JPEG_COVER_EUROPA", headers={"Content-Type": "image/jpeg"})
+        return httpx.Response(404)
+
+    async def mock_native_get(url, **kwargs):
+        if "/api/v1/app/series/" in url and "/books" in url:
+            if "%E5%BF%AB%E6%A5%BD%E5%A4%A9" in url or "COMIC快楽天" in url:
+                return httpx.Response(200, json=rakuten_books_native)
+            if "%E3%82%A8%E3%82%A6%E3%83%AD%E3%83%91" in url or "COMICエウロパ" in url:
+                return httpx.Response(200, json=europa_books_native)
+        return httpx.Response(404)
+
+    mock_client = AsyncMock()
+    mock_client.get = AsyncMock(side_effect=mock_native_get)
+
+    with patch.object(grimmory_client, "komga_request", side_effect=mock_komga_request), \
+         patch.object(grimmory_client, "get_client", return_value=mock_client), \
+         patch.object(grimmory_client, "get_native_token", new_callable=AsyncMock, return_value="dummy-token"):
+
+        # 3. GET /api/v1/series returns disambiguated IDs
+        r_series = client.get("/api/v1/series?library_id=25", headers=AUTH_HEADER)
+        assert r_series.status_code == 200
+        content = r_series.json()["content"]
+        assert len(content) == 2
+        r_rak = next(s for s in content if s["name"] == "COMIC快楽天")
+        r_eur = next(s for s in content if s["name"] == "COMICエウロパ")
+        assert r_rak["id"] == id_rakuten
+        assert r_eur["id"] == id_europa
+
+        # 4. Series thumbnails use respective first book covers
+        t_rak = client.get(f"/api/v1/series/{id_rakuten}/thumbnail", headers=AUTH_HEADER)
+        assert t_rak.status_code == 200
+        assert t_rak.content == b"JPEG_COVER_RAKUTEN"
+
+        t_eur = client.get(f"/api/v1/series/{id_europa}/thumbnail", headers=AUTH_HEADER)
+        assert t_eur.status_code == 200
+        assert t_eur.content == b"JPEG_COVER_EUROPA"
+
+        # 5. Series books endpoint returns distinct books
+        b_rak = client.get(f"/api/v1/series/{id_rakuten}/books", headers=AUTH_HEADER)
+        assert b_rak.status_code == 200
+        rak_books = b_rak.json()["content"]
+        assert len(rak_books) == 2
+        assert [b["id"] for b in rak_books] == ["101", "102"]
+        assert all(b["seriesId"] == id_rakuten for b in rak_books)
+
+        b_eur = client.get(f"/api/v1/series/{id_europa}/books", headers=AUTH_HEADER)
+        assert b_eur.status_code == 200
+        eur_books = b_eur.json()["content"]
+        assert len(eur_books) == 1
+        assert eur_books[0]["id"] == "201"
+        assert eur_books[0]["seriesId"] == id_europa
+
+        # 6. Next & Previous book navigation in disambiguated series
+        next_resp = client.get("/api/v1/books/101/next", headers=AUTH_HEADER)
+        assert next_resp.status_code == 200
+        assert next_resp.json()["id"] == "102"
+
+        prev_resp = client.get("/api/v1/books/102/previous", headers=AUTH_HEADER)
+        assert prev_resp.status_code == 200
+        assert prev_resp.json()["id"] == "101"
+
+        no_next = client.get("/api/v1/books/102/next", headers=AUTH_HEADER)
+        assert no_next.status_code == 404
+
+        # 7. Self-healing: clear custom_series cache, simulate server restart, fetch series
+        grimmory_client.custom_series.clear()
+        assert id_rakuten not in grimmory_client.custom_series
+        s_detail = client.get(f"/api/v1/series/{id_rakuten}", headers=AUTH_HEADER)
+        assert s_detail.status_code == 200
+        assert s_detail.json()["id"] == id_rakuten
+        assert s_detail.json()["name"] == "COMIC快楽天"
+
+
 if __name__ == "__main__":
     pytest.main(["-v", __file__])
 

@@ -780,6 +780,23 @@ class GrimmoryClient:
             "dto": dto
         }
 
+    async def ensure_custom_series_loaded(self, unique_id: str, user: str, pwd: str) -> None:
+        """Populate custom_series cache for a library if missing."""
+        if unique_id in self.custom_series:
+            return
+        if "-u-" not in unique_id:
+            return
+        lib_id = unique_id.split("-u-")[0]
+        try:
+            from app.dto_utils import disambiguate_series_dto
+            # Fetch series for this library (up to 500) to populate disambiguated mappings
+            resp = await self.komga_request("GET", f"/api/v1/series?library_id={lib_id}&size=500", user, pwd)
+            if resp.status_code == 200:
+                for s in resp.json().get("content", []):
+                    disambiguate_series_dto(s)
+        except Exception:
+            pass
+
     async def get_series_books_custom(
         self,
         unique_id: str,
@@ -787,20 +804,10 @@ class GrimmoryClient:
         pwd: str
     ) -> List[Dict[str, Any]]:
         """Fetch books for a disambiguated non-ASCII series."""
-        info = self.custom_series.get(unique_id)
-        if not info and "-u-" in unique_id:
-            # Self-healing: if server restarted, fetch library series to populate custom_series
-            lib_id = unique_id.split("-u-")[0]
-            try:
-                from app.dto_utils import disambiguate_series_dto
-                resp = await self.komga_request("GET", f"/api/v1/series?library_id={lib_id}&size=100", user, pwd)
-                if resp.status_code == 200:
-                    for s in resp.json().get("content", []):
-                        disambiguate_series_dto(s)
-            except Exception:
-                pass
-            info = self.custom_series.get(unique_id)
+        if unique_id not in self.custom_series and "-u-" in unique_id:
+            await self.ensure_custom_series_loaded(unique_id, user, pwd)
 
+        info = self.custom_series.get(unique_id)
         if not info:
             return []
 
@@ -816,31 +823,55 @@ class GrimmoryClient:
                 data = resp.json()
                 content = data.get("content", []) if isinstance(data, dict) else data if isinstance(data, list) else []
                 if content:
-                    return [raw_app_book_to_dto(b) for b in content if b.get("id")]
+                    filtered = [b for b in content if str(b.get("libraryId", lib_id)) == str(lib_id)]
+                    chosen = filtered if filtered else content
+                    dtos = [raw_app_book_to_dto(b, series_id_override=unique_id) for b in chosen if b.get("id")]
+                    dtos.sort(key=lambda x: x.get("metadata", {}).get("numberSort", 1.0))
+                    return dtos
         except Exception:
             pass
 
         # 2. Try search: /api/v1/app/books/search?q={name}
         try:
-            resp = await self.client.get(f"/api/v1/app/books/search?q={enc}&size=50", headers=native_headers)
+            resp = await self.client.get(f"/api/v1/app/books/search?q={enc}&size=100", headers=native_headers)
             if resp.status_code == 200:
                 data = resp.json()
                 content = data.get("content", []) if isinstance(data, dict) else data if isinstance(data, list) else []
                 matched = [b for b in content if (b.get("title") == s_name or b.get("seriesName") == s_name) and str(b.get("libraryId", lib_id)) == str(lib_id)]
                 if matched:
-                    return [raw_app_book_to_dto(b) for b in matched if b.get("id")]
+                    dtos = [raw_app_book_to_dto(b, series_id_override=unique_id) for b in matched if b.get("id")]
+                    dtos.sort(key=lambda x: x.get("metadata", {}).get("numberSort", 1.0))
+                    return dtos
         except Exception:
             pass
 
         # 3. If no books under series, search books in library where title or seriesName matches
         try:
-            resp = await self.client.get(f"/api/v1/app/books?libraryId={lib_id}&size=100", headers=native_headers)
+            resp = await self.client.get(f"/api/v1/app/books?libraryId={lib_id}&size=200", headers=native_headers)
             if resp.status_code == 200:
                 data = resp.json()
                 all_books = data.get("content", []) if isinstance(data, dict) else data if isinstance(data, list) else []
                 matched = [b for b in all_books if b.get("title") == s_name or b.get("seriesName") == s_name]
                 if matched:
-                    return [raw_app_book_to_dto(b) for b in matched if b.get("id")]
+                    dtos = [raw_app_book_to_dto(b, series_id_override=unique_id) for b in matched if b.get("id")]
+                    dtos.sort(key=lambda x: x.get("metadata", {}).get("numberSort", 1.0))
+                    return dtos
+        except Exception:
+            pass
+
+        # 4. Fallback: filter Grimmory Komga books by seriesTitle == s_name
+        try:
+            resp = await self.komga_request("GET", f"/api/v1/books?library_id={lib_id}&size=500", user, pwd)
+            if resp.status_code == 200:
+                data = resp.json()
+                all_komga_books = data.get("content", []) if isinstance(data, dict) else []
+                matched = [b for b in all_komga_books if b.get("seriesTitle") == s_name]
+                if matched:
+                    for b in matched:
+                        b["seriesId"] = unique_id
+                        ensure_book_dto(b)
+                    matched.sort(key=lambda x: x.get("metadata", {}).get("numberSort", 1.0))
+                    return matched
         except Exception:
             pass
 
