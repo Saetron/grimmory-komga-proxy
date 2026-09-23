@@ -13,6 +13,8 @@ import asyncio
 token_cache: TTLCache = TTLCache(maxsize=100, ttl=3600)
 # Cache page info per book (1 hour TTL)
 page_cache: TTLCache = TTLCache(maxsize=5000, ttl=3600)
+# Cache page count per book (24 hour TTL)
+page_count_cache: TTLCache = TTLCache(maxsize=10000, ttl=86400)
 # Cache book DTOs (5 min TTL)
 book_cache: TTLCache = TTLCache(maxsize=5000, ttl=300)
 
@@ -282,7 +284,86 @@ class GrimmoryClient:
             }]
 
         page_cache[book_id] = pages
+        page_count_cache[book_id] = len(pages)
         return pages
+
+    async def get_book_page_count(self, book_id: str, user: str, pwd: str) -> int:
+        """Get the page count for a book, using cache or querying Grimmory endpoints."""
+        if book_id in page_count_cache:
+            return page_count_cache[book_id]
+        if book_id in page_cache and len(page_cache[book_id]) > 0:
+            count = len(page_cache[book_id])
+            page_count_cache[book_id] = count
+            return count
+
+        native_headers = await self.get_native_headers(user, pwd)
+
+        # 1. Try CBX pages: /api/v1/cbx/{book_id}/pages returns [1, 2, ...]
+        try:
+            resp = await self.client.get(f"/api/v1/cbx/{book_id}/pages", headers=native_headers)
+            if resp.status_code == 200:
+                data = resp.json()
+                if isinstance(data, list) and len(data) > 0:
+                    count = len(data)
+                    page_count_cache[book_id] = count
+                    return count
+        except Exception:
+            pass
+
+        # 2. Try CBX page-dimensions
+        try:
+            resp = await self.client.get(f"/api/v1/cbx/{book_id}/page-dimensions", headers=native_headers)
+            if resp.status_code == 200:
+                data = resp.json()
+                if isinstance(data, list) and len(data) > 0:
+                    count = len(data)
+                    page_count_cache[book_id] = count
+                    return count
+        except Exception:
+            pass
+
+        # 3. Try PDF pages: /api/v1/pdf/{book_id}/pages
+        try:
+            resp = await self.client.get(f"/api/v1/pdf/{book_id}/pages", headers=native_headers)
+            if resp.status_code == 200:
+                data = resp.json()
+                count = data if isinstance(data, int) else len(data) if isinstance(data, list) else 0
+                if count > 0:
+                    page_count_cache[book_id] = count
+                    return count
+        except Exception:
+            pass
+
+        # 4. Try Komga layer: /komga/api/v1/books/{book_id}/pages
+        try:
+            resp = await self.komga_request("GET", f"/api/v1/books/{book_id}/pages", user, pwd)
+            if resp.status_code == 200:
+                data = resp.json()
+                if isinstance(data, list) and len(data) > 0:
+                    count = len(data)
+                    page_count_cache[book_id] = count
+                    return count
+        except Exception:
+            pass
+
+        return 1
+
+    async def enrich_books_page_count(self, books: List[Dict[str, Any]], user: str, pwd: str) -> None:
+        """Concurrently populate accurate pagesCount for a list of book DTOs."""
+        if not books:
+            return
+
+        async def _enrich_one(book: Dict[str, Any]):
+            book_id = str(book.get("id"))
+            if not book_id or book_id == "None":
+                return
+            count = await self.get_book_page_count(book_id, user, pwd)
+            if "media" not in book or not isinstance(book["media"], dict):
+                book["media"] = {"status": "READY", "mediaType": "application/x-cbz", "mediaProfile": "DIVINA"}
+            if count > 0:
+                book["media"]["pagesCount"] = count
+
+        await asyncio.gather(*[_enrich_one(b) for b in books], return_exceptions=True)
 
     async def get_book_dto(self, book_id: str, user: str, pwd: str) -> Optional[Dict[str, Any]]:
         """Fetch book DTO from Grimmory's Komga layer and enrich it."""
@@ -305,6 +386,10 @@ class GrimmoryClient:
                 if "media" not in book or not isinstance(book["media"], dict):
                     book["media"] = {"status": "READY", "mediaType": "application/x-cbz", "mediaProfile": "DIVINA"}
                 book["media"]["pagesCount"] = len(pages)
+        elif book_id in page_count_cache:
+            if "media" not in book or not isinstance(book["media"], dict):
+                book["media"] = {"status": "READY", "mediaType": "application/x-cbz", "mediaProfile": "DIVINA"}
+            book["media"]["pagesCount"] = page_count_cache[book_id]
 
         # Check and attach readProgress if fetched or in cache
         if "readProgress" not in book and (fetch_dimensions or book_id in book_cache):
@@ -412,6 +497,9 @@ class GrimmoryClient:
                     start = page * size
                     page_items = raw_books[start:start + size]
                     paged_content = [raw_app_book_to_dto(item) for item in page_items if item.get("id")]
+                    await self.enrich_books_page_count(paged_content, user, pwd)
+                    for b in paged_content:
+                        ensure_book_dto(b)
                     return ensure_page_dto({
                         "content": paged_content,
                         "totalElements": total,
@@ -447,6 +535,9 @@ class GrimmoryClient:
                     start = page * size
                     page_items = raw_books[start:start + size]
                     paged_content = [raw_app_book_to_dto(item) for item in page_items if item.get("id")]
+                    await self.enrich_books_page_count(paged_content, user, pwd)
+                    for b in paged_content:
+                        ensure_book_dto(b)
                     return ensure_page_dto({
                         "content": paged_content,
                         "totalElements": total,
@@ -470,6 +561,7 @@ class GrimmoryClient:
         if resp.status_code == 200:
             data = resp.json()
             if "content" in data and isinstance(data["content"], list):
+                await self.enrich_books_page_count(data["content"], user, pwd)
                 for b in data["content"]:
                     ensure_book_dto(b)
             return ensure_page_dto(data, default_page=page, default_size=size)

@@ -4,7 +4,7 @@ from unittest.mock import AsyncMock, patch
 import httpx
 from fastapi.testclient import TestClient
 from app.main import app
-from app.grimmory_client import grimmory_client, token_cache, page_cache, book_cache
+from app.grimmory_client import grimmory_client, token_cache, page_cache, page_count_cache, book_cache
 
 client = TestClient(app)
 
@@ -16,6 +16,7 @@ AUTH_HEADER = {
 def clear_caches():
     token_cache.clear()
     page_cache.clear()
+    page_count_cache.clear()
     book_cache.clear()
     grimmory_client.custom_series.clear()
 
@@ -360,9 +361,10 @@ def test_books_post_list_series_filter_routing():
         assert data["content"][0]["id"] == "book-in-series-1"
 
         # Verify it routed specifically to /api/v1/series/series-abc/books
-        assert mock_komga.call_args[0][1] == "/api/v1/series/series-abc/books"
+        first_call = mock_komga.call_args_list[0]
+        assert first_call[0][1] == "/api/v1/series/series-abc/books"
         # Verify series_id was not duplicated in params
-        assert "series_id" not in mock_komga.call_args[1].get("params", {})
+        assert "series_id" not in first_call[1].get("params", {})
 
         # 2. Test with 'values' array
         resp2 = client.post(
@@ -594,14 +596,20 @@ def test_disambiguated_series_integration_mock():
 
 
 def test_normal_series_books_routing():
-    """Verify normal series queries Grimmory's /komga/api/v1/series/{id}/books directly."""
+    """Verify normal series queries Grimmory's /komga/api/v1/series/{id}/books directly and enriches page count."""
     mock_komga_resp = httpx.Response(200, json={
         "content": [{"id": "145", "name": "Book 145", "media": {"status": "READY", "pagesCount": 0}}],
         "totalElements": 1,
         "totalPages": 1
     })
 
-    with patch.object(grimmory_client, "komga_request", new_callable=AsyncMock) as mock_komga:
+    mock_client = AsyncMock()
+    mock_client.get = AsyncMock(return_value=httpx.Response(200, json=list(range(1, 69))))
+
+    with patch.object(grimmory_client, "komga_request", new_callable=AsyncMock) as mock_komga, \
+         patch.object(grimmory_client, "get_client", return_value=mock_client), \
+         patch.object(grimmory_client, "get_native_token", new_callable=AsyncMock, return_value="dummy-token"):
+
         mock_komga.return_value = mock_komga_resp
 
         # POST /api/v1/books/list for normal series
@@ -614,10 +622,68 @@ def test_normal_series_books_routing():
         data = resp.json()
         assert len(data["content"]) == 1
         assert data["content"][0]["id"] == "145"
+        # Must be enriched from 0 to 68
+        assert data["content"][0]["media"]["pagesCount"] == 68
 
         # Ensure it called Grimmory's /api/v1/series/{id}/books
-        mock_komga.assert_called_once()
-        assert mock_komga.call_args[0][1] == "/api/v1/series/17-blade-runner-2029/books"
+        assert any(c[0][1] == "/api/v1/series/17-blade-runner-2029/books" for c in mock_komga.call_args_list)
+
+
+def test_book_page_count_enrichment_and_caching():
+    """Verify CBX page count resolution, PDF fallback, and TTL caching."""
+    mock_series_books = {
+        "content": [
+            {"id": "cbz-book-1", "name": "CBZ Comic", "media": {"status": "READY", "pagesCount": 0}},
+            {"id": "pdf-book-2", "name": "PDF Doc", "media": {"status": "READY", "pagesCount": 0}},
+        ],
+        "totalElements": 2,
+        "totalPages": 1
+    }
+
+    call_count = {"cbx": 0, "pdf": 0}
+
+    async def mock_native_get(url, **kwargs):
+        if "/cbx/cbz-book-1/pages" in url:
+            call_count["cbx"] += 1
+            return httpx.Response(200, json=list(range(1, 115))) # 114 pages
+        elif "/cbx/pdf-book-2/pages" in url:
+            return httpx.Response(404)
+        elif "/pdf/pdf-book-2/pages" in url:
+            call_count["pdf"] += 1
+            return httpx.Response(200, json=45) # 45 pages
+        return httpx.Response(404)
+
+    mock_client = AsyncMock()
+    mock_client.get = AsyncMock(side_effect=mock_native_get)
+
+    with patch.object(grimmory_client, "komga_request", new_callable=AsyncMock) as mock_komga, \
+         patch.object(grimmory_client, "get_client", return_value=mock_client), \
+         patch.object(grimmory_client, "get_native_token", new_callable=AsyncMock, return_value="dummy-token"):
+
+        mock_komga.return_value = httpx.Response(200, json=mock_series_books)
+
+        resp = client.get("/api/v1/series/10-test-series/books", headers=AUTH_HEADER)
+        assert resp.status_code == 200
+        books = resp.json()["content"]
+        assert len(books) == 2
+        assert books[0]["media"]["pagesCount"] == 114
+        assert books[1]["media"]["pagesCount"] == 45
+        assert call_count["cbx"] == 1
+        assert call_count["pdf"] == 1
+
+        # Second call should hit page_count_cache without calling client.get again
+        mock_komga.return_value = httpx.Response(200, json={
+            "content": [
+                {"id": "cbz-book-1", "name": "CBZ Comic", "media": {"status": "READY", "pagesCount": 0}},
+            ],
+            "totalElements": 1,
+            "totalPages": 1
+        })
+        resp2 = client.get("/api/v1/series/10-test-series/books", headers=AUTH_HEADER)
+        assert resp2.status_code == 200
+        assert resp2.json()["content"][0]["media"]["pagesCount"] == 114
+        # Cache hit: call count remains 1
+        assert call_count["cbx"] == 1
 
 
 def test_cbx_page_dimensions_sequential_indexing():

@@ -181,6 +181,7 @@ async def get_series_books(
         books = await grimmory_client.get_series_books_custom(series_id, user, pwd)
         start = page * size
         paged_content = books[start:start + size]
+        await grimmory_client.enrich_books_page_count(paged_content, user, pwd)
         for b in paged_content:
             ensure_book_dto(b)
         return ensure_page_dto({
@@ -195,6 +196,7 @@ async def get_series_books(
         raise HTTPException(status_code=resp.status_code, detail="Failed to fetch books for series")
     data = resp.json()
     if "content" in data and isinstance(data["content"], list):
+        await grimmory_client.enrich_books_page_count(data["content"], user, pwd)
         for b in data["content"]:
             ensure_book_dto(b)
     return ensure_page_dto(data, default_page=page, default_size=size)

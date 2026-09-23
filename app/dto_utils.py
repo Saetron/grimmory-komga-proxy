@@ -152,8 +152,10 @@ def ensure_book_dto(book: Dict[str, Any]) -> Dict[str, Any]:
     media.setdefault("mediaType", "application/x-cbz")
     media.setdefault("mediaProfile", "DIVINA")
     b_id = str(book.get("id"))
-    from app.grimmory_client import page_cache
-    if b_id in page_cache and len(page_cache[b_id]) > 0:
+    from app.grimmory_client import page_cache, page_count_cache
+    if b_id in page_count_cache and page_count_cache[b_id] > 0:
+        media["pagesCount"] = page_count_cache[b_id]
+    elif b_id in page_cache and len(page_cache[b_id]) > 0:
         media["pagesCount"] = len(page_cache[b_id])
     elif "pagesCount" not in media or media["pagesCount"] is None or media["pagesCount"] <= 0:
         media["pagesCount"] = 1
