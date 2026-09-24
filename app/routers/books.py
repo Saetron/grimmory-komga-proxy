@@ -55,9 +55,11 @@ async def list_books(
             return ensure_page_dto(data, default_page=page, default_size=size)
         return ensure_page_dto({"content": []}, default_page=page, default_size=size)
 
-    if "readProgress.readDate" in sort:
+    read_status_param = params.get("read_status", "") or params.get("readStatus", "")
+    if "in_progress" in str(read_status_param).lower() or "readprogress" in sort.lower() or "readdate" in sort.lower():
         return await grimmory_client.get_ondeck_books(user, pwd, page=page, size=size, library_id=library_id)
-    if "createdDate" in sort or "metadata.releaseDate" in sort:
+
+    if any(k in sort.lower() for k in ["createddate", "releasedate", "lastmodified", "created", "addedon"]):
         return await grimmory_client.get_latest_books(user, pwd, page=page, size=size, library_id=library_id)
 
     resp = await grimmory_client.komga_request("GET", "/api/v1/books", user, pwd, params=params)
@@ -138,11 +140,13 @@ async def list_books_post(
 
     # 2. Check if filtering by read status / in-progress
     read_status = filters.get("read_status", [])
-    if "IN_PROGRESS" in read_status or "readProgress.readDate" in sort:
+    query_read_status = params.get("read_status", "") or params.get("readStatus", "")
+    is_in_prog = any("in_progress" in str(s).lower() for s in (read_status if isinstance(read_status, list) else [read_status]))
+    if is_in_prog or "in_progress" in str(query_read_status).lower() or "readprogress" in sort.lower() or "readdate" in sort.lower():
         return await grimmory_client.get_ondeck_books(user, pwd, page=page, size=size, library_id=library_id)
 
     # 3. Check if sorting by recently added or released
-    if "createdDate" in sort or "metadata.releaseDate" in sort:
+    if any(k in sort.lower() for k in ["createddate", "releasedate", "lastmodified", "created", "addedon"]):
         return await grimmory_client.get_latest_books(user, pwd, page=page, size=size, library_id=library_id)
 
     if "search" in filters:

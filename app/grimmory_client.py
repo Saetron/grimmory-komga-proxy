@@ -5,7 +5,7 @@ import urllib.parse
 from typing import Optional, Dict, Any, List, Tuple
 from cachetools import TTLCache
 from app.config import settings
-from app.dto_utils import ensure_page_dto, ensure_book_dto, raw_app_book_to_dto
+from app.dto_utils import ensure_page_dto, ensure_book_dto, raw_app_book_to_dto, ensure_series_dto, disambiguate_series_dto
 import asyncio
 
 # In-memory caches:
@@ -686,35 +686,72 @@ class GrimmoryClient:
         size: int = 20,
         library_id: Optional[str] = None
     ) -> Dict[str, Any]:
-        """Fetch books currently reading (on deck)."""
+        """Fetch books currently reading (on deck) with complete readProgress."""
         native_headers = await self.get_native_headers(user, pwd)
+        raw_books = []
         try:
-            resp = await self.client.get("/api/v1/app/books/continue-reading", headers=native_headers)
+            resp = await self.client.get("/api/v1/app/books/continue-reading", params={"size": 100}, headers=native_headers)
             if resp.status_code == 200:
-                raw_books = resp.json()
-                if isinstance(raw_books, list):
-                    if library_id:
-                        raw_books = [
-                            b for b in raw_books
-                            if str(b.get("libraryId") or b.get("library_id")) == str(library_id)
-                        ]
-                    total = len(raw_books)
-                    start = page * size
-                    page_items = raw_books[start:start + size]
-                    paged_content = [raw_app_book_to_dto(item) for item in page_items if item.get("id")]
-                    await self.enrich_books_page_count(paged_content, user, pwd)
-                    for b in paged_content:
-                        ensure_book_dto(b)
-                    return ensure_page_dto({
-                        "content": paged_content,
-                        "totalElements": total,
-                        "number": page,
-                        "size": size
-                    }, default_page=page, default_size=size)
+                data = resp.json()
+                if isinstance(data, list):
+                    raw_books = data
+                elif isinstance(data, dict):
+                    raw_books = data.get("content", [])
         except Exception:
             pass
 
-        return ensure_page_dto({"content": []}, default_page=page, default_size=size)
+        # Merge active in-progress books from cache
+        seen_ids = {str(b.get("id")) for b in raw_books if b.get("id")}
+        for b_id, prog in list(read_progress_cache.items()):
+            if prog and not prog.get("completed") and prog.get("page", 0) > 0 and str(b_id) not in seen_ids:
+                cached_b = await self.get_book_dto(str(b_id), user, pwd)
+                if cached_b:
+                    raw_books.insert(0, cached_b)
+                    seen_ids.add(str(b_id))
+
+        if library_id:
+            raw_books = [
+                b for b in raw_books
+                if str(b.get("libraryId") or b.get("library_id")) == str(library_id)
+            ]
+
+        total = len(raw_books)
+        start = page * size
+        page_items = raw_books[start:start + size]
+
+        paged_content = []
+        for item in page_items:
+            if not item.get("id"):
+                continue
+            b_dto = item if ("media" in item and "metadata" in item) else raw_app_book_to_dto(item)
+            b_id = str(b_dto["id"])
+            if not b_dto.get("readProgress"):
+                b_dto["readProgress"] = await self.get_read_progress(b_id, user, pwd)
+
+            # Ensure valid in-progress status so Komic displays in On Deck
+            if not b_dto.get("readProgress"):
+                now_iso = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+                b_dto["readProgress"] = {
+                    "page": 1,
+                    "completed": False,
+                    "readDate": b_dto.get("lastModified") or now_iso,
+                    "created": b_dto.get("created") or now_iso,
+                    "lastModified": b_dto.get("lastModified") or now_iso,
+                    "deviceId": "komic",
+                    "deviceName": "Komic"
+                }
+            paged_content.append(b_dto)
+
+        await self.enrich_books_page_count(paged_content, user, pwd)
+        for b in paged_content:
+            ensure_book_dto(b)
+
+        return ensure_page_dto({
+            "content": paged_content,
+            "totalElements": total,
+            "number": page,
+            "size": size
+        }, default_page=page, default_size=size)
 
     async def get_latest_books(
         self,
@@ -727,10 +764,11 @@ class GrimmoryClient:
         """Fetch recently added books."""
         native_headers = await self.get_native_headers(user, pwd)
         try:
-            resp = await self.client.get("/api/v1/app/books/recently-added", headers=native_headers)
+            resp = await self.client.get("/api/v1/app/books/recently-added", params={"size": 500}, headers=native_headers)
             if resp.status_code == 200:
-                raw_books = resp.json()
-                if isinstance(raw_books, list) and len(raw_books) > 0:
+                data = resp.json()
+                raw_books = data.get("content", []) if isinstance(data, dict) else data if isinstance(data, list) else []
+                if raw_books:
                     if library_id:
                         raw_books = [
                             b for b in raw_books
@@ -772,6 +810,63 @@ class GrimmoryClient:
             return ensure_page_dto(data, default_page=page, default_size=size)
 
         return ensure_page_dto({"content": []}, default_page=page, default_size=size)
+
+    async def get_updated_series(
+        self,
+        user: str,
+        pwd: str,
+        page: int = 0,
+        size: int = 20,
+        library_id: Optional[str] = None
+    ) -> Dict[str, Any]:
+        """Fetch recently updated series based on chronological book activity."""
+        native_headers = await self.get_native_headers(user, pwd)
+        recent_series_names = []
+        try:
+            resp = await self.client.get("/api/v1/app/books/recently-added", params={"size": 500}, headers=native_headers)
+            if resp.status_code == 200:
+                raw = resp.json()
+                raw_books = raw.get("content", []) if isinstance(raw, dict) else raw if isinstance(raw, list) else []
+                for b in raw_books:
+                    if library_id and str(b.get("libraryId") or b.get("library_id")) != str(library_id):
+                        continue
+                    s_name = b.get("seriesName")
+                    if s_name and s_name not in recent_series_names:
+                        recent_series_names.append(s_name)
+        except Exception:
+            pass
+
+        # Fetch series from Grimmory
+        params = {"size": 500}
+        if library_id:
+            params["library_id"] = str(library_id)
+        resp = await self.komga_request("GET", "/api/v1/series", user, pwd, params=params)
+        if resp.status_code != 200:
+            return ensure_page_dto({"content": []}, default_page=page, default_size=size)
+
+        all_series = resp.json().get("content", []) if isinstance(resp.json(), dict) else []
+        for s in all_series:
+            disambiguate_series_dto(s)
+            ensure_series_dto(s)
+
+        # Rank series by chronological appearance in recently-added books
+        name_to_rank = {name.lower(): rank for rank, name in enumerate(recent_series_names)}
+
+        def series_sort_key(s):
+            name = (s.get("name") or s.get("metadata", {}).get("title") or "").lower()
+            return name_to_rank.get(name, 999999)
+
+        all_series.sort(key=series_sort_key)
+
+        total = len(all_series)
+        start = page * size
+        paged_content = all_series[start:start + size]
+        return ensure_page_dto({
+            "content": paged_content,
+            "totalElements": total,
+            "number": page,
+            "size": size
+        }, default_page=page, default_size=size)
 
     def register_custom_series(self, unique_id: str, lib_id: str, name: str, dto: Dict[str, Any]) -> None:
         """Register a disambiguated series mapping."""

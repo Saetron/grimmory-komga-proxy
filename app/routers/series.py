@@ -18,6 +18,11 @@ async def list_series(
     # Normalize libraryId to library_id for Grimmory compatibility
     if "libraryId" in params:
         params["library_id"] = params.pop("libraryId")
+    library_id = params.get("library_id")
+    sort = params.get("sort", "")
+
+    if any(k in sort.lower() for k in ["lastmodified", "created", "updated"]):
+        return await grimmory_client.get_updated_series(user, pwd, page=page, size=size, library_id=library_id)
 
     resp = await grimmory_client.komga_request("GET", "/api/v1/series", user, pwd, params=params)
     if resp.status_code != 200:
@@ -43,13 +48,17 @@ async def list_series_post(
     params = dict(request.query_params)
     page = int(params.get("page", 0))
     size = int(params.get("size", 20))
+    sort = params.get("sort", "")
+    body = {}
 
     # Normalize libraryId in query
     if "libraryId" in params:
         params["library_id"] = params.pop("libraryId")
 
     try:
-        body = await request.json()
+        raw_body = await request.json()
+        if isinstance(raw_body, dict):
+            body = raw_body
         filters = extract_search_filters(body)
         if "library_id" in filters:
             params["library_id"] = filters["library_id"]
@@ -57,6 +66,14 @@ async def list_series_post(
             params["search"] = filters["search"]
     except Exception:
         pass
+
+    library_id = params.get("library_id")
+    sort_val = sort
+    if not sort_val and "sort" in body:
+        sort_val = str(body["sort"])
+
+    if any(k in sort_val.lower() for k in ["lastmodified", "created", "updated"]):
+        return await grimmory_client.get_updated_series(user, pwd, page=page, size=size, library_id=library_id)
 
     resp = await grimmory_client.komga_request("GET", "/api/v1/series", user, pwd, params=params)
     if resp.status_code == 200:
@@ -82,22 +99,8 @@ async def list_series_special(
     params = dict(request.query_params)
     page = int(params.get("page", 0))
     size = int(params.get("size", 20))
-
-    # Normalize libraryId
-    if "libraryId" in params:
-        params["library_id"] = params.pop("libraryId")
-
-    if "sort" not in params:
-        params["sort"] = "lastModified,desc"
-    resp = await grimmory_client.komga_request("GET", "/api/v1/series", user, pwd, params=params)
-    if resp.status_code == 200:
-        data = resp.json()
-        if "content" in data and isinstance(data["content"], list):
-            for s in data["content"]:
-                disambiguate_series_dto(s)
-                ensure_series_dto(s)
-        return ensure_page_dto(data, default_page=page, default_size=size)
-    return ensure_page_dto({"content": []}, default_page=page, default_size=size)
+    library_id = params.get("library_id") or params.get("libraryId")
+    return await grimmory_client.get_updated_series(user, pwd, page=page, size=size, library_id=library_id)
 
 
 @router.get("/alphabetical-groups")

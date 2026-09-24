@@ -216,9 +216,14 @@ def ensure_book_dto(book: Dict[str, Any]) -> Dict[str, Any]:
     meta.setdefault("isbn", "")
     meta.setdefault("isbnLock", False)
     meta.setdefault("links", [])
-    meta.setdefault("linksLock", False)
     meta.setdefault("created", now_iso)
     meta.setdefault("lastModified", now_iso)
+
+    # Attach readProgress if available in cache and missing on book
+    from app.grimmory_client import read_progress_cache
+    if b_id in read_progress_cache and read_progress_cache[b_id]:
+        if "readProgress" not in book or book.get("readProgress") is None:
+            book["readProgress"] = read_progress_cache[b_id]
 
     return book
 
@@ -241,6 +246,41 @@ def raw_app_book_to_dto(raw: Dict[str, Any], series_id_override: Optional[str] =
     file_type = raw.get("primaryFileType")
     media_type = "application/x-cbz" if file_type == "CBX" else "application/pdf" if file_type == "PDF" else "application/epub+zip"
 
+    # Check for embedded progress in raw object or cache
+    page_prog = 1
+    pct_prog = 0
+    has_prog = False
+    if "cbxProgress" in raw and isinstance(raw["cbxProgress"], dict):
+        page_prog = raw["cbxProgress"].get("page", 1)
+        pct_prog = raw["cbxProgress"].get("percentage", 0)
+        has_prog = True
+    elif "pdfProgress" in raw and isinstance(raw["pdfProgress"], dict):
+        page_prog = raw["pdfProgress"].get("page", 1)
+        pct_prog = raw["pdfProgress"].get("percentage", 0)
+        has_prog = True
+    elif "epubProgress" in raw and isinstance(raw["epubProgress"], dict):
+        page_prog = raw["epubProgress"].get("page", 1)
+        pct_prog = raw["epubProgress"].get("percentage", 0)
+        has_prog = True
+
+    from app.grimmory_client import read_progress_cache
+    cached_prog = read_progress_cache.get(b_id)
+    read_prog = None
+    if cached_prog:
+        read_prog = cached_prog
+    elif has_prog:
+        date_fin = raw.get("dateFinished")
+        is_comp = bool(date_fin or pct_prog == 100 or raw.get("completed") or raw.get("isRead"))
+        read_prog = {
+            "page": page_prog,
+            "completed": is_comp,
+            "readDate": date_fin or raw.get("lastRead") or raw.get("coverUpdatedOn") or added_on,
+            "created": added_on,
+            "lastModified": added_on,
+            "deviceId": "komic",
+            "deviceName": "Komic"
+        }
+
     dto = {
         "id": b_id,
         "seriesId": series_id,
@@ -254,6 +294,7 @@ def raw_app_book_to_dto(raw: Dict[str, Any], series_id_override: Optional[str] =
         "fileLastModified": added_on,
         "sizeBytes": raw.get("fileSizeKb", 0) * 1024,
         "size": f"{raw.get('fileSizeKb', 0) // 1024} MB",
+        "readProgress": read_prog,
         "media": {
             "status": "READY",
             "mediaType": media_type,

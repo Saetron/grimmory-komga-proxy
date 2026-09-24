@@ -1063,7 +1063,142 @@ def test_series_books_pagination_exceeding_20_books():
         assert 2 in requested_pages
 
 
+def test_ondeck_read_progress_enrichment_and_cache_merge():
+    """Verify that On Deck enriches books with readProgress and merges cached in-progress books."""
+    from app.grimmory_client import read_progress_cache
+
+    # Book 201 has no progress embedded in native continue-reading response
+    raw_reading = [
+        {"id": 201, "name": "Book 201", "libraryId": 14}
+    ]
+
+    # Prepopulate read_progress_cache with Book 301 (active in-progress) and Book 401 (completed)
+    read_progress_cache["201"] = {"page": 3, "completed": False}
+    read_progress_cache["301"] = {"page": 12, "completed": False}
+    read_progress_cache["401"] = {"page": 100, "completed": True}
+
+    async def mock_get_book_dto(b_id, user, pwd):
+        return {
+            "id": str(b_id),
+            "name": f"Book {b_id}",
+            "libraryId": "14",
+            "media": {"pagesCount": 50},
+        }
+
+    async def mock_native_get(url, **kwargs):
+        if "continue-reading" in url:
+            return httpx.Response(200, json=raw_reading)
+        return httpx.Response(404)
+
+    mock_client = AsyncMock()
+    mock_client.get = AsyncMock(side_effect=mock_native_get)
+
+    with patch.object(grimmory_client, "get_client", return_value=mock_client), \
+         patch.object(grimmory_client, "get_book_dto", side_effect=mock_get_book_dto), \
+         patch.object(grimmory_client, "get_native_token", new_callable=AsyncMock, return_value="dummy-token"):
+
+        # 1. GET /api/v1/books/ondeck
+        resp = client.get("/api/v1/books/ondeck", headers=AUTH_HEADER)
+        assert resp.status_code == 200
+        content = resp.json()["content"]
+        ids = [b["id"] for b in content]
+        # Should include both 201 (from continue-reading) and 301 (from cache), but NOT 401 (completed)
+        assert "201" in ids
+        assert "301" in ids
+        assert "401" not in ids
+
+        for b in content:
+            # Komga clients REQUIRE readProgress with page and completed=False
+            assert "readProgress" in b
+            assert b["readProgress"] is not None
+            assert "page" in b["readProgress"]
+            assert b["readProgress"]["completed"] is False
+
+        # 2. GET /api/v1/books?read_status=IN_PROGRESS should route to on-deck
+        resp_filter = client.get("/api/v1/books?read_status=IN_PROGRESS", headers=AUTH_HEADER)
+        assert resp_filter.status_code == 200
+        f_ids = [b["id"] for b in resp_filter.json()["content"]]
+        assert "201" in f_ids
+        assert "301" in f_ids
+
+        # 3. POST /api/v1/books/list with sort=readProgress.readDate,desc should route to on-deck
+        resp_post = client.post(
+            "/api/v1/books/list?sort=readProgress.readDate,desc",
+            json={"readStatus": ["IN_PROGRESS"]},
+            headers=AUTH_HEADER
+        )
+        assert resp_post.status_code == 200
+        p_ids = [b["id"] for b in resp_post.json()["content"]]
+        assert "201" in p_ids
+        assert "301" in p_ids
+
+
+def test_recently_updated_series_chronological_ordering():
+    """Verify that recently updated series are ordered chronologically by book activity, not alphabetically."""
+    # Grimmory's /komga/api/v1/series returns series alphabetically: Series A, Series B, Series Z
+    komga_series_resp = {
+        "content": [
+            {"id": "s-a", "name": "Series A", "metadata": {"title": "Series A", "status": "ONGOING"}},
+            {"id": "s-b", "name": "Series B", "metadata": {"title": "Series B", "status": "ONGOING"}},
+            {"id": "s-z", "name": "Series Z", "metadata": {"title": "Series Z", "status": "ONGOING"}},
+        ],
+        "totalElements": 3,
+        "totalPages": 1
+    }
+
+    # Grimmory's /api/v1/app/books/recently-added has Series Z first, then Series A
+    recently_added_books = [
+        {"id": 901, "name": "Z vol 1", "seriesName": "Series Z", "libraryId": 14},
+        {"id": 902, "name": "A vol 2", "seriesName": "Series A", "libraryId": 14},
+    ]
+
+    async def mock_native_get(url, **kwargs):
+        if "recently-added" in url:
+            return httpx.Response(200, json=recently_added_books)
+        return httpx.Response(404)
+
+    mock_client = AsyncMock()
+    mock_client.get = AsyncMock(side_effect=mock_native_get)
+
+    with patch.object(grimmory_client, "komga_request", new_callable=AsyncMock) as mock_komga, \
+         patch.object(grimmory_client, "get_client", return_value=mock_client), \
+         patch.object(grimmory_client, "get_native_token", new_callable=AsyncMock, return_value="dummy-token"):
+
+        mock_komga.return_value = httpx.Response(200, json=komga_series_resp)
+
+        # 1. GET /api/v1/series/updated
+        resp = client.get("/api/v1/series/updated", headers=AUTH_HEADER)
+        assert resp.status_code == 200
+        content = resp.json()["content"]
+        assert len(content) == 3
+        # Should be ordered: Series Z (most recent book), Series A (next most recent), Series B (no recent activity)
+        assert content[0]["name"] == "Series Z"
+        assert content[1]["name"] == "Series A"
+        assert content[2]["name"] == "Series B"
+
+        # 2. POST /api/v1/series/list with sort=lastModified,desc
+        resp_post = client.post(
+            "/api/v1/series/list?sort=lastModified,desc",
+            json={},
+            headers=AUTH_HEADER
+        )
+        assert resp_post.status_code == 200
+        content_post = resp_post.json()["content"]
+        assert content_post[0]["name"] == "Series Z"
+        assert content_post[1]["name"] == "Series A"
+        assert content_post[2]["name"] == "Series B"
+
+        # 3. Pagination verification: page 0 size 1
+        resp_p0 = client.get("/api/v1/series/updated?page=0&size=1", headers=AUTH_HEADER)
+        assert resp_p0.status_code == 200
+        d_p0 = resp_p0.json()
+        assert d_p0["totalElements"] == 3
+        assert len(d_p0["content"]) == 1
+        assert d_p0["content"][0]["name"] == "Series Z"
+
+
 if __name__ == "__main__":
     pytest.main(["-v", __file__])
+
 
 
