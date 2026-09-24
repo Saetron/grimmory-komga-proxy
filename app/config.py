@@ -70,7 +70,9 @@ class Settings:
         os.getenv("USER_MAPPING") or os.getenv("USER_MAPPINGS") or os.getenv("USER_MAP") or ""
     )
     LOG_LEVEL: str = os.getenv("LOG_LEVEL", "info")
-    DATABASE_PATH: str = os.getenv("DATABASE_PATH", os.path.join(os.getenv("DATA_DIR", "data"), "bridge.db"))
+    DATA_DIR: str = os.getenv("DATA_DIR", "data")
+    DATABASE_PATH: str = os.getenv("DATABASE_PATH", os.path.join(DATA_DIR, "bridge.db"))
+    THUMBNAILS_DIR: str = os.getenv("THUMBNAILS_DIR", os.path.join(DATA_DIR, "thumbnails"))
     SYNC_INTERVAL_MINUTES: int = int(os.getenv("SYNC_INTERVAL_MINUTES", "30"))
     SYNC_ON_STARTUP: bool = os.getenv("SYNC_ON_STARTUP", "true").lower() in ("true", "1", "yes")
     SYNC_CONCURRENCY: int = int(os.getenv("SYNC_CONCURRENCY", "6"))

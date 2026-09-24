@@ -18,3 +18,5 @@ services:
       # Optional: set default credentials if client does not provide basic auth
       # - GRIMMORY_USERNAME=your_username
       # - GRIMMORY_PASSWORD=your_password
+    volumes:
+      - ./data:/app/data

@@ -67,8 +67,83 @@ class ReadProgressCache(TTLCache):
 read_progress_cache: ReadProgressCache = ReadProgressCache(maxsize=10000, ttl=86400 * 30)
 # Cache book DTOs (5 min TTL)
 book_cache: TTLCache = TTLCache(maxsize=5000, ttl=300)
-# Cache thumbnails (7 days TTL)
-thumbnail_cache: TTLCache = TTLCache(maxsize=3000, ttl=86400 * 7)
+def get_thumbnail_path(target_type: str, item_id: str) -> str:
+    safe_id = "".join(c for c in str(item_id) if c.isalnum() or c in ("-", "_"))
+    dir_path = os.path.join(settings.THUMBNAILS_DIR, target_type)
+    os.makedirs(dir_path, exist_ok=True)
+    return os.path.join(dir_path, f"{safe_id}.img")
+
+def detect_image_type(content: bytes) -> str:
+    if content.startswith(b"\xff\xd8\xff"):
+        return "image/jpeg"
+    elif content.startswith(b"\x89PNG"):
+        return "image/png"
+    elif content.startswith(b"RIFF") and b"WEBP" in content[:16]:
+        return "image/webp"
+    elif content.startswith(b"GIF8"):
+        return "image/gif"
+    return "image/jpeg"
+
+def get_cached_thumbnail(target_type: str, item_id: str) -> Optional[Tuple[bytes, str]]:
+    """Retrieve thumbnail from persistent disk storage (mount point)."""
+    path = get_thumbnail_path(target_type, item_id)
+    if os.path.exists(path):
+        try:
+            with open(path, "rb") as f:
+                content = f.read()
+            if content:
+                return content, detect_image_type(content)
+        except Exception:
+            pass
+    return None
+
+def save_cached_thumbnail(target_type: str, item_id: str, content: bytes, content_type: str = "image/jpeg") -> None:
+    """Save thumbnail to persistent disk storage (mount point)."""
+    if not content:
+        return
+    path = get_thumbnail_path(target_type, item_id)
+    try:
+        with open(path, "wb") as f:
+            f.write(content)
+    except Exception as e:
+        logger.debug(f"[Thumbnail] Could not save thumbnail to disk: {e}")
+
+class DiskThumbnailCache:
+    """Disk-backed thumbnail cache stored on persistent mount point (zero RAM usage)."""
+    def __getitem__(self, key: str) -> Tuple[bytes, str]:
+        t_type, item_id = key.split(":", 1) if ":" in key else ("books", key)
+        cached = get_cached_thumbnail("books" if t_type == "b" else "series" if t_type == "s" else t_type, item_id)
+        if cached is not None:
+            return cached
+        raise KeyError(key)
+
+    def __setitem__(self, key: str, value: Tuple[bytes, str]):
+        t_type, item_id = key.split(":", 1) if ":" in key else ("books", key)
+        content, c_type = value
+        save_cached_thumbnail("books" if t_type == "b" else "series" if t_type == "s" else t_type, item_id, content, c_type)
+
+    def __contains__(self, key: str) -> bool:
+        t_type, item_id = key.split(":", 1) if ":" in key else ("books", key)
+        path = get_thumbnail_path("books" if t_type == "b" else "series" if t_type == "s" else t_type, item_id)
+        return os.path.exists(path)
+
+    def get(self, key: str, default=None):
+        try:
+            return self[key]
+        except KeyError:
+            return default
+
+    def clear(self):
+        try:
+            import shutil
+            if os.path.exists(settings.THUMBNAILS_DIR):
+                shutil.rmtree(settings.THUMBNAILS_DIR)
+            os.makedirs(settings.THUMBNAILS_DIR, exist_ok=True)
+        except Exception:
+            pass
+
+# Disk-backed thumbnail cache (uses persistent volume mount point, zero RAM bloating)
+thumbnail_cache: DiskThumbnailCache = DiskThumbnailCache()
 # Active reading sessions: session_key -> dict
 active_sessions: Dict[str, Dict[str, Any]] = {}
 
