@@ -2,6 +2,7 @@ from fastapi import APIRouter, Header, Request, Response, HTTPException, status
 from typing import Optional, Dict, Any, List
 from app.grimmory_client import grimmory_client
 from app.dto_utils import ensure_page_dto, ensure_series_dto, ensure_book_dto, extract_search_filters, disambiguate_series_dto
+from app.db import db
 
 router = APIRouter(prefix="/api/v1/series", tags=["Series"])
 
@@ -27,6 +28,37 @@ async def list_series(
 
     if any(k in sort.lower() for k in ["lastmodified", "created", "updated"]):
         return await grimmory_client.get_updated_series(user, pwd, page=page, size=size, library_id=library_id)
+
+    # Check SQLite DB first for instant snappy response
+    cached_series = db.get_all_series(library_id=library_id)
+    if cached_series:
+        user_libs = await grimmory_client.get_user_library_ids(user, pwd)
+        if user_libs is not None:
+            cached_series = [s for s in cached_series if str(s.get("libraryId") or s.get("library_id", "")) in user_libs]
+
+        sort_lower = sort.lower()
+        if "titlesort" in sort_lower or "name" in sort_lower:
+            reverse = "desc" in sort_lower
+            cached_series.sort(key=lambda s: str(s.get("metadata", {}).get("titleSort") or s.get("name", "")).lower(), reverse=reverse)
+        elif "created" in sort_lower or "added" in sort_lower:
+            reverse = "desc" in sort_lower
+            cached_series.sort(key=lambda s: str(s.get("created") or s.get("lastModified") or ""), reverse=reverse)
+        elif "bookscount" in sort_lower:
+            reverse = "desc" in sort_lower
+            cached_series.sort(key=lambda s: int(s.get("booksCount", 0)), reverse=reverse)
+
+        total = len(cached_series)
+        start = page * size
+        paged_content = cached_series[start:start + size]
+        for s in paged_content:
+            disambiguate_series_dto(s)
+            ensure_series_dto(s)
+        return ensure_page_dto({
+            "content": paged_content,
+            "totalElements": total,
+            "number": page,
+            "size": size
+        }, default_page=page, default_size=size)
 
     resp = await grimmory_client.komga_request("GET", "/api/v1/series", user, pwd, params=params)
     if resp.status_code != 200:
@@ -82,6 +114,37 @@ async def list_series_post(
 
     if any(k in sort_val.lower() for k in ["lastmodified", "created", "updated"]):
         return await grimmory_client.get_updated_series(user, pwd, page=page, size=size, library_id=library_id)
+
+    # Check SQLite DB first for instant snappy response
+    cached_series = db.get_all_series(library_id=library_id)
+    if cached_series:
+        user_libs = await grimmory_client.get_user_library_ids(user, pwd)
+        if user_libs is not None:
+            cached_series = [s for s in cached_series if str(s.get("libraryId") or s.get("library_id", "")) in user_libs]
+
+        sort_lower = sort_val.lower()
+        if "titlesort" in sort_lower or "name" in sort_lower:
+            reverse = "desc" in sort_lower
+            cached_series.sort(key=lambda s: str(s.get("metadata", {}).get("titleSort") or s.get("name", "")).lower(), reverse=reverse)
+        elif "created" in sort_lower or "added" in sort_lower:
+            reverse = "desc" in sort_lower
+            cached_series.sort(key=lambda s: str(s.get("created") or s.get("lastModified") or ""), reverse=reverse)
+        elif "bookscount" in sort_lower:
+            reverse = "desc" in sort_lower
+            cached_series.sort(key=lambda s: int(s.get("booksCount", 0)), reverse=reverse)
+
+        total = len(cached_series)
+        start = page * size
+        paged_content = cached_series[start:start + size]
+        for s in paged_content:
+            disambiguate_series_dto(s)
+            ensure_series_dto(s)
+        return ensure_page_dto({
+            "content": paged_content,
+            "totalElements": total,
+            "number": page,
+            "size": size
+        }, default_page=page, default_size=size)
 
     resp = await grimmory_client.komga_request("GET", "/api/v1/series", user, pwd, params=params)
     if resp.status_code == 200:
@@ -176,6 +239,13 @@ async def get_series(
 
         raise HTTPException(status_code=404, detail="Series not found")
 
+    db_series = db.get_series(series_id)
+    if db_series:
+        if await grimmory_client.user_can_access_series(db_series, user, pwd):
+            disambiguate_series_dto(db_series)
+            return ensure_series_dto(db_series)
+        raise HTTPException(status_code=404, detail="Series not found")
+
     resp = await grimmory_client.komga_request("GET", f"/api/v1/series/{series_id}", user, pwd)
     if resp.status_code != 200:
         raise HTTPException(status_code=resp.status_code, detail="Series not found")
@@ -228,6 +298,25 @@ async def get_series_books(
         return ensure_page_dto({
             "content": paged_content,
             "totalElements": len(books),
+            "number": page,
+            "size": size
+        }, default_page=page, default_size=size)
+
+    # Check SQLite DB first for instant snappy response
+    db_books = db.get_books_by_series(series_id)
+    if db_books:
+        user_libs = await grimmory_client.get_user_library_ids(user, pwd)
+        if user_libs is not None:
+            db_books = [b for b in db_books if str(b.get("libraryId") or b.get("library_id", "")) in user_libs]
+        total = len(db_books)
+        start = page * size
+        paged_content = db_books[start:start + size]
+        await grimmory_client.enrich_books_page_count(paged_content, user, pwd)
+        for b in paged_content:
+            ensure_book_dto(b)
+        return ensure_page_dto({
+            "content": paged_content,
+            "totalElements": total,
             "number": page,
             "size": size
         }, default_page=page, default_size=size)

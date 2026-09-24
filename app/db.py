@@ -258,6 +258,26 @@ class Database:
                     pass
             return result
 
+    def get_latest_books(self, library_id: Optional[str] = None, limit: int = 100) -> List[Dict[str, Any]]:
+        with self._get_connection() as conn:
+            if library_id:
+                rows = conn.execute(
+                    "SELECT dto_json FROM books WHERE library_id = ? ORDER BY updated_at DESC LIMIT ?",
+                    (str(library_id), limit)
+                ).fetchall()
+            else:
+                rows = conn.execute(
+                    "SELECT dto_json FROM books ORDER BY updated_at DESC LIMIT ?",
+                    (limit,)
+                ).fetchall()
+            result = []
+            for r in rows:
+                try:
+                    result.append(json.loads(r["dto_json"]))
+                except Exception:
+                    pass
+            return result
+
     def search_books(self, query: str, library_id: Optional[str] = None) -> List[Dict[str, Any]]:
         term = f"%{query.strip()}%"
         with self._get_connection() as conn:

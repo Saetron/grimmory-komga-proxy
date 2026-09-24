@@ -3,6 +3,7 @@ from fastapi.responses import StreamingResponse
 from typing import Optional, Dict, Any, List
 from app.grimmory_client import grimmory_client
 from app.dto_utils import ensure_page_dto, ensure_book_dto, extract_search_filters
+from app.db import db
 
 router = APIRouter(prefix="/api/v1/books", tags=["Books"])
 
@@ -53,6 +54,25 @@ async def list_books(
                 "size": size
             }, default_page=page, default_size=size)
 
+        # Check SQLite DB first!
+        db_books = db.get_books_by_series(series_id)
+        if db_books:
+            user_libs = await grimmory_client.get_user_library_ids(user, pwd)
+            if user_libs is not None:
+                db_books = [b for b in db_books if str(b.get("libraryId") or b.get("library_id", "")) in user_libs]
+            total = len(db_books)
+            start = page * size
+            paged_content = db_books[start:start + size]
+            await grimmory_client.enrich_books_page_count(paged_content, user, pwd)
+            for b in paged_content:
+                ensure_book_dto(b)
+            return ensure_page_dto({
+                "content": paged_content,
+                "totalElements": total,
+                "number": page,
+                "size": size
+            }, default_page=page, default_size=size)
+
         resp = await grimmory_client.komga_request("GET", f"/api/v1/series/{series_id}/books", user, pwd, params=params)
         if resp.status_code == 200:
             data = resp.json()
@@ -81,6 +101,26 @@ async def list_books(
 
     if any(k in sort.lower() for k in ["createddate", "lastmodified", "created", "addedon"]):
         return await grimmory_client.get_latest_books(user, pwd, page=page, size=size, library_id=library_id)
+
+    # Check SQLite DB first if library_id is provided
+    if library_id:
+        db_books = db.get_all_books(library_id=library_id)
+        if db_books:
+            user_libs = await grimmory_client.get_user_library_ids(user, pwd)
+            if user_libs is not None:
+                db_books = [b for b in db_books if str(b.get("libraryId") or b.get("library_id", "")) in user_libs]
+            total = len(db_books)
+            start = page * size
+            paged_content = db_books[start:start + size]
+            await grimmory_client.enrich_books_page_count(paged_content, user, pwd)
+            for b in paged_content:
+                ensure_book_dto(b)
+            return ensure_page_dto({
+                "content": paged_content,
+                "totalElements": total,
+                "number": page,
+                "size": size
+            }, default_page=page, default_size=size)
 
     resp = await grimmory_client.komga_request("GET", "/api/v1/books", user, pwd, params=params)
     if resp.status_code != 200:
@@ -153,6 +193,25 @@ async def list_books_post(
                 "size": size
             }, default_page=page, default_size=size)
 
+        # Check SQLite DB first!
+        db_books = db.get_books_by_series(series_id)
+        if db_books:
+            user_libs = await grimmory_client.get_user_library_ids(user, pwd)
+            if user_libs is not None:
+                db_books = [b for b in db_books if str(b.get("libraryId") or b.get("library_id", "")) in user_libs]
+            total = len(db_books)
+            start = page * size
+            paged_content = db_books[start:start + size]
+            await grimmory_client.enrich_books_page_count(paged_content, user, pwd)
+            for b in paged_content:
+                ensure_book_dto(b)
+            return ensure_page_dto({
+                "content": paged_content,
+                "totalElements": total,
+                "number": page,
+                "size": size
+            }, default_page=page, default_size=size)
+
         # Grimmory ONLY returns books for a series via /series/{id}/books
         params.pop("series_id", None)
         params.pop("seriesId", None)
@@ -194,6 +253,26 @@ async def list_books_post(
 
     if any(k in sort_str for k in ["createddate", "lastmodified", "created", "addedon"]):
         return await grimmory_client.get_latest_books(user, pwd, page=page, size=size, library_id=library_id)
+
+    # Check SQLite DB first if library_id is provided
+    if library_id:
+        db_books = db.get_all_books(library_id=library_id)
+        if db_books:
+            user_libs = await grimmory_client.get_user_library_ids(user, pwd)
+            if user_libs is not None:
+                db_books = [b for b in db_books if str(b.get("libraryId") or b.get("library_id", "")) in user_libs]
+            total = len(db_books)
+            start = page * size
+            paged_content = db_books[start:start + size]
+            await grimmory_client.enrich_books_page_count(paged_content, user, pwd)
+            for b in paged_content:
+                ensure_book_dto(b)
+            return ensure_page_dto({
+                "content": paged_content,
+                "totalElements": total,
+                "number": page,
+                "size": size
+            }, default_page=page, default_size=size)
 
     resp = await grimmory_client.komga_request("GET", "/api/v1/books", user, pwd, params=params)
     if resp.status_code == 200:

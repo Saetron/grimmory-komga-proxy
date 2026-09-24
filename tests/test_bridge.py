@@ -1920,6 +1920,64 @@ def test_user_mapping_and_aliases():
     assert p == "real_grimmory_pwd"
 
 
+def test_snappy_performance_zero_network_when_cached():
+    """Verify that browsing series, library, and series books uses SQLite cache with zero network requests."""
+    # Seed SQLite DB
+    db.save_series({
+        "id": "s-snappy-1",
+        "libraryId": "lib-snappy",
+        "name": "Snappy Manga",
+        "booksCount": 2,
+        "metadata": {"title": "Snappy Manga", "titleSort": "Snappy Manga"}
+    })
+    db.save_books_batch([
+        {"id": "b-snappy-1", "seriesId": "s-snappy-1", "libraryId": "lib-snappy", "name": "Chapter 1", "number": 1.0, "media": {"pagesCount": 25}},
+        {"id": "b-snappy-2", "seriesId": "s-snappy-1", "libraryId": "lib-snappy", "name": "Chapter 2", "number": 2.0, "media": {"pagesCount": 30}}
+    ])
+
+    # If any network call is made to Grimmory, fail immediately!
+    mock_komga = AsyncMock(side_effect=RuntimeError("Network request should NOT occur when data is cached in SQLite!"))
+    mock_client = AsyncMock()
+    mock_client.get = AsyncMock(side_effect=RuntimeError("Client GET should NOT occur when data is cached in SQLite!"))
+
+    with patch.object(grimmory_client, "komga_request", side_effect=mock_komga), \
+         patch.object(grimmory_client, "get_client", return_value=mock_client), \
+         patch.object(grimmory_client, "get_user_library_ids", new_callable=AsyncMock, return_value={"lib-snappy"}):
+
+        # 1. GET /api/v1/series?library_id=lib-snappy
+        resp_series = client.get("/api/v1/series?library_id=lib-snappy", headers=AUTH_HEADER)
+        assert resp_series.status_code == 200
+        assert len(resp_series.json()["content"]) == 1
+        assert resp_series.json()["content"][0]["id"] == "s-snappy-1"
+
+        # 2. POST /api/v1/series/list
+        resp_series_post = client.post("/api/v1/series/list", json={"library_id": "lib-snappy"}, headers=AUTH_HEADER)
+        assert resp_series_post.status_code == 200
+        assert len(resp_series_post.json()["content"]) == 1
+        assert resp_series_post.json()["content"][0]["id"] == "s-snappy-1"
+
+        # 3. GET /api/v1/series/s-snappy-1
+        resp_single_series = client.get("/api/v1/series/s-snappy-1", headers=AUTH_HEADER)
+        assert resp_single_series.status_code == 200
+        assert resp_single_series.json()["name"] == "Snappy Manga"
+
+        # 4. GET /api/v1/series/s-snappy-1/books
+        resp_books = client.get("/api/v1/series/s-snappy-1/books", headers=AUTH_HEADER)
+        assert resp_books.status_code == 200
+        assert len(resp_books.json()["content"]) == 2
+        assert resp_books.json()["content"][0]["id"] == "b-snappy-1"
+
+        # 5. POST /api/v1/books/list with series_id
+        resp_books_post = client.post("/api/v1/books/list", json={"series_id": "s-snappy-1"}, headers=AUTH_HEADER)
+        assert resp_books_post.status_code == 200
+        assert len(resp_books_post.json()["content"]) == 2
+
+        # 6. GET /api/v1/books?library_id=lib-snappy
+        resp_all_books = client.get("/api/v1/books?library_id=lib-snappy", headers=AUTH_HEADER)
+        assert resp_all_books.status_code == 200
+        assert len(resp_all_books.json()["content"]) == 2
+
+
 if __name__ == "__main__":
     pytest.main(["-v", __file__])
 

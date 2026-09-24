@@ -567,11 +567,11 @@ class GrimmoryClient:
             if count > 0:
                 book["media"]["pagesCount"] = count
 
-            # Attach read progress if missing or null
+            # Attach read progress from in-memory cache or SQLite DB (fast, 0 network requests)
             if "readProgress" not in book or book.get("readProgress") is None:
-                progress = await self.get_read_progress(book_id, user, pwd)
-                if progress:
-                    book["readProgress"] = progress
+                prog = read_progress_cache.get(book_id) or db.get_read_progress(book_id)
+                if prog:
+                    book["readProgress"] = prog
                 else:
                     book["readProgress"] = None
 
@@ -1075,10 +1075,7 @@ class GrimmoryClient:
         if user_libs is not None:
             all_books = [b for b in all_books if str(b.get("libraryId") or b.get("library_id", "")) in user_libs]
 
-        await self.enrich_books_page_count(all_books, user, pwd)
-        for b in all_books:
-            ensure_book_dto(b)
-
+        # Filter books by status
         matched_books = []
         for b in all_books:
             if library_id:
@@ -1128,6 +1125,10 @@ class GrimmoryClient:
         start = page * size
         paged_content = matched_books[start:start + size]
 
+        await self.enrich_books_page_count(paged_content, user, pwd)
+        for b in paged_content:
+            ensure_book_dto(b)
+
         return ensure_page_dto({
             "content": paged_content,
             "totalElements": total,
@@ -1159,48 +1160,7 @@ class GrimmoryClient:
 
         seen_ids = {str(b.get("id")) for b in raw_books if b.get("id")}
 
-        # 2. Check magic shelves if continue-reading is empty
-        if not raw_books:
-            try:
-                resp = await self.client.get("/api/v1/app/shelves/magic", headers=native_headers)
-                if resp.status_code == 200:
-                    shelves = resp.json()
-                    if isinstance(shelves, list):
-                        for s in shelves:
-                            s_name = (s.get("name") or "").lower()
-                            if any(k in s_name for k in ["reading", "in progress", "currently"]):
-                                s_id = s.get("id")
-                                if s_id:
-                                    b_resp = await self.client.get(f"/api/v1/app/shelves/magic/{s_id}/books", headers=native_headers)
-                                    if b_resp.status_code == 200:
-                                        b_data = b_resp.json()
-                                        b_list = b_data.get("content", []) if isinstance(b_data, dict) else b_data if isinstance(b_data, list) else []
-                                        for b in b_list:
-                                            b_id = str(b.get("id"))
-                                            if b_id and b_id not in seen_ids and not self._is_book_finished(b):
-                                                raw_books.append(b)
-                                                seen_ids.add(b_id)
-            except Exception:
-                pass
-
-        # 3. If still empty, check top recently added/active books
-        if not raw_books and len(seen_ids) == 0:
-            try:
-                resp = await self.client.get("/api/v1/app/books/recently-added", params={"size": 15}, headers=native_headers)
-                if resp.status_code == 200:
-                    r_data = resp.json()
-                    r_books = r_data.get("content", []) if isinstance(r_data, dict) else r_data if isinstance(r_data, list) else []
-                    for b in r_books:
-                        b_id = str(b.get("id"))
-                        if b_id and b_id not in seen_ids:
-                            prog = await self.get_read_progress(b_id, user, pwd)
-                            if prog and not prog.get("completed") and prog.get("page", 0) > 0 and not self._is_book_finished(b):
-                                raw_books.append(b)
-                                seen_ids.add(b_id)
-            except Exception:
-                pass
-
-        # 4. Merge active in-progress books from DB and cache
+        # 2. Merge active in-progress books from DB and cache
         try:
             db_in_progress = db.get_all_in_progress()
             for b_id, prog in db_in_progress:
@@ -1220,7 +1180,7 @@ class GrimmoryClient:
                     raw_books.insert(0, cached_b)
                     seen_ids.add(str(b_id))
 
-        # 5. Strict filter: remove ANY completed or finished book
+        # 3. Strict filter: remove ANY completed or finished book
         final_books = []
         for b in raw_books:
             if self._is_book_finished(b):
@@ -1253,7 +1213,7 @@ class GrimmoryClient:
             b_dto = item if ("media" in item and "metadata" in item) else raw_app_book_to_dto(item)
             b_id = str(b_dto["id"])
             if not b_dto.get("readProgress"):
-                b_dto["readProgress"] = await self.get_read_progress(b_id, user, pwd)
+                b_dto["readProgress"] = read_progress_cache.get(b_id) or db.get_read_progress(b_id)
 
             if self._is_book_finished(b_dto):
                 continue
@@ -1309,24 +1269,25 @@ class GrimmoryClient:
                 candidate_books.append(b)
                 seen_ids.add(b_id)
 
-        # 2. Query Grimmory native recently added books to check for newly published dates
-        native_headers = await self.get_native_headers(user, pwd)
-        try:
-            resp = await self.client.get("/api/v1/app/books/recently-added", params={"size": 500}, headers=native_headers)
-            if resp.status_code == 200:
-                data = resp.json()
-                raw_list = data.get("content", []) if isinstance(data, dict) else data if isinstance(data, list) else []
-                for item in raw_list:
-                    b_id = str(item.get("id"))
-                    if b_id and b_id not in seen_ids:
-                        dto = raw_app_book_to_dto(item)
-                        rd = dto.get("metadata", {}).get("releaseDate") or item.get("publishedDate") or item.get("releaseDate")
-                        if rd and str(rd).strip() not in ("", "null", "None"):
-                            dto["metadata"]["releaseDate"] = str(rd).strip()
-                            candidate_books.append(dto)
-                            seen_ids.add(b_id)
-        except Exception:
-            pass
+        # 2. Query Grimmory native recently added books only if DB has no release dates yet
+        if not candidate_books:
+            native_headers = await self.get_native_headers(user, pwd)
+            try:
+                resp = await self.client.get("/api/v1/app/books/recently-added", params={"size": 500}, headers=native_headers)
+                if resp.status_code == 200:
+                    data = resp.json()
+                    raw_list = data.get("content", []) if isinstance(data, dict) else data if isinstance(data, list) else []
+                    for item in raw_list:
+                        b_id = str(item.get("id"))
+                        if b_id and b_id not in seen_ids:
+                            dto = raw_app_book_to_dto(item)
+                            rd = dto.get("metadata", {}).get("releaseDate") or item.get("publishedDate") or item.get("releaseDate")
+                            if rd and str(rd).strip() not in ("", "null", "None"):
+                                dto["metadata"]["releaseDate"] = str(rd).strip()
+                                candidate_books.append(dto)
+                                seen_ids.add(b_id)
+            except Exception:
+                pass
 
         # 3. If needed, query Grimmory Komga endpoint with releaseDate sort
         if not candidate_books:
@@ -1351,7 +1312,9 @@ class GrimmoryClient:
         user_libs = await self.get_user_library_ids(user, pwd)
         valid_released_books = []
         for b in candidate_books:
-            if user_libs is not None and str(b.get("libraryId") or b.get("library_id", "")) not in user_libs:
+            if user_libs is not None and str(b.get("libraryId") or b.get("library_id", "")) in user_libs:
+                pass
+            elif user_libs is not None:
                 continue
             if library_id and str(b.get("libraryId") or b.get("library_id")) != str(library_id):
                 continue
@@ -1389,6 +1352,25 @@ class GrimmoryClient:
         library_id: Optional[str] = None
     ) -> Dict[str, Any]:
         """Fetch recently added books."""
+        # 1. Try SQLite persistent cache first
+        db_books = db.get_latest_books(library_id=library_id, limit=200)
+        if db_books:
+            user_libs = await self.get_user_library_ids(user, pwd)
+            if user_libs is not None:
+                db_books = [b for b in db_books if str(b.get("libraryId") or b.get("library_id", "")) in user_libs]
+            total = len(db_books)
+            start = page * size
+            page_items = db_books[start:start + size]
+            await self.enrich_books_page_count(page_items, user, pwd)
+            for b in page_items:
+                ensure_book_dto(b)
+            return ensure_page_dto({
+                "content": page_items,
+                "totalElements": total,
+                "number": page,
+                "size": size
+            }, default_page=page, default_size=size)
+
         native_headers = await self.get_native_headers(user, pwd)
         try:
             resp = await self.client.get("/api/v1/app/books/recently-added", params={"size": 500}, headers=native_headers)
@@ -1453,34 +1435,47 @@ class GrimmoryClient:
         library_id: Optional[str] = None
     ) -> Dict[str, Any]:
         """Fetch recently updated series based on chronological book activity."""
-        native_headers = await self.get_native_headers(user, pwd)
-        recent_series_names = []
-        try:
-            resp = await self.client.get("/api/v1/app/books/recently-added", params={"size": 500}, headers=native_headers)
+        # 1. Check SQLite DB for series first
+        all_series = db.get_all_series(library_id=library_id)
+        if not all_series:
+            # Fetch series from Grimmory
+            params = {"size": 500}
+            if library_id:
+                params["library_id"] = str(library_id)
+            resp = await self.komga_request("GET", "/api/v1/series", user, pwd, params=params)
             if resp.status_code == 200:
-                raw = resp.json()
-                raw_books = raw.get("content", []) if isinstance(raw, dict) else raw if isinstance(raw, list) else []
-                for b in raw_books:
-                    if library_id and str(b.get("libraryId") or b.get("library_id")) != str(library_id):
-                        continue
-                    s_name = b.get("seriesName")
-                    if s_name and s_name not in recent_series_names:
-                        recent_series_names.append(s_name)
-        except Exception:
-            pass
+                all_series = resp.json().get("content", []) if isinstance(resp.json(), dict) else []
 
-        # Fetch series from Grimmory
-        params = {"size": 500}
-        if library_id:
-            params["library_id"] = str(library_id)
-        resp = await self.komga_request("GET", "/api/v1/series", user, pwd, params=params)
-        if resp.status_code != 200:
-            return ensure_page_dto({"content": []}, default_page=page, default_size=size)
+        user_libs = await self.get_user_library_ids(user, pwd)
+        if user_libs is not None:
+            all_series = [s for s in all_series if str(s.get("libraryId") or s.get("library_id", "")) in user_libs]
 
-        all_series = resp.json().get("content", []) if isinstance(resp.json(), dict) else []
         for s in all_series:
             disambiguate_series_dto(s)
             ensure_series_dto(s)
+
+        recent_series_names = []
+        recent_books = db.get_latest_books(library_id=library_id, limit=200)
+        for b in recent_books:
+            s_name = b.get("seriesName") or (b.get("metadata") or {}).get("series")
+            if s_name and s_name not in recent_series_names:
+                recent_series_names.append(s_name)
+
+        if not recent_series_names:
+            native_headers = await self.get_native_headers(user, pwd)
+            try:
+                resp = await self.client.get("/api/v1/app/books/recently-added", params={"size": 100}, headers=native_headers)
+                if resp.status_code == 200:
+                    raw = resp.json()
+                    raw_books = raw.get("content", []) if isinstance(raw, dict) else raw if isinstance(raw, list) else []
+                    for b in raw_books:
+                        if library_id and str(b.get("libraryId") or b.get("library_id")) != str(library_id):
+                            continue
+                        s_name = b.get("seriesName")
+                        if s_name and s_name not in recent_series_names:
+                            recent_series_names.append(s_name)
+            except Exception:
+                pass
 
         # Rank series by chronological appearance in recently-added books
         name_to_rank = {name.lower(): rank for rank, name in enumerate(recent_series_names)}
