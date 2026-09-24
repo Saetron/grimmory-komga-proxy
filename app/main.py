@@ -1,9 +1,11 @@
 import logging
+import asyncio
 from fastapi import FastAPI, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
 from contextlib import asynccontextmanager
 from app.config import settings
 from app.grimmory_client import grimmory_client
+from app.sync_service import sync_service
 from app.routers import auth, libraries, series, books, readlists
 
 logging.basicConfig(level=getattr(logging, settings.LOG_LEVEL.upper(), logging.INFO))
@@ -12,7 +14,17 @@ logger = logging.getLogger("grimmory-komga-bridge")
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     logger.info(f"Starting Grimmory-Komga Bridge pointing to: {settings.GRIMMORY_URL}")
+    sync_task = None
+    if settings.SYNC_INTERVAL_MINUTES > 0:
+        sync_task = asyncio.create_task(sync_service.run_periodic_sync())
     yield
+    sync_service.stop()
+    if sync_task:
+        sync_task.cancel()
+        try:
+            await sync_task
+        except asyncio.CancelledError:
+            pass
     await grimmory_client.client.aclose()
     logger.info("Grimmory-Komga Bridge shut down.")
 
@@ -46,8 +58,18 @@ async def root():
         "service": "Grimmory-Komga Bridge",
         "version": "1.0.0",
         "grimmoryUrl": settings.GRIMMORY_URL,
+        "syncIntervalMinutes": settings.SYNC_INTERVAL_MINUTES,
+        "lastSync": sync_service.last_sync_stats,
         "docs": "/docs"
     }
+
+@app.post("/api/v1/sync")
+@app.get("/api/v1/sync")
+async def trigger_sync(request: Request):
+    auth_header = request.headers.get("Authorization")
+    user, pwd = grimmory_client.extract_credentials(auth_header)
+    stats = await sync_service.run_full_sync(user=user, pwd=pwd)
+    return stats
 
 # Fallback catch-all for any other /api/v1/* route
 @app.api_route("/api/v1/{path:path}", methods=["GET", "POST", "PUT", "PATCH", "DELETE"])

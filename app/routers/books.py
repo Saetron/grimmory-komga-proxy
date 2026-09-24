@@ -63,7 +63,10 @@ async def list_books(
     if "in_progress" in str(read_status_param).lower() or "readprogress" in sort.lower() or "readdate" in sort.lower():
         return await grimmory_client.get_ondeck_books(user, pwd, page=page, size=size, library_id=library_id)
 
-    if any(k in sort.lower() for k in ["createddate", "releasedate", "lastmodified", "created", "addedon"]):
+    if "releasedate" in sort.lower():
+        return await grimmory_client.get_released_books(user, pwd, page=page, size=size, library_id=library_id)
+
+    if any(k in sort.lower() for k in ["createddate", "lastmodified", "created", "addedon"]):
         return await grimmory_client.get_latest_books(user, pwd, page=page, size=size, library_id=library_id)
 
     resp = await grimmory_client.komga_request("GET", "/api/v1/books", user, pwd, params=params)
@@ -154,7 +157,11 @@ async def list_books_post(
         return await grimmory_client.search_books(search_query, user, pwd, page=page, size=size, library_id=library_id)
 
     # 3. Check if sorting by recently added or released
-    if any(k in sort.lower() for k in ["createddate", "releasedate", "lastmodified", "created", "addedon"]):
+    sort_str = (sort + " " + str(body.get("sort", ""))).lower()
+    if "releasedate" in sort_str:
+        return await grimmory_client.get_released_books(user, pwd, page=page, size=size, library_id=library_id)
+
+    if any(k in sort_str for k in ["createddate", "lastmodified", "created", "addedon"]):
         return await grimmory_client.get_latest_books(user, pwd, page=page, size=size, library_id=library_id)
 
     resp = await grimmory_client.komga_request("GET", "/api/v1/books", user, pwd, params=params)
@@ -193,6 +200,19 @@ async def get_latest_books(
     size = int(params.get("size", 20))
     library_id = params.get("library_id") or params.get("libraryId")
     return await grimmory_client.get_latest_books(user, pwd, page=page, size=size, library_id=library_id)
+
+
+@router.get("/released")
+async def get_released_books_endpoint(
+    request: Request,
+    authorization: Optional[str] = Header(None)
+) -> Dict[str, Any]:
+    user, pwd = grimmory_client.extract_credentials(authorization)
+    params = dict(request.query_params)
+    page = int(params.get("page", 0))
+    size = int(params.get("size", 20))
+    library_id = params.get("library_id") or params.get("libraryId")
+    return await grimmory_client.get_released_books(user, pwd, page=page, size=size, library_id=library_id)
 
 
 @router.get("/duplicates")

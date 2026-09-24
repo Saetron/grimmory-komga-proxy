@@ -64,6 +64,7 @@ class GrimmoryClient:
         self.custom_series: Dict[str, Dict[str, Any]] = {}
         self.custom_series_books_cache: TTLCache = TTLCache(maxsize=1000, ttl=300)
         self.all_series_cache: TTLCache = TTLCache(maxsize=100, ttl=60)
+        self.last_credentials: Optional[Tuple[str, str]] = None
 
     def get_client(self) -> httpx.AsyncClient:
         try:
@@ -92,9 +93,12 @@ class GrimmoryClient:
                 decoded = base64.b64decode(auth_header[6:]).decode("utf-8")
                 if ":" in decoded:
                     user, pwd = decoded.split(":", 1)
+                    self.last_credentials = (user, pwd)
                     return user, pwd
             except Exception:
                 pass
+        if self.last_credentials:
+            return self.last_credentials
         return settings.DEFAULT_USERNAME, settings.DEFAULT_PASSWORD
 
     def get_basic_auth_header(self, user: str, pwd: str) -> Dict[str, str]:
@@ -788,6 +792,50 @@ class GrimmoryClient:
 
         return None
 
+    def _is_book_finished(self, book_obj: Dict[str, Any]) -> bool:
+        """Strictly determine if a book is completed or finished."""
+        b_id = str(book_obj.get("id"))
+
+        # 1. Check direct readProgress object if present
+        prog = book_obj.get("readProgress")
+        if isinstance(prog, dict):
+            if prog.get("completed") is True:
+                return True
+            page = prog.get("page", 0)
+            pages_count = book_obj.get("media", {}).get("pagesCount", 0)
+            if pages_count > 1 and page >= pages_count:
+                return True
+
+        # 2. Check in-memory cache
+        cached = read_progress_cache.get(b_id)
+        if isinstance(cached, dict):
+            if cached.get("completed") is True:
+                return True
+            page = cached.get("page", 0)
+            pages_count = book_obj.get("media", {}).get("pagesCount", 0)
+            if pages_count > 1 and page >= pages_count:
+                return True
+
+        # 3. Check persistent database
+        db_prog = db.get_read_progress(b_id)
+        if isinstance(db_prog, dict) and db_prog.get("completed") is True:
+            return True
+
+        # 4. Check Grimmory native raw status fields
+        if book_obj.get("readStatus") == "READ" or book_obj.get("status") == "READ":
+            return True
+        if book_obj.get("completed") is True or book_obj.get("isRead") is True:
+            return True
+        if book_obj.get("dateFinished") is not None and str(book_obj.get("dateFinished")).strip() not in ("", "null", "None"):
+            return True
+
+        for p_key in ["cbxProgress", "pdfProgress", "epubProgress"]:
+            p = book_obj.get(p_key)
+            if isinstance(p, dict) and p.get("percentage") == 100:
+                return True
+
+        return False
+
     async def get_ondeck_books(
         self,
         user: str,
@@ -796,7 +844,7 @@ class GrimmoryClient:
         size: int = 20,
         library_id: Optional[str] = None
     ) -> Dict[str, Any]:
-        """Fetch books currently reading (on deck) with complete readProgress."""
+        """Fetch books currently reading (on deck) with complete readProgress. Never returns finished books."""
         native_headers = await self.get_native_headers(user, pwd)
         raw_books = []
         try:
@@ -804,9 +852,9 @@ class GrimmoryClient:
             if resp.status_code == 200:
                 data = resp.json()
                 if isinstance(data, list):
-                    raw_books = data
+                    raw_books = [b for b in data if not self._is_book_finished(b)]
                 elif isinstance(data, dict):
-                    raw_books = data.get("content", [])
+                    raw_books = [b for b in data.get("content", []) if not self._is_book_finished(b)]
         except Exception:
             pass
 
@@ -830,7 +878,7 @@ class GrimmoryClient:
                                         b_list = b_data.get("content", []) if isinstance(b_data, dict) else b_data if isinstance(b_data, list) else []
                                         for b in b_list:
                                             b_id = str(b.get("id"))
-                                            if b_id and b_id not in seen_ids:
+                                            if b_id and b_id not in seen_ids and not self._is_book_finished(b):
                                                 raw_books.append(b)
                                                 seen_ids.add(b_id)
             except Exception:
@@ -847,7 +895,7 @@ class GrimmoryClient:
                         b_id = str(b.get("id"))
                         if b_id and b_id not in seen_ids:
                             prog = await self.get_read_progress(b_id, user, pwd)
-                            if prog and not prog.get("completed") and prog.get("page", 0) > 0:
+                            if prog and not prog.get("completed") and prog.get("page", 0) > 0 and not self._is_book_finished(b):
                                 raw_books.append(b)
                                 seen_ids.add(b_id)
             except Exception:
@@ -858,9 +906,9 @@ class GrimmoryClient:
             db_in_progress = db.get_all_in_progress()
             for b_id, prog in db_in_progress:
                 read_progress_cache[b_id] = prog
-                if str(b_id) not in seen_ids:
+                if str(b_id) not in seen_ids and not prog.get("completed"):
                     cached_b = await self.get_book_dto(str(b_id), user, pwd)
-                    if cached_b:
+                    if cached_b and not self._is_book_finished(cached_b):
                         raw_books.insert(0, cached_b)
                         seen_ids.add(str(b_id))
         except Exception:
@@ -869,16 +917,14 @@ class GrimmoryClient:
         for b_id, prog in list(read_progress_cache.items()):
             if prog and not prog.get("completed") and prog.get("page", 0) > 0 and str(b_id) not in seen_ids:
                 cached_b = await self.get_book_dto(str(b_id), user, pwd)
-                if cached_b:
+                if cached_b and not self._is_book_finished(cached_b):
                     raw_books.insert(0, cached_b)
                     seen_ids.add(str(b_id))
 
-        # 5. Filter out completed books
+        # 5. Strict filter: remove ANY completed or finished book
         final_books = []
         for b in raw_books:
-            b_id = str(b.get("id"))
-            prog = read_progress_cache.get(b_id)
-            if prog and prog.get("completed"):
+            if self._is_book_finished(b):
                 continue
             final_books.append(b)
         raw_books = final_books
@@ -895,12 +941,15 @@ class GrimmoryClient:
 
         paged_content = []
         for item in page_items:
-            if not item.get("id"):
+            if not item.get("id") or self._is_book_finished(item):
                 continue
             b_dto = item if ("media" in item and "metadata" in item) else raw_app_book_to_dto(item)
             b_id = str(b_dto["id"])
             if not b_dto.get("readProgress"):
                 b_dto["readProgress"] = await self.get_read_progress(b_id, user, pwd)
+
+            if self._is_book_finished(b_dto):
+                continue
 
             # Ensure valid in-progress status so Komic displays in On Deck
             if not b_dto.get("readProgress"):
@@ -917,11 +966,105 @@ class GrimmoryClient:
             paged_content.append(b_dto)
 
         await self.enrich_books_page_count(paged_content, user, pwd)
+        
+        # Final pass: guarantee no finished books after enrichment
+        paged_content = [b for b in paged_content if not self._is_book_finished(b)]
         for b in paged_content:
             ensure_book_dto(b)
 
         return ensure_page_dto({
             "content": paged_content,
+            "totalElements": max(len(paged_content), total),
+            "number": page,
+            "size": size
+        }, default_page=page, default_size=size)
+
+    async def get_released_books(
+        self,
+        user: str,
+        pwd: str,
+        page: int = 0,
+        size: int = 20,
+        library_id: Optional[str] = None
+    ) -> Dict[str, Any]:
+        """
+        Fetch recently released books.
+        Strict requirement: ONLY return books that have a non-empty releaseDate/publishedDate in Grimmory!
+        """
+        candidate_books = []
+        seen_ids = set()
+
+        # 1. Fetch cached books with release date from SQLite DB
+        db_candidates = db.get_books_with_release_date(library_id=library_id)
+        for b in db_candidates:
+            b_id = str(b.get("id"))
+            if b_id and b_id not in seen_ids:
+                candidate_books.append(b)
+                seen_ids.add(b_id)
+
+        # 2. Query Grimmory native recently added books to check for newly published dates
+        native_headers = await self.get_native_headers(user, pwd)
+        try:
+            resp = await self.client.get("/api/v1/app/books/recently-added", params={"size": 500}, headers=native_headers)
+            if resp.status_code == 200:
+                data = resp.json()
+                raw_list = data.get("content", []) if isinstance(data, dict) else data if isinstance(data, list) else []
+                for item in raw_list:
+                    b_id = str(item.get("id"))
+                    if b_id and b_id not in seen_ids:
+                        dto = raw_app_book_to_dto(item)
+                        rd = dto.get("metadata", {}).get("releaseDate") or item.get("publishedDate") or item.get("releaseDate")
+                        if rd and str(rd).strip() not in ("", "null", "None"):
+                            dto["metadata"]["releaseDate"] = str(rd).strip()
+                            candidate_books.append(dto)
+                            seen_ids.add(b_id)
+        except Exception:
+            pass
+
+        # 3. If needed, query Grimmory Komga endpoint with releaseDate sort
+        if not candidate_books:
+            try:
+                params = {"size": 100, "sort": "metadata.releaseDate,desc"}
+                if library_id:
+                    params["library_id"] = str(library_id)
+                k_resp = await self.komga_request("GET", "/api/v1/books", user, pwd, params=params)
+                if k_resp.status_code == 200:
+                    k_data = k_resp.json()
+                    k_items = k_data.get("content", []) if isinstance(k_data, dict) else []
+                    for b in k_items:
+                        b_id = str(b.get("id"))
+                        rd = b.get("metadata", {}).get("releaseDate")
+                        if rd and str(rd).strip() not in ("", "null", "None") and b_id not in seen_ids:
+                            candidate_books.append(b)
+                            seen_ids.add(b_id)
+            except Exception:
+                pass
+
+        # 4. Strict filter: MUST have non-empty releaseDate
+        valid_released_books = []
+        for b in candidate_books:
+            if library_id and str(b.get("libraryId") or b.get("library_id")) != str(library_id):
+                continue
+            rd = b.get("metadata", {}).get("releaseDate")
+            if rd and str(rd).strip() not in ("", "null", "None"):
+                valid_released_books.append(b)
+
+        # 5. Sort by releaseDate DESC
+        def _release_key(b):
+            return str(b.get("metadata", {}).get("releaseDate") or "")
+
+        valid_released_books.sort(key=_release_key, reverse=True)
+
+        total = len(valid_released_books)
+        start = page * size
+        page_items = valid_released_books[start:start + size]
+
+        await self.enrich_books_page_count(page_items, user, pwd)
+        for b in page_items:
+            ensure_book_dto(b)
+
+        return ensure_page_dto({
+            "content": page_items,
             "totalElements": total,
             "number": page,
             "size": size

@@ -262,6 +262,23 @@ class Database:
                     pass
             return result
 
+    def get_books_with_release_date(self, library_id: Optional[str] = None) -> List[Dict[str, Any]]:
+        with self._get_connection() as conn:
+            if library_id:
+                rows = conn.execute("SELECT dto_json FROM books WHERE library_id = ?", (str(library_id),)).fetchall()
+            else:
+                rows = conn.execute("SELECT dto_json FROM books").fetchall()
+            result = []
+            for r in rows:
+                try:
+                    book = json.loads(r["dto_json"])
+                    rd = book.get("metadata", {}).get("releaseDate")
+                    if rd and str(rd).strip() not in ("", "null", "None"):
+                        result.append(book)
+                except Exception:
+                    pass
+            return result
+
     # --- Pages & Dimensions Operations ---
     def save_book_pages(self, book_id: str, pages: List[Dict[str, Any]], pages_count: int):
         now = time.time()

@@ -22,6 +22,8 @@ def clear_caches():
     book_cache.clear()
     active_sessions.clear()
     grimmory_client.custom_series.clear()
+    grimmory_client.all_series_cache.clear()
+    grimmory_client.custom_series_books_cache.clear()
     db.clear_all()
 
 
@@ -1471,6 +1473,186 @@ def test_sqlite_db_unwritable_fallback():
     retrieved = fallback_db.get_series("fallback-1")
     assert retrieved is not None
     assert retrieved["name"] == "Fallback Test"
+
+
+@pytest.mark.anyio
+async def test_sync_service_full_sync():
+    """Verify that sync_service.run_full_sync validates series, books, and read progress into SQLite."""
+    from app.sync_service import sync_service
+
+    # Mock Grimmory responses
+    mock_series_data = {
+        "content": [
+            {"id": "sync-s-1", "libraryId": "14", "name": "Sync Series 1", "booksCount": 2, "metadata": {"title": "Sync Series 1"}}
+        ],
+        "totalPages": 1
+    }
+    mock_books_data = {
+        "content": [
+            {"id": "sync-b-1", "seriesId": "sync-s-1", "libraryId": "14", "name": "Sync Book 1", "number": 1.0, "media": {"pagesCount": 10}},
+            {"id": "sync-b-2", "seriesId": "sync-s-1", "libraryId": "14", "name": "Sync Book 2", "number": 2.0, "media": {"pagesCount": 15}}
+        ]
+    }
+    mock_cr_data = [
+        {"id": "sync-b-1", "cbxProgress": {"page": 5, "percentage": 50}, "dateFinished": None}
+    ]
+
+    async def mock_komga(method, path, user, pwd, **kwargs):
+        if "/api/v1/series/sync-s-1/books" in path:
+            return httpx.Response(200, json=mock_books_data)
+        if "/api/v1/series" in path:
+            return httpx.Response(200, json=mock_series_data)
+        return httpx.Response(404)
+
+    mock_client = AsyncMock()
+    async def mock_get(url, **kwargs):
+        if "continue-reading" in url:
+            return httpx.Response(200, json=mock_cr_data)
+        if "progress" in url:
+            return httpx.Response(200, json={"cbxProgress": {"page": 5, "percentage": 50}, "dateFinished": None})
+        return httpx.Response(404)
+    mock_client.get = AsyncMock(side_effect=mock_get)
+
+    with patch.object(grimmory_client, "komga_request", side_effect=mock_komga), \
+         patch.object(grimmory_client, "get_client", return_value=mock_client), \
+         patch.object(grimmory_client, "get_native_token", new_callable=AsyncMock, return_value="dummy-token"):
+
+        stats = await sync_service.run_full_sync("testuser", "testpass")
+        assert stats["status"] == "success"
+        assert stats["seriesCount"] == 1
+        assert stats["booksCount"] == 2
+        assert stats["readProgressCount"] == 1
+
+        # Verify series and books are stored in SQLite DB
+        cached_series = db.get_series("sync-s-1")
+        assert cached_series is not None
+        assert cached_series["name"] == "Sync Series 1"
+
+        cached_books = db.get_books_by_series("sync-s-1")
+        assert len(cached_books) == 2
+        assert cached_books[0]["id"] == "sync-b-1"
+        assert cached_books[1]["id"] == "sync-b-2"
+
+        # Verify read progress is stored in SQLite DB
+        prog = db.get_read_progress("sync-b-1")
+        assert prog is not None
+        assert prog["page"] == 5
+
+
+def test_sync_endpoint_manual_trigger():
+    """Verify manual sync trigger endpoint POST /api/v1/sync returns 200 with sync statistics."""
+    from app.sync_service import sync_service
+
+    async def mock_run_sync(user=None, pwd=None):
+        return {
+            "status": "success",
+            "seriesCount": 5,
+            "booksCount": 42,
+            "readProgressCount": 3,
+            "durationSeconds": 1.23,
+            "error": None
+        }
+
+    with patch.object(sync_service, "run_full_sync", side_effect=mock_run_sync):
+        resp = client.post("/api/v1/sync", headers=AUTH_HEADER)
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["status"] == "success"
+        assert data["seriesCount"] == 5
+        assert data["booksCount"] == 42
+
+
+def test_ondeck_strictly_excludes_finished_books():
+    """Verify that On Deck / Keep Reading never returns completed or finished books."""
+    raw_continue_reading = [
+        {"id": "b-active-1", "title": "Active Reading", "cbxProgress": {"page": 5, "percentage": 50}, "dateFinished": None},
+        {"id": "b-fin-status", "title": "Finished by Status", "readStatus": "READ"},
+        {"id": "b-fin-comp", "title": "Finished by Completed Flag", "completed": True},
+        {"id": "b-fin-date", "title": "Finished by Date", "dateFinished": "2026-09-24T10:00:00Z"},
+        {"id": "b-fin-pct", "title": "Finished by 100 Percent", "cbxProgress": {"page": 20, "percentage": 100}}
+    ]
+
+    mock_client = AsyncMock()
+    async def mock_get(url, **kwargs):
+        if "continue-reading" in url:
+            return httpx.Response(200, json=raw_continue_reading)
+        if "b-active-1/progress" in url:
+            return httpx.Response(200, json={"cbxProgress": {"page": 5, "percentage": 50}, "dateFinished": None})
+        return httpx.Response(404)
+    mock_client.get = AsyncMock(side_effect=mock_get)
+
+    async def mock_get_dto(b_id, user, pwd):
+        item = next((b for b in raw_continue_reading if b["id"] == b_id), {"id": b_id, "title": f"Book {b_id}"})
+        return {
+            "id": b_id,
+            "name": item.get("title", f"Book {b_id}"),
+            "libraryId": "14",
+            "media": {"pagesCount": 20},
+            "readStatus": item.get("readStatus"),
+            "completed": item.get("completed"),
+            "dateFinished": item.get("dateFinished"),
+            "cbxProgress": item.get("cbxProgress")
+        }
+
+    with patch.object(grimmory_client, "get_client", return_value=mock_client), \
+         patch.object(grimmory_client, "get_book_dto", side_effect=mock_get_dto), \
+         patch.object(grimmory_client, "get_native_token", new_callable=AsyncMock, return_value="dummy-token"):
+
+        # 1. Test GET /api/v1/books/ondeck
+        resp = client.get("/api/v1/books/ondeck", headers=AUTH_HEADER)
+        assert resp.status_code == 200
+        content = resp.json()["content"]
+        assert len(content) == 1
+        assert content[0]["id"] == "b-active-1"
+        assert content[0]["readProgress"]["completed"] is False
+
+        # 2. Test POST /api/v1/books/list with readStatus=["IN_PROGRESS"]
+        post_resp = client.post(
+            "/api/v1/books/list",
+            json={"readStatus": ["IN_PROGRESS"]},
+            headers=AUTH_HEADER
+        )
+        assert post_resp.status_code == 200
+        post_content = post_resp.json()["content"]
+        assert len(post_content) == 1
+        assert post_content[0]["id"] == "b-active-1"
+
+
+def test_recently_released_books_only_with_release_date():
+    """Verify that recently released books only includes books that have a non-empty releaseDate."""
+    books = [
+        {"id": "b-rel-old", "name": "Old Release", "metadata": {"releaseDate": "2026-01-15"}, "media": {"pagesCount": 10}},
+        {"id": "b-rel-new", "name": "New Release", "metadata": {"releaseDate": "2026-09-20"}, "media": {"pagesCount": 10}},
+        {"id": "b-no-rel-1", "name": "No Release Date 1", "metadata": {"releaseDate": None}, "media": {"pagesCount": 10}},
+        {"id": "b-no-rel-2", "name": "No Release Date 2", "metadata": {}, "media": {"pagesCount": 10}}
+    ]
+    db.save_books_batch(books)
+
+    # 1. Test GET /api/v1/books?sort=metadata.releaseDate,desc
+    resp = client.get("/api/v1/books?sort=metadata.releaseDate,desc", headers=AUTH_HEADER)
+    assert resp.status_code == 200
+    content = resp.json()["content"]
+    assert len(content) == 2
+    assert content[0]["id"] == "b-rel-new"
+    assert content[1]["id"] == "b-rel-old"
+    assert all(b.get("metadata", {}).get("releaseDate") is not None for b in content)
+
+    # 2. Test POST /api/v1/books/list with sort: metadata.releaseDate,desc
+    post_resp = client.post(
+        "/api/v1/books/list",
+        json={"sort": "metadata.releaseDate,desc"},
+        headers=AUTH_HEADER
+    )
+    assert post_resp.status_code == 200
+    post_content = post_resp.json()["content"]
+    assert len(post_content) == 2
+    assert post_content[0]["id"] == "b-rel-new"
+    assert post_content[1]["id"] == "b-rel-old"
+
+    # 3. Test GET /api/v1/books/released
+    rel_resp = client.get("/api/v1/books/released", headers=AUTH_HEADER)
+    assert rel_resp.status_code == 200
+    assert len(rel_resp.json()["content"]) == 2
 
 
 if __name__ == "__main__":
