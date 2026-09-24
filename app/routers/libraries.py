@@ -12,7 +12,7 @@ def ensure_library_dto(lib: Dict[str, Any]) -> Dict[str, Any]:
         "scanPdf": True,
         "scanEpub": True,
         "scanForceModifiedTime": False,
-        "scanInterval": "EVERY_6_HOURS",
+        "scanInterval": "EVERY_6H",
         "scanOnStartup": False,
         "scanDirectoryExclusions": [],
         "repairExtensions": False,
@@ -27,17 +27,20 @@ def ensure_library_dto(lib: Dict[str, Any]) -> Dict[str, Any]:
         "importComicInfoSeries": True,
         "importComicInfoCollection": True,
         "importComicInfoReadList": True,
-        "importComicInfoSeriesAppendVolume": True,
+        "importComicInfoSeriesAppendVolume": False,
         "importEpubBook": True,
         "importEpubSeries": True,
         "importMylarSeries": True,
         "importLocalArtwork": True,
         "importBarcodeIsbn": True,
-        "root": "/books"
+        "root": "/books",
+        "oneshotsDirectory": None
     }
     for k, v in defaults.items():
         if k not in lib:
             lib[k] = v
+    if lib.get("scanInterval") == "EVERY_6_HOURS":
+        lib["scanInterval"] = "EVERY_6H"
     return lib
 
 @router.get("", response_model=List[Dict[str, Any]])

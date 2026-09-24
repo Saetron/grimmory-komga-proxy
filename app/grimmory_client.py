@@ -1132,7 +1132,7 @@ class GrimmoryClient:
 
         return None
 
-    def _is_book_finished(self, book_obj: Dict[str, Any], user: Optional[str] = None) -> bool:
+    def _is_book_finished(self, book_obj: Dict[str, Any], user: Optional[str] = None, progress: Optional[Dict[str, Any]] = None) -> bool:
         """Strictly determine if a book is completed or finished."""
         if not book_obj or not isinstance(book_obj, dict):
             return False
@@ -1141,7 +1141,9 @@ class GrimmoryClient:
         p_key = f"{u}:{b_id}"
 
         # 1. User-scoped cache and database progress is the highest authority
-        user_prog = read_progress_cache.get(p_key) or (read_progress_cache.get(b_id) if u == "default" else None) or db.get_read_progress(u, b_id)
+        user_prog = progress or read_progress_cache.get(p_key) or (read_progress_cache.get(b_id) if u == "default" else None)
+        if user_prog is None:
+            user_prog = db.get_read_progress(u, b_id)
         if isinstance(user_prog, dict):
             if user_prog.get("completed") is True:
                 return True
@@ -1200,14 +1202,20 @@ class GrimmoryClient:
 
         return False
 
-    def _is_book_in_progress(self, book_obj: Dict[str, Any], user: Optional[str] = None) -> bool:
+    def _is_book_in_progress(self, book_obj: Dict[str, Any], user: Optional[str] = None, progress: Optional[Dict[str, Any]] = None) -> bool:
         if not book_obj or not isinstance(book_obj, dict):
-            return False
-        if self._is_book_finished(book_obj, user=user):
             return False
         b_id = str(book_obj.get("id"))
         u = (user or "default").lower().strip()
         p_key = f"{u}:{b_id}"
+
+        user_prog = progress or read_progress_cache.get(p_key) or (read_progress_cache.get(b_id) if u == "default" else None)
+        if user_prog is None:
+            user_prog = db.get_read_progress(u, b_id)
+
+        if self._is_book_finished(book_obj, user=user, progress=user_prog):
+            return False
+
         read_status = str(book_obj.get("readStatus") or book_obj.get("status") or "").upper().strip()
         if read_status == "READ":
             return False
@@ -1217,7 +1225,6 @@ class GrimmoryClient:
             return True
 
         # Check user-scoped progress first
-        user_prog = read_progress_cache.get(p_key) or (read_progress_cache.get(b_id) if u == "default" else None) or db.get_read_progress(u, b_id)
         if isinstance(user_prog, dict):
             if user_prog.get("completed") is True:
                 return False
@@ -1415,18 +1422,21 @@ class GrimmoryClient:
         # Filter books by status
         matched_books = []
         u = (user or "default").lower().strip()
+        user_prog_map = db.get_all_read_progress_map(u)
+        default_prog_map = db.get_all_read_progress_map("default") if u != "default" else {}
         for b in all_books:
+            b_id = str(b.get("id"))
             if library_id:
                 b_lib = str(b.get("libraryId") or b.get("library_id", ""))
                 if b_lib and b_lib != str(library_id):
                     continue
             b_copy = dict(b)
-            p_key = f"{u}:{b_copy.get('id')}"
-            u_prog = read_progress_cache.get(p_key) or (read_progress_cache.get(str(b_copy.get('id'))) if u == "default" else None) or db.get_read_progress(u, str(b_copy.get('id')))
+            p_key = f"{u}:{b_id}"
+            u_prog = read_progress_cache.get(p_key) or user_prog_map.get(b_id) or (read_progress_cache.get(b_id) if u == "default" else None) or default_prog_map.get(b_id)
             b_copy["readProgress"] = u_prog
 
-            is_fin = self._is_book_finished(b_copy, user=user)
-            is_inp = self._is_book_in_progress(b_copy, user=user)
+            is_fin = self._is_book_finished(b_copy, user=user, progress=u_prog)
+            is_inp = self._is_book_in_progress(b_copy, user=user, progress=u_prog)
             is_unr = (not is_fin) and (not is_inp)
 
             matched = False

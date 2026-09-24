@@ -24,6 +24,8 @@ async def list_series(
     if "libraryId" in params:
         params["library_id"] = params.pop("libraryId")
     library_id = params.get("library_id")
+    if library_id in ("", "null", "None"):
+        library_id = None
     sort = params.get("sort", "")
 
     search_query = params.get("search")
@@ -56,7 +58,7 @@ async def list_series(
         paged_content = cached_series[start:start + size]
         for s in paged_content:
             disambiguate_series_dto(s)
-            ensure_series_dto(s)
+            ensure_series_dto(s, user=user)
         return ensure_page_dto({
             "content": paged_content,
             "totalElements": total,
@@ -95,12 +97,20 @@ async def list_series_post(
     if "libraryId" in params:
         params["library_id"] = params.pop("libraryId")
 
+    filters = {}
     try:
         raw_body = await request.json()
         if isinstance(raw_body, dict):
             body = raw_body
         filters = extract_search_filters(body)
-        if "library_id" in filters:
+        if "library_ids" in filters:
+            if not filters["library_ids"]:
+                params.pop("library_id", None)
+            elif len(filters["library_ids"]) == 1:
+                params["library_id"] = filters["library_ids"][0]
+            else:
+                params["library_id"] = ",".join(filters["library_ids"])
+        elif "library_id" in filters:
             params["library_id"] = filters["library_id"]
         if "search" in filters:
             params["search"] = filters["search"]
@@ -108,6 +118,8 @@ async def list_series_post(
         pass
 
     library_id = params.get("library_id")
+    if library_id in ("", "null", "None"):
+        library_id = None
     sort_val = sort
     if not sort_val and "sort" in body:
         sort_val = str(body["sort"])
@@ -142,7 +154,7 @@ async def list_series_post(
         paged_content = cached_series[start:start + size]
         for s in paged_content:
             disambiguate_series_dto(s)
-            ensure_series_dto(s)
+            ensure_series_dto(s, user=user)
         return ensure_page_dto({
             "content": paged_content,
             "totalElements": total,
@@ -156,7 +168,7 @@ async def list_series_post(
         if "content" in data and isinstance(data["content"], list):
             for s in data["content"]:
                 disambiguate_series_dto(s)
-                ensure_series_dto(s)
+                ensure_series_dto(s, user=user)
         return ensure_page_dto(data, default_page=page, default_size=size)
 
     return ensure_page_dto({"content": []}, default_page=page, default_size=size)

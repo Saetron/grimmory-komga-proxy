@@ -2243,6 +2243,65 @@ def test_list_books_post_with_series_and_read_status():
         assert kwargs.get("series_id") == "test-series-1"
 
 
+
+def test_library_dto_compatibility():
+    """Verify that ensure_library_dto generates valid Komga LibraryDto fields."""
+    from app.routers.libraries import ensure_library_dto
+    raw_lib = {"id": "14", "name": "Stories", "scanInterval": "EVERY_6_HOURS"}
+    dto = ensure_library_dto(raw_lib)
+    assert dto["scanInterval"] == "EVERY_6H"
+    assert "oneshotsDirectory" in dto
+    assert dto["oneshotsDirectory"] is None
+    assert dto["unavailable"] is False
+    assert dto["importComicInfoSeriesAppendVolume"] is False
+
+
+def test_switch_to_all_libraries_series_and_books():
+    """Verify that switching to all libraries (empty libraryIds or empty string) loads from DB instantly."""
+    db.save_series({"id": "s-lib-1", "libraryId": "14", "name": "Series Lib 1", "booksCount": 1})
+    db.save_series({"id": "s-lib-2", "libraryId": "15", "name": "Series Lib 2", "booksCount": 1})
+    db.save_book({"id": "b-1", "seriesId": "s-lib-1", "libraryId": "14", "name": "Book 1"})
+    db.save_book({"id": "b-2", "seriesId": "s-lib-2", "libraryId": "15", "name": "Book 2"})
+
+    with patch.object(grimmory_client, "get_user_library_ids", new_callable=AsyncMock) as mock_libs:
+        mock_libs.return_value = {"14", "15"}
+
+        # 1. POST /api/v1/series/list with {"libraryIds": []}
+        resp = client.post("/api/v1/series/list", json={"libraryIds": []}, headers=AUTH_HEADER)
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["totalElements"] == 2
+
+        # 2. POST /api/v1/books/list with {"libraryIds": []}
+        resp_b = client.post("/api/v1/books/list", json={"libraryIds": []}, headers=AUTH_HEADER)
+        assert resp_b.status_code == 200
+        data_b = resp_b.json()
+        assert data_b["totalElements"] == 2
+
+        # 3. GET /api/v1/books without library_id
+        resp_all = client.get("/api/v1/books", headers=AUTH_HEADER)
+        assert resp_all.status_code == 200
+        data_all = resp_all.json()
+        assert data_all["totalElements"] == 2
+
+
+def test_multi_library_db_query():
+    """Verify that db.get_all_series and db.get_all_books support lists and comma-separated library IDs."""
+    db.save_series({"id": "s-1", "libraryId": "14", "name": "S1"})
+    db.save_series({"id": "s-2", "libraryId": "15", "name": "S2"})
+    db.save_series({"id": "s-3", "libraryId": "16", "name": "S3"})
+
+    # List of IDs
+    res = db.get_all_series(["14", "16"])
+    ids = {s["id"] for s in res}
+    assert ids == {"s-1", "s-3"}
+
+    # Comma-separated string
+    res_str = db.get_all_series("14, 15")
+    ids_str = {s["id"] for s in res_str}
+    assert ids_str == {"s-1", "s-2"}
+
+
 if __name__ == "__main__":
     pytest.main(["-v", __file__])
 

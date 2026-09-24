@@ -4,7 +4,7 @@ import os
 import time
 import tempfile
 import logging
-from typing import Optional, Dict, Any, List, Tuple, Set
+from typing import Optional, Dict, Any, List, Tuple, Set, Union
 from app.config import settings
 
 logger = logging.getLogger("grimmory-komga-bridge")
@@ -170,9 +170,21 @@ class Database:
                     pass
         return None
 
-    def get_all_series(self, library_id: Optional[str] = None) -> List[Dict[str, Any]]:
+    def get_all_series(self, library_id: Optional[Union[str, List[str], Set[str]]] = None) -> List[Dict[str, Any]]:
         with self._get_connection() as conn:
-            if library_id:
+            if isinstance(library_id, str) and "," in library_id:
+                library_id = [x.strip() for x in library_id.split(",") if x.strip()]
+
+            if isinstance(library_id, (list, set, tuple)):
+                lib_list = [str(x) for x in library_id if str(x).strip()]
+                if not lib_list:
+                    rows = conn.execute("SELECT dto_json FROM series ORDER BY name ASC").fetchall()
+                elif len(lib_list) == 1:
+                    rows = conn.execute("SELECT dto_json FROM series WHERE library_id = ? ORDER BY name ASC", (lib_list[0],)).fetchall()
+                else:
+                    placeholders = ",".join("?" * len(lib_list))
+                    rows = conn.execute(f"SELECT dto_json FROM series WHERE library_id IN ({placeholders}) ORDER BY name ASC", lib_list).fetchall()
+            elif library_id:
                 rows = conn.execute("SELECT dto_json FROM series WHERE library_id = ? ORDER BY name ASC", (str(library_id),)).fetchall()
             else:
                 rows = conn.execute("SELECT dto_json FROM series ORDER BY name ASC").fetchall()
@@ -284,9 +296,21 @@ class Database:
                     pass
             return result
 
-    def get_all_books(self, library_id: Optional[str] = None) -> List[Dict[str, Any]]:
+    def get_all_books(self, library_id: Optional[Union[str, List[str], Set[str]]] = None) -> List[Dict[str, Any]]:
         with self._get_connection() as conn:
-            if library_id:
+            if isinstance(library_id, str) and "," in library_id:
+                library_id = [x.strip() for x in library_id.split(",") if x.strip()]
+
+            if isinstance(library_id, (list, set, tuple)):
+                lib_list = [str(x) for x in library_id if str(x).strip()]
+                if not lib_list:
+                    rows = conn.execute("SELECT dto_json FROM books ORDER BY number_sort ASC").fetchall()
+                elif len(lib_list) == 1:
+                    rows = conn.execute("SELECT dto_json FROM books WHERE library_id = ? ORDER BY number_sort ASC", (lib_list[0],)).fetchall()
+                else:
+                    placeholders = ",".join("?" * len(lib_list))
+                    rows = conn.execute(f"SELECT dto_json FROM books WHERE library_id IN ({placeholders}) ORDER BY number_sort ASC", lib_list).fetchall()
+            elif library_id:
                 rows = conn.execute(
                     "SELECT dto_json FROM books WHERE library_id = ? ORDER BY number_sort ASC",
                     (str(library_id),)

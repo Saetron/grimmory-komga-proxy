@@ -99,8 +99,10 @@ def ensure_series_dto(series: Dict[str, Any], user: Optional[str] = None) -> Dic
             if s_books:
                 from app.grimmory_client import grimmory_client
                 series["booksCount"] = len(s_books)
-                read_cnt = sum(1 for b in s_books if grimmory_client._is_book_finished(b, user=user))
-                inp_cnt = sum(1 for b in s_books if grimmory_client._is_book_in_progress(b, user=user))
+                u = (user or "default").lower().strip()
+                u_map = db.get_all_read_progress_map(u)
+                read_cnt = sum(1 for b in s_books if grimmory_client._is_book_finished(b, user=user, progress=u_map.get(str(b.get("id")))))
+                inp_cnt = sum(1 for b in s_books if grimmory_client._is_book_in_progress(b, user=user, progress=u_map.get(str(b.get("id")))))
                 series["booksReadCount"] = read_cnt
                 series["booksInProgressCount"] = inp_cnt
                 series["booksUnreadCount"] = max(0, len(s_books) - read_cnt - inp_cnt)
@@ -502,14 +504,47 @@ def extract_search_filters(body: Any) -> Dict[str, Any]:
                     if isinstance(v, dict):
                         val = v.get("value")
                         vals = v.get("values")
-                        if val is not None and "library_id" not in filters:
-                            filters["library_id"] = str(val)
-                        elif vals and isinstance(vals, list) and len(vals) > 0 and "library_id" not in filters:
-                            filters["library_id"] = str(vals[0])
-                    elif isinstance(v, list) and len(v) > 0 and "library_id" not in filters:
-                        filters["library_id"] = str(v[0])
-                    elif isinstance(v, (str, int)) and "library_id" not in filters:
-                        filters["library_id"] = str(v)
+                        if val is not None:
+                            val_str = str(val).strip()
+                            if val_str:
+                                filters["library_id"] = val_str
+                                filters["library_ids"] = [val_str]
+                            else:
+                                filters.pop("library_id", None)
+                                filters["library_ids"] = []
+                        elif vals and isinstance(vals, list):
+                            clean_vals = [str(x) for x in vals if str(x).strip()]
+                            if clean_vals:
+                                filters["library_id"] = clean_vals[0]
+                                filters["library_ids"] = clean_vals
+                            else:
+                                filters.pop("library_id", None)
+                                filters["library_ids"] = []
+                    elif isinstance(v, list):
+                        clean_list = [str(x) for x in v if str(x).strip()]
+                        if clean_list:
+                            filters["library_id"] = clean_list[0]
+                            filters["library_ids"] = clean_list
+                        else:
+                            filters.pop("library_id", None)
+                            filters["library_ids"] = []
+                    elif isinstance(v, (str, int)):
+                        val_str = str(v).strip()
+                        if val_str:
+                            if "," in val_str:
+                                split_ids = [x.strip() for x in val_str.split(",") if x.strip()]
+                                if split_ids:
+                                    filters["library_ids"] = split_ids
+                                    filters["library_id"] = split_ids[0]
+                                else:
+                                    filters.pop("library_id", None)
+                                    filters["library_ids"] = []
+                            else:
+                                filters["library_id"] = val_str
+                                filters["library_ids"] = [val_str]
+                        else:
+                            filters.pop("library_id", None)
+                            filters["library_ids"] = []
 
                 elif k_lower in ["readstatus", "read_status"]:
                     if isinstance(v, dict):

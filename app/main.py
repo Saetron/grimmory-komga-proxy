@@ -1,5 +1,6 @@
 import logging
 import asyncio
+import time
 from fastapi import FastAPI, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
 from contextlib import asynccontextmanager
@@ -43,6 +44,23 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+@app.middleware("http")
+async def log_requests(request: Request, call_next):
+    start_time = time.time()
+    method = request.method
+    path = request.url.path
+    query = request.url.query
+    full_url = f"{path}?{query}" if query else path
+    try:
+        response = await call_next(request)
+        duration_ms = round((time.time() - start_time) * 1000, 1)
+        logger.info(f"{method} {full_url} -> {response.status_code} ({duration_ms}ms)")
+        return response
+    except Exception as e:
+        duration_ms = round((time.time() - start_time) * 1000, 1)
+        logger.error(f"{method} {full_url} -> EXCEPTION: {e} ({duration_ms}ms)", exc_info=True)
+        raise
 
 # Include API Routers
 app.include_router(auth.router)
