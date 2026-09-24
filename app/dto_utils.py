@@ -73,6 +73,22 @@ def ensure_series_dto(series: Dict[str, Any]) -> Dict[str, Any]:
     series.setdefault("name", series.get("name", "Unknown Series"))
     series.setdefault("url", f"/api/v1/series/{series.get('id', '')}")
 
+    s_id = str(series.get("id", ""))
+    if s_id:
+        try:
+            from app.db import db
+            s_books = db.get_books_by_series(s_id)
+            if s_books:
+                from app.grimmory_client import grimmory_client
+                series["booksCount"] = len(s_books)
+                read_cnt = sum(1 for b in s_books if grimmory_client._is_book_finished(b))
+                inp_cnt = sum(1 for b in s_books if grimmory_client._is_book_in_progress(b))
+                series["booksReadCount"] = read_cnt
+                series["booksInProgressCount"] = inp_cnt
+                series["booksUnreadCount"] = max(0, len(s_books) - read_cnt - inp_cnt)
+        except Exception:
+            pass
+
     meta = series.get("metadata")
     if not isinstance(meta, dict):
         meta = {}

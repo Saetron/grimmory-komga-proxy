@@ -1978,6 +1978,132 @@ def test_snappy_performance_zero_network_when_cached():
         assert len(resp_all_books.json()["content"]) == 2
 
 
+@pytest.mark.anyio
+async def test_continue_reading_and_ondeck_never_show_finished_books():
+    """Verify that books with 100% progress or readStatus='READ' never appear in Weiterlesen or Als nächstes lesen."""
+    from app.grimmory_client import read_progress_cache
+
+    # Series 1: Lena (1 book, 100% READ)
+    book_finished = {
+        "id": "1001",
+        "seriesId": "s-lena",
+        "seriesTitle": "Lena",
+        "libraryId": "14",
+        "name": "Lena 1",
+        "number": 1,
+        "readStatus": "READ",
+        "readProgress": {"page": 50, "completed": True, "readDate": "2026-09-24T12:00:00Z"},
+        "media": {"pagesCount": 50},
+        "metadata": {"numberSort": 1.0}
+    }
+    # Series 2: Manga (Book 1 READ, Book 2 IN_PROGRESS at 10%, Book 3 UNREAD)
+    book_manga_1 = {
+        "id": "2001",
+        "seriesId": "s-manga",
+        "seriesTitle": "Manga",
+        "libraryId": "14",
+        "name": "Manga Vol 1",
+        "number": 1,
+        "readStatus": "READ",
+        "readProgress": {"page": 100, "completed": True, "readDate": "2026-09-24T11:00:00Z"},
+        "media": {"pagesCount": 100},
+        "metadata": {"numberSort": 1.0}
+    }
+    book_manga_2 = {
+        "id": "2002",
+        "seriesId": "s-manga",
+        "seriesTitle": "Manga",
+        "libraryId": "14",
+        "name": "Manga Vol 2",
+        "number": 2,
+        "readStatus": "READING",
+        "readProgress": {"page": 15, "completed": False, "readDate": "2026-09-24T13:00:00Z"},
+        "media": {"pagesCount": 100},
+        "metadata": {"numberSort": 2.0}
+    }
+    book_manga_3 = {
+        "id": "2003",
+        "seriesId": "s-manga",
+        "seriesTitle": "Manga",
+        "libraryId": "14",
+        "name": "Manga Vol 3",
+        "number": 3,
+        "media": {"pagesCount": 100},
+        "metadata": {"numberSort": 3.0}
+    }
+
+    # Save to SQLite
+    db.save_books_batch([book_finished, book_manga_1, book_manga_2, book_manga_3])
+    db.save_read_progress("1001", 50, True, "2026-09-24T12:00:00Z", book_finished["readProgress"])
+    db.save_read_progress("2001", 100, True, "2026-09-24T11:00:00Z", book_manga_1["readProgress"])
+    db.save_read_progress("2002", 15, False, "2026-09-24T13:00:00Z", book_manga_2["readProgress"])
+    read_progress_cache["1001"] = book_finished["readProgress"]
+    read_progress_cache["2001"] = book_manga_1["readProgress"]
+    read_progress_cache["2002"] = book_manga_2["readProgress"]
+
+    mock_client = AsyncMock()
+    mock_client.get = AsyncMock(return_value=httpx.Response(200, json=[]))
+
+    with patch.object(grimmory_client, "get_client", return_value=mock_client), \
+         patch.object(grimmory_client, "get_native_token", new_callable=AsyncMock, return_value="dummy-token"):
+
+        # 1. Weiterlesen (Continue reading): GET /api/v1/books?read_status=IN_PROGRESS
+        resp_cr = client.get("/api/v1/books?read_status=IN_PROGRESS", headers=AUTH_HEADER)
+        assert resp_cr.status_code == 200
+        cr_content = resp_cr.json()["content"]
+        cr_ids = [b["id"] for b in cr_content]
+        # Must contain book 2002 (in progress), and NEVER finished books 1001 or 2001
+        assert "2002" in cr_ids
+        assert "1001" not in cr_ids
+        assert "2001" not in cr_ids
+        assert "2003" not in cr_ids
+
+        # 2. Als nächstes lesen (On Deck): GET /api/v1/books/ondeck
+        resp_od = client.get("/api/v1/books/ondeck", headers=AUTH_HEADER)
+        assert resp_od.status_code == 200
+        od_content = resp_od.json()["content"]
+        od_ids = [b["id"] for b in od_content]
+        # Must contain 2002 (active in-progress book of s-manga)
+        # Lena series (s-lena) is completely finished, so 1001 must NEVER appear!
+        assert "1001" not in od_ids
+        assert "2001" not in od_ids
+
+
+@pytest.mark.anyio
+async def test_reconcile_read_progress_heals_stale_cache():
+    """Verify that reconcile_read_progress heals stale 'completed=0' SQLite records with Grimmory."""
+    from app.grimmory_client import read_progress_cache
+
+    # Simulate stale record in DB where completed = 0, but Grimmory has readStatus = READ
+    stale_dto = {"page": 1, "completed": False, "readDate": "2026-09-24T09:00:00Z"}
+    db.save_read_progress("stale-101", 1, False, "2026-09-24T09:00:00Z", stale_dto)
+    read_progress_cache["stale-101"] = stale_dto
+
+    # Grimmory returns readStatus: 'READ'
+    async def mock_grimmory_progress(url, **kwargs):
+        if "/api/v1/app/books/stale-101/progress" in url:
+            return httpx.Response(200, json={"readStatus": "READ", "lastReadTime": "2026-09-24T18:00:00Z"})
+        return httpx.Response(404)
+
+    mock_client = AsyncMock()
+    mock_client.get = AsyncMock(side_effect=mock_grimmory_progress)
+
+    with patch.object(grimmory_client, "get_client", return_value=mock_client), \
+         patch.object(grimmory_client, "get_native_token", new_callable=AsyncMock, return_value="dummy-token"):
+
+        await grimmory_client.reconcile_read_progress("test_user", "test_pwd")
+
+        # After reconciliation, DB must have completed = 1!
+        cached_p = db.get_read_progress("stale-101")
+        assert cached_p is not None
+        assert cached_p["completed"] is True
+        assert read_progress_cache["stale-101"]["completed"] is True
+
+        # And it should no longer be returned by get_all_in_progress()!
+        in_prog = db.get_all_in_progress()
+        assert not any(b_id == "stale-101" for b_id, _ in in_prog)
+
+
 if __name__ == "__main__":
     pytest.main(["-v", __file__])
 

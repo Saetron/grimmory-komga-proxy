@@ -140,9 +140,10 @@ class SyncService:
             stats["booksCount"] = total_books_synced
             logger.info(f"[BackgroundSync] Validated {total_books_synced} books across all series.")
 
-            # 4. Sync Read Progress & On Deck
+            # 4. Sync Read Progress & Reconcile In-Progress with Grimmory
             in_prog_count = 0
             try:
+                in_prog_count = await grimmory_client.reconcile_read_progress(user, pwd)
                 native_headers = await grimmory_client.get_native_headers(user, pwd)
                 cr_resp = await grimmory_client.client.get("/api/v1/app/books/continue-reading?size=100", headers=native_headers)
                 if cr_resp.status_code == 200:
@@ -151,11 +152,10 @@ class SyncService:
                     for b in cr_books:
                         b_id = str(b.get("id"))
                         if b_id:
-                            prog = await grimmory_client.get_read_progress(b_id, user, pwd)
-                            if prog:
-                                in_prog_count += 1
+                            await grimmory_client.get_read_progress(b_id, user, pwd)
+                    in_prog_count = len(db.get_all_in_progress())
             except Exception as e:
-                logger.debug(f"[BackgroundSync] Continue-reading sync note: {e}")
+                logger.debug(f"[BackgroundSync] Progress sync note: {e}")
 
             stats["readProgressCount"] = in_prog_count
             duration = round(time.time() - start_time, 2)

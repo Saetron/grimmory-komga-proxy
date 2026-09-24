@@ -94,7 +94,7 @@ async def list_books(
         )
 
     if "readprogress" in sort.lower() or "readdate" in sort.lower():
-        return await grimmory_client.get_ondeck_books(user, pwd, page=page, size=size, library_id=library_id)
+        return await grimmory_client.get_continue_reading_books(user, pwd, page=page, size=size, library_id=library_id)
 
     if "releasedate" in sort.lower():
         return await grimmory_client.get_released_books(user, pwd, page=page, size=size, library_id=library_id)
@@ -240,7 +240,7 @@ async def list_books_post(
         )
 
     if "readprogress" in sort.lower() or "readdate" in sort.lower():
-        return await grimmory_client.get_ondeck_books(user, pwd, page=page, size=size, library_id=library_id)
+        return await grimmory_client.get_continue_reading_books(user, pwd, page=page, size=size, library_id=library_id)
 
     search_query = params.get("search") or filters.get("search")
     if search_query:

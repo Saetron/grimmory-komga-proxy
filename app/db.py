@@ -4,7 +4,7 @@ import os
 import time
 import tempfile
 import logging
-from typing import Optional, Dict, Any, List, Tuple
+from typing import Optional, Dict, Any, List, Tuple, Set
 from app.config import settings
 
 logger = logging.getLogger("grimmory-komga-bridge")
@@ -392,6 +392,18 @@ class Database:
     def delete_read_progress(self, book_id: str):
         with self._get_connection() as conn:
             conn.execute("DELETE FROM read_progress WHERE book_id = ?", (str(book_id),))
+
+    def get_active_series_ids(self) -> List[str]:
+        with self._get_connection() as conn:
+            rows = conn.execute(
+                "SELECT DISTINCT series_id FROM books WHERE id IN (SELECT book_id FROM read_progress) AND series_id != ''"
+            ).fetchall()
+            return [str(r["series_id"]) for r in rows if r["series_id"]]
+
+    def get_all_read_book_ids(self) -> Set[str]:
+        with self._get_connection() as conn:
+            rows = conn.execute("SELECT book_id FROM read_progress WHERE completed = 1").fetchall()
+            return {str(r["book_id"]) for r in rows}
 
     def clear_all(self):
         with self._get_connection() as conn:
