@@ -1,8 +1,12 @@
+import logging
+import httpx
 from fastapi import APIRouter, Header, Request, Response, HTTPException, status
 from typing import Optional, Dict, Any, List
 from app.grimmory_client import grimmory_client
 from app.dto_utils import ensure_page_dto, ensure_series_dto, ensure_book_dto, extract_search_filters, disambiguate_series_dto
 from app.db import db
+
+logger = logging.getLogger("grimmory-komga-bridge")
 
 router = APIRouter(prefix="/api/v1/series", tags=["Series"])
 
@@ -337,35 +341,94 @@ async def get_series_thumbnail(
     series_id: str,
     authorization: Optional[str] = Header(None)
 ) -> Response:
+    from app.grimmory_client import thumbnail_cache
+    cache_key = f"s:{series_id}"
+    if cache_key in thumbnail_cache:
+        cached_content, cached_type = thumbnail_cache[cache_key]
+        return Response(
+            content=cached_content,
+            status_code=200,
+            headers={
+                "Content-Type": cached_type,
+                "Cache-Control": "public, max-age=604800, immutable"
+            }
+        )
+
     user, pwd = grimmory_client.extract_credentials(authorization)
 
-    # Handle virtual standalone series
-    if "-standalone-" in series_id:
-        b_id = series_id.split("-standalone-")[-1]
-        resp = await grimmory_client.komga_request("GET", f"/api/v1/books/{b_id}/thumbnail", user, pwd)
+    try:
+        # Handle virtual standalone series
+        if "-standalone-" in series_id:
+            b_id = series_id.split("-standalone-")[-1]
+            b_cache_key = f"b:{b_id}"
+            if b_cache_key in thumbnail_cache:
+                cached_content, cached_type = thumbnail_cache[b_cache_key]
+                return Response(
+                    content=cached_content,
+                    status_code=200,
+                    headers={
+                        "Content-Type": cached_type,
+                        "Cache-Control": "public, max-age=604800, immutable"
+                    }
+                )
+            resp = await grimmory_client.komga_request("GET", f"/api/v1/books/{b_id}/thumbnail", user, pwd)
+            if resp.status_code == 200:
+                c_type = resp.headers.get("Content-Type", "image/jpeg")
+                thumbnail_cache[cache_key] = (resp.content, c_type)
+                thumbnail_cache[b_cache_key] = (resp.content, c_type)
+                return Response(
+                    content=resp.content,
+                    status_code=200,
+                    headers={
+                        "Content-Type": c_type,
+                        "Cache-Control": "public, max-age=604800, immutable"
+                    }
+                )
+            return Response(
+                content=resp.content,
+                status_code=resp.status_code,
+                headers={"Content-Type": resp.headers.get("Content-Type", "image/jpeg")}
+            )
+
+        # Handle custom disambiguated series: use first book's thumbnail
+        if "-u-" in series_id:
+            books = await grimmory_client.get_series_books_custom(series_id, user, pwd)
+            if books:
+                first_b_id = str(books[0]["id"])
+                resp = await grimmory_client.komga_request("GET", f"/api/v1/books/{first_b_id}/thumbnail", user, pwd)
+                if resp.status_code == 200:
+                    c_type = resp.headers.get("Content-Type", "image/jpeg")
+                    thumbnail_cache[cache_key] = (resp.content, c_type)
+                    return Response(
+                        content=resp.content,
+                        status_code=200,
+                        headers={
+                            "Content-Type": c_type,
+                            "Cache-Control": "public, max-age=604800, immutable"
+                        }
+                    )
+
+        resp = await grimmory_client.komga_request("GET", f"/api/v1/series/{series_id}/thumbnail", user, pwd)
+        if resp.status_code == 200:
+            c_type = resp.headers.get("Content-Type", "image/jpeg")
+            thumbnail_cache[cache_key] = (resp.content, c_type)
+            return Response(
+                content=resp.content,
+                status_code=200,
+                headers={
+                    "Content-Type": c_type,
+                    "Cache-Control": "public, max-age=604800, immutable"
+                }
+            )
         return Response(
             content=resp.content,
             status_code=resp.status_code,
             headers={"Content-Type": resp.headers.get("Content-Type", "image/jpeg")}
         )
-
-    # Handle custom disambiguated series: use first book's thumbnail
-    if "-u-" in series_id:
-        books = await grimmory_client.get_series_books_custom(series_id, user, pwd)
-        if books:
-            first_b_id = str(books[0]["id"])
-            resp = await grimmory_client.komga_request("GET", f"/api/v1/books/{first_b_id}/thumbnail", user, pwd)
-            if resp.status_code == 200:
-                return Response(
-                    content=resp.content,
-                    status_code=200,
-                    headers={"Content-Type": resp.headers.get("Content-Type", "image/jpeg")}
-                )
-
-    resp = await grimmory_client.komga_request("GET", f"/api/v1/series/{series_id}/thumbnail", user, pwd)
-    return Response(
-        content=resp.content,
-        status_code=resp.status_code,
-        headers={"Content-Type": resp.headers.get("Content-Type", "image/jpeg")}
-    )
+    except (httpx.TimeoutException, httpx.HTTPError) as e:
+        logger.warning(f"[Thumbnail] Timeout or network error fetching thumbnail for series {series_id}: {e}")
+        return Response(status_code=404, content=b"", media_type="image/jpeg")
+    except Exception as e:
+        logger.error(f"[Thumbnail] Error fetching thumbnail for series {series_id}: {e}")
+        return Response(status_code=404, content=b"", media_type="image/jpeg")
 

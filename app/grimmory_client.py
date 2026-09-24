@@ -67,6 +67,8 @@ class ReadProgressCache(TTLCache):
 read_progress_cache: ReadProgressCache = ReadProgressCache(maxsize=10000, ttl=86400 * 30)
 # Cache book DTOs (5 min TTL)
 book_cache: TTLCache = TTLCache(maxsize=5000, ttl=300)
+# Cache thumbnails (7 days TTL)
+thumbnail_cache: TTLCache = TTLCache(maxsize=3000, ttl=86400 * 7)
 # Active reading sessions: session_key -> dict
 active_sessions: Dict[str, Dict[str, Any]] = {}
 
@@ -119,9 +121,9 @@ class GrimmoryClient:
         if self._client is None or self._client.is_closed or self._client_loop != loop:
             self._client = httpx.AsyncClient(
                 base_url=self.base_url,
-                timeout=httpx.Timeout(60.0, connect=10.0),
+                timeout=httpx.Timeout(60.0, connect=20.0),
                 follow_redirects=True,
-                limits=httpx.Limits(max_keepalive_connections=50, max_connections=100)
+                limits=httpx.Limits(max_keepalive_connections=100, max_connections=200)
             )
             self._client_loop = loop
         return self._client

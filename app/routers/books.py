@@ -1,9 +1,13 @@
+import logging
+import httpx
 from fastapi import APIRouter, Header, Request, Response, HTTPException, status
 from fastapi.responses import StreamingResponse
 from typing import Optional, Dict, Any, List
 from app.grimmory_client import grimmory_client
 from app.dto_utils import ensure_page_dto, ensure_book_dto, extract_search_filters
 from app.db import db
+
+logger = logging.getLogger("grimmory-komga-bridge")
 
 router = APIRouter(prefix="/api/v1/books", tags=["Books"])
 
@@ -407,13 +411,44 @@ async def get_book_thumbnail(
     book_id: str,
     authorization: Optional[str] = Header(None)
 ) -> Response:
+    from app.grimmory_client import thumbnail_cache
+    cache_key = f"b:{book_id}"
+    if cache_key in thumbnail_cache:
+        cached_content, cached_type = thumbnail_cache[cache_key]
+        return Response(
+            content=cached_content,
+            status_code=200,
+            headers={
+                "Content-Type": cached_type,
+                "Cache-Control": "public, max-age=604800, immutable"
+            }
+        )
+
     user, pwd = grimmory_client.extract_credentials(authorization)
-    resp = await grimmory_client.komga_request("GET", f"/api/v1/books/{book_id}/thumbnail", user, pwd)
-    return Response(
-        content=resp.content,
-        status_code=resp.status_code,
-        headers={"Content-Type": resp.headers.get("Content-Type", "image/jpeg")}
-    )
+    try:
+        resp = await grimmory_client.komga_request("GET", f"/api/v1/books/{book_id}/thumbnail", user, pwd)
+        if resp.status_code == 200:
+            c_type = resp.headers.get("Content-Type", "image/jpeg")
+            thumbnail_cache[cache_key] = (resp.content, c_type)
+            return Response(
+                content=resp.content,
+                status_code=200,
+                headers={
+                    "Content-Type": c_type,
+                    "Cache-Control": "public, max-age=604800, immutable"
+                }
+            )
+        return Response(
+            content=resp.content,
+            status_code=resp.status_code,
+            headers={"Content-Type": resp.headers.get("Content-Type", "image/jpeg")}
+        )
+    except (httpx.TimeoutException, httpx.HTTPError) as e:
+        logger.warning(f"[Thumbnail] Timeout or network error fetching thumbnail for book {book_id}: {e}")
+        return Response(status_code=404, content=b"", media_type="image/jpeg")
+    except Exception as e:
+        logger.error(f"[Thumbnail] Error fetching thumbnail for book {book_id}: {e}")
+        return Response(status_code=404, content=b"", media_type="image/jpeg")
 
 
 @router.get("/{book_id}/pages")
@@ -436,19 +471,22 @@ async def get_book_page(
     user, pwd = grimmory_client.extract_credentials(authorization)
     params = dict(request.query_params)
     
-    komga_resp = await grimmory_client.komga_request(
-        "GET",
-        f"/api/v1/books/{book_id}/pages/{page_number}",
-        user,
-        pwd,
-        params=params
-    )
-    if komga_resp.status_code == 200:
-        return StreamingResponse(
-            content=iter([komga_resp.content]),
-            status_code=200,
-            media_type=komga_resp.headers.get("Content-Type", "image/jpeg")
+    try:
+        komga_resp = await grimmory_client.komga_request(
+            "GET",
+            f"/api/v1/books/{book_id}/pages/{page_number}",
+            user,
+            pwd,
+            params=params
         )
+        if komga_resp.status_code == 200:
+            return StreamingResponse(
+                content=iter([komga_resp.content]),
+                status_code=200,
+                media_type=komga_resp.headers.get("Content-Type", "image/jpeg")
+            )
+    except Exception:
+        pass
 
     # Fallback to Grimmory native page image endpoints
     native_headers = await grimmory_client.get_native_headers(user, pwd)

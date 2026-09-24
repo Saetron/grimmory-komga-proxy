@@ -2178,6 +2178,40 @@ async def test_multi_user_read_progress_isolation():
     assert not any(b["id"] == book_id for b in inp_for_bob["content"])
 
 
+def test_thumbnail_caching_and_timeout_resilience():
+    """Verify that thumbnails are cached with immutable headers and timeouts gracefully return 404."""
+    from app.grimmory_client import thumbnail_cache
+    thumbnail_cache.clear()
+
+    dummy_jpeg = b"\xff\xd8\xff\xe0\x00\x10JFIF"
+    call_count = 0
+
+    async def mock_komga_request(method, path, user, pwd, **kwargs):
+        nonlocal call_count
+        call_count += 1
+        if "timeout-book" in path:
+            raise httpx.ConnectTimeout("Connection timed out")
+        return httpx.Response(200, content=dummy_jpeg, headers={"Content-Type": "image/jpeg"})
+
+    with patch.object(grimmory_client, "komga_request", side_effect=mock_komga_request):
+        # 1. First fetch for book-thumb-1 -> calls Grimmory and caches
+        resp1 = client.get("/api/v1/books/book-thumb-1/thumbnail", headers=AUTH_HEADER)
+        assert resp1.status_code == 200
+        assert resp1.content == dummy_jpeg
+        assert "max-age=604800" in resp1.headers.get("Cache-Control", "")
+        assert call_count == 1
+
+        # 2. Second fetch for book-thumb-1 -> served from cache, no network call
+        resp2 = client.get("/api/v1/books/book-thumb-1/thumbnail", headers=AUTH_HEADER)
+        assert resp2.status_code == 200
+        assert resp2.content == dummy_jpeg
+        assert call_count == 1
+
+        # 3. Fetch for timeout-book -> ConnectTimeout handled gracefully, returns 404 (not 500)
+        resp3 = client.get("/api/v1/books/timeout-book/thumbnail", headers=AUTH_HEADER)
+        assert resp3.status_code == 404
+
+
 if __name__ == "__main__":
     pytest.main(["-v", __file__])
 
