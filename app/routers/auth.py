@@ -19,6 +19,7 @@ async def actuator_info() -> Dict[str, Any]:
         }
     }
 
+@router.get("/api/v1/users/me")
 @router.get("/api/v2/users/me")
 async def get_current_user(authorization: Optional[str] = Header(None)) -> Dict[str, Any]:
     user, pwd = grimmory_client.extract_credentials(authorization)

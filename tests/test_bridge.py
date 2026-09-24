@@ -2212,6 +2212,37 @@ def test_thumbnail_caching_and_timeout_resilience():
         assert resp3.status_code == 404
 
 
+
+def test_user_me_v1_alias():
+    """Verify that GET /api/v1/users/me is an alias to /api/v2/users/me."""
+    mock_komga_resp = httpx.Response(
+        200,
+        json={"id": "user1", "email": "reader@example.com", "roles": ["USER"]}
+    )
+    with patch.object(grimmory_client, "komga_request", new_callable=AsyncMock) as mock_req:
+        mock_req.return_value = mock_komga_resp
+        resp = client.get("/api/v1/users/me", headers=AUTH_HEADER)
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["email"] == "reader@example.com"
+        assert "PAGE_STREAMING" in data["roles"]
+
+
+def test_list_books_post_with_series_and_read_status():
+    """Verify POST /api/v1/books/list does not crash with UnboundLocalError when seriesId and readStatus are provided."""
+    with patch.object(grimmory_client, "get_books_by_read_status", new_callable=AsyncMock) as mock_get_books:
+        mock_get_books.return_value = {"content": [], "totalElements": 0}
+        resp = client.post(
+            "/api/v1/books/list",
+            json={"seriesId": "test-series-1", "readStatus": ["UNREAD"]},
+            headers=AUTH_HEADER
+        )
+        assert resp.status_code == 200
+        mock_get_books.assert_called_once()
+        _, kwargs = mock_get_books.call_args
+        assert kwargs.get("series_id") == "test-series-1"
+
+
 if __name__ == "__main__":
     pytest.main(["-v", __file__])
 

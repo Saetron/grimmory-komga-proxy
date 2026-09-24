@@ -158,6 +158,13 @@ async def list_books_post(
 
     filters = extract_search_filters(body)
 
+    # Extract library filter
+    if "library_id" in filters:
+        params["library_id"] = filters["library_id"]
+    if "libraryId" in params:
+        params["library_id"] = params.pop("libraryId")
+    library_id = params.get("library_id") or filters.get("library_id")
+
     read_status = filters.get("read_status", [])
     query_read_status = params.get("read_status", "") or params.get("readStatus", "")
     all_raw_statuses = []
@@ -229,13 +236,6 @@ async def list_books_post(
             return ensure_page_dto(data, default_page=page, default_size=size)
         return ensure_page_dto({"content": []}, default_page=page, default_size=size)
 
-
-    # Extract library filter
-    if "library_id" in filters:
-        params["library_id"] = filters["library_id"]
-    if "libraryId" in params:
-        params["library_id"] = params.pop("libraryId")
-    library_id = params.get("library_id")
 
     # 2. Check if filtering by read status
     if statuses:
