@@ -14,10 +14,17 @@ class SyncService:
         self.is_syncing: bool = False
         self.last_sync_time: Optional[float] = None
         self.last_sync_stats: Dict[str, Any] = {}
+        self.has_synced_successfully: bool = False
         self._stop_event = asyncio.Event()
 
     def stop(self):
         self._stop_event.set()
+
+    def maybe_trigger_sync_on_login(self, user: str, pwd: str):
+        """If no successful background sync has completed yet, trigger it now with user's validated credentials."""
+        if not self.has_synced_successfully and not self.is_syncing and user and pwd:
+            logger.info(f"[BackgroundSync] Authenticated user '{user}' detected. Starting initial background sync...")
+            asyncio.create_task(self.run_full_sync(user=user, pwd=pwd))
 
     async def run_full_sync(self, user: Optional[str] = None, pwd: Optional[str] = None) -> Dict[str, Any]:
         """Perform a full check of Grimmory and validate/update the SQLite cache."""
@@ -25,9 +32,23 @@ class SyncService:
             logger.info("[BackgroundSync] Sync already in progress, skipping duplicate run.")
             return {"status": "in_progress", "message": "Sync already in progress"}
 
+        # 1. Resolve credentials
+        if not user or not pwd:
+            user, pwd = grimmory_client.extract_credentials(None)
+
+        if not user or not pwd:
+            logger.info(
+                "[BackgroundSync] No Grimmory credentials configured (GRIMMORY_USERNAME / GRIMMORY_PASSWORD). "
+                "Background sync paused until credentials are provided in environment or a user connects via Komic."
+            )
+            return {
+                "status": "skipped",
+                "message": "No Grimmory credentials configured yet"
+            }
+
         self.is_syncing = True
         start_time = time.time()
-        logger.info("[BackgroundSync] Starting full Grimmory database sync and cache validation...")
+        logger.info(f"[BackgroundSync] Starting full Grimmory database sync and cache validation for user '{user}'...")
 
         stats = {
             "status": "success",
@@ -39,11 +60,24 @@ class SyncService:
         }
 
         try:
-            # 1. Resolve credentials
-            if not user or not pwd:
-                user, pwd = grimmory_client.extract_credentials(None)
+            # 2. Verify authentication with Grimmory first
+            auth_check = await grimmory_client.komga_request("GET", "/api/v1/libraries", user, pwd)
+            if auth_check.status_code == 401:
+                logger.error(
+                    f"[BackgroundSync] Authentication failed (HTTP 401 Unauthorized) connecting to Grimmory with user '{user}'. "
+                    f"Please verify GRIMMORY_USERNAME and GRIMMORY_PASSWORD (or USER_MAPPING) match a valid Grimmory account."
+                )
+                stats["status"] = "unauthorized"
+                stats["error"] = f"HTTP 401 Unauthorized for user '{user}'"
+                self.last_sync_stats = stats
+                return stats
+            elif auth_check.status_code >= 400:
+                logger.warning(
+                    f"[BackgroundSync] Grimmory returned HTTP {auth_check.status_code} while checking libraries. "
+                    f"Sync may be partial or Grimmory may be temporarily unavailable."
+                )
 
-            # 2. Sync all series from Grimmory (Komga + custom disambiguated)
+            # 3. Sync all series from Grimmory (Komga + custom disambiguated)
             all_series = await grimmory_client.get_all_series(user, pwd)
             stats["seriesCount"] = len(all_series)
             if all_series:
@@ -128,6 +162,7 @@ class SyncService:
             stats["durationSeconds"] = duration
             self.last_sync_time = time.time()
             self.last_sync_stats = stats
+            self.has_synced_successfully = True
             logger.info(
                 f"[BackgroundSync] Full sync complete in {duration}s: "
                 f"{stats['seriesCount']} series, {stats['booksCount']} books, {in_prog_count} in-progress."

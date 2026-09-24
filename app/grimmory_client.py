@@ -94,7 +94,12 @@ class GrimmoryClient:
                 decoded = base64.b64decode(auth_header[6:]).decode("utf-8")
                 if ":" in decoded:
                     user, pwd = decoded.split(":", 1)
-                    self.last_credentials = (user, pwd)
+                    if user in settings.USER_MAPPINGS:
+                        mapped_user, mapped_pwd = settings.USER_MAPPINGS[user]
+                        self.last_credentials = (mapped_user, mapped_pwd)
+                        return mapped_user, mapped_pwd
+                    if user and pwd:
+                        self.last_credentials = (user, pwd)
                     return user, pwd
             except Exception:
                 pass

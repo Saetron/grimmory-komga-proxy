@@ -38,6 +38,11 @@ async def get_current_user(authorization: Optional[str] = Header(None)) -> Dict[
         )
 
     data = resp.json()
+    try:
+        from app.sync_service import sync_service
+        sync_service.maybe_trigger_sync_on_login(user, pwd)
+    except Exception:
+        pass
     # Ensure full Komga UserDto roles and permissions
     roles = data.get("roles", [])
     for standard_role in ["USER", "FILE_DOWNLOAD", "PAGE_STREAMING", "ADMIN"]:

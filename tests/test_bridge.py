@@ -1499,6 +1499,8 @@ async def test_sync_service_full_sync():
     ]
 
     async def mock_komga(method, path, user, pwd, **kwargs):
+        if "/api/v1/libraries" in path:
+            return httpx.Response(200, json=[{"id": "14", "name": "Manga"}])
         if "/api/v1/series/sync-s-1/books" in path:
             return httpx.Response(200, json=mock_books_data)
         if "/api/v1/series" in path:
@@ -1854,6 +1856,68 @@ def test_user_library_access_cached_books():
         book_ids = [b["id"] for b in content]
         assert "book-allowed" in book_ids
         assert "book-forbidden" not in book_ids
+
+
+@pytest.mark.anyio
+async def test_sync_service_skips_when_no_credentials():
+    """Verify background sync pauses gracefully without spamming 401s if no credentials exist."""
+    from app.sync_service import sync_service
+    from app.config import settings
+
+    old_user = settings.DEFAULT_USERNAME
+    old_pwd = settings.DEFAULT_PASSWORD
+    old_last = grimmory_client.last_credentials
+    try:
+        settings.DEFAULT_USERNAME = ""
+        settings.DEFAULT_PASSWORD = ""
+        grimmory_client.last_credentials = None
+
+        stats = await sync_service.run_full_sync()
+        assert stats["status"] == "skipped"
+        assert "No Grimmory credentials configured" in stats["message"]
+    finally:
+        settings.DEFAULT_USERNAME = old_user
+        settings.DEFAULT_PASSWORD = old_pwd
+        grimmory_client.last_credentials = old_last
+
+
+@pytest.mark.anyio
+async def test_sync_service_unauthorized_detected():
+    """Verify background sync catches 401 and reports unauthorized cleanly."""
+    from app.sync_service import sync_service
+
+    async def mock_komga_401(method, path, user, pwd, **kwargs):
+        return httpx.Response(401, json={"message": "Unauthorized"})
+
+    with patch.object(grimmory_client, "komga_request", side_effect=mock_komga_401):
+        stats = await sync_service.run_full_sync("wronguser", "wrongpass")
+        assert stats["status"] == "unauthorized"
+        assert "401" in stats["error"]
+
+
+def test_user_mapping_and_aliases():
+    """Verify USER_MAPPING parses various formats and maps client username to Grimmory credentials."""
+    from app.config import parse_user_mappings, settings
+
+    # Test comma-separated mapping
+    m1 = parse_user_mappings("unraid_user:grimmory_admin:secret123,reader:grim_reader:pass456")
+    assert m1["unraid_user"] == ("grimmory_admin", "secret123")
+    assert m1["reader"] == ("grim_reader", "pass456")
+
+    # Test equal-sign mapping
+    m2 = parse_user_mappings("unraid_user=grimmory_admin:secret123")
+    assert m2["unraid_user"] == ("grimmory_admin", "secret123")
+
+    # Test JSON mapping
+    m3 = parse_user_mappings('{"komic": ["grimmory_user", "mypass"]}')
+    assert m3["komic"] == ("grimmory_user", "mypass")
+
+    # Test client extraction with user mapping
+    settings.USER_MAPPINGS = {"mapped_client": ("real_grimmory_user", "real_grimmory_pwd")}
+    auth_header = "Basic " + base64.b64encode(b"mapped_client:anyclientpass").decode()
+    u, p = grimmory_client.extract_credentials(auth_header)
+    assert u == "real_grimmory_user"
+    assert p == "real_grimmory_pwd"
 
 
 if __name__ == "__main__":
