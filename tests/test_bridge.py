@@ -95,9 +95,9 @@ def test_series_post_list_translation_mock():
         data = resp.json()
         assert len(data["content"]) == 1
         assert data["content"][0]["name"] == "Series 1"
-        assert mock_req.call_count >= 1
-        _, kwargs = mock_req.call_args_list[0]
-        assert kwargs.get("params", {}).get("library_id") == "lib-1"
+        series_calls = [c for c in mock_req.call_args_list if len(c.args) > 1 and c.args[1] == "/api/v1/series"]
+        assert len(series_calls) >= 1
+        assert series_calls[0].kwargs.get("params", {}).get("library_id") == "lib-1"
 
         # Searching for non-matching term returns 0
         resp_nomatch = client.post(
@@ -2340,6 +2340,38 @@ def test_homepage_endpoints():
         resp_latest_post = client.post("/api/v1/books/latest", headers=AUTH_HEADER)
         assert resp_latest_post.status_code == 200
         assert "content" in resp_latest_post.json()
+
+
+def test_komic_search_structure():
+    """Verify that Komic nested fullTextSearch query returns fast results from SQLite."""
+    db.save_series({"id": "neko-series", "libraryId": "14", "name": "Neko no Te"})
+    db.save_book({"id": "neko-book", "seriesId": "neko-series", "libraryId": "14", "name": "Neko Chapter 1", "number": 1})
+
+    with patch.object(grimmory_client, "get_user_library_ids", new_callable=AsyncMock, return_value={"14"}):
+        payload = {
+            "fullTextSearch": "Neko",
+            "condition": {
+                "allOf": [
+                    {
+                        "libraryId": {
+                            "value": "14",
+                            "operator": "is"
+                        }
+                    }
+                ]
+            }
+        }
+        resp = client.post("/api/v1/series/list", json=payload, headers=AUTH_HEADER)
+        assert resp.status_code == 200
+        data = resp.json()
+        assert len(data["content"]) == 1
+        assert data["content"][0]["name"] == "Neko no Te"
+
+        resp_books = client.post("/api/v1/books/list", json=payload, headers=AUTH_HEADER)
+        assert resp_books.status_code == 200
+        books_data = resp_books.json()
+        assert len(books_data["content"]) == 1
+        assert books_data["content"][0]["name"] == "Neko Chapter 1"
 
 
 if __name__ == "__main__":

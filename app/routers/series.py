@@ -28,7 +28,7 @@ async def list_series(
         library_id = None
     sort = params.get("sort", "")
 
-    search_query = params.get("search")
+    search_query = params.get("search") or params.get("searchTerm") or params.get("q") or params.get("query")
     if search_query:
         return await grimmory_client.search_series(search_query, user, pwd, page=page, size=size, library_id=library_id)
 
@@ -128,7 +128,7 @@ async def list_series_post(
     if not sort_val and "sort" in body:
         sort_val = str(body["sort"])
 
-    search_query = params.get("search") or filters.get("search")
+    search_query = params.get("search") or params.get("searchTerm") or params.get("q") or params.get("query") or filters.get("search")
     if search_query:
         return await grimmory_client.search_series(search_query, user, pwd, page=page, size=size, library_id=library_id)
 

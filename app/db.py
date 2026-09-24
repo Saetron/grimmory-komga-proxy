@@ -196,10 +196,22 @@ class Database:
                     pass
             return result
 
-    def search_series(self, query: str, library_id: Optional[str] = None) -> List[Dict[str, Any]]:
+    def search_series(self, query: str, library_id: Optional[Union[str, List[str], Set[str]]] = None) -> List[Dict[str, Any]]:
         term = f"%{query.strip()}%"
         with self._get_connection() as conn:
-            if library_id:
+            if isinstance(library_id, str) and "," in library_id:
+                library_id = [x.strip() for x in library_id.split(",") if x.strip()]
+
+            if isinstance(library_id, (list, set, tuple)):
+                lib_list = [str(x) for x in library_id if str(x).strip()]
+                if not lib_list:
+                    rows = conn.execute("SELECT dto_json FROM series WHERE (name LIKE ? OR dto_json LIKE ?) ORDER BY name ASC", (term, term)).fetchall()
+                elif len(lib_list) == 1:
+                    rows = conn.execute("SELECT dto_json FROM series WHERE library_id = ? AND (name LIKE ? OR dto_json LIKE ?) ORDER BY name ASC", (lib_list[0], term, term)).fetchall()
+                else:
+                    placeholders = ",".join("?" * len(lib_list))
+                    rows = conn.execute(f"SELECT dto_json FROM series WHERE library_id IN ({placeholders}) AND (name LIKE ? OR dto_json LIKE ?) ORDER BY name ASC", lib_list + [term, term]).fetchall()
+            elif library_id:
                 rows = conn.execute(
                     "SELECT dto_json FROM series WHERE library_id = ? AND (name LIKE ? OR dto_json LIKE ?) ORDER BY name ASC",
                     (str(library_id), term, term)
@@ -345,10 +357,22 @@ class Database:
                     pass
             return result
 
-    def search_books(self, query: str, library_id: Optional[str] = None) -> List[Dict[str, Any]]:
+    def search_books(self, query: str, library_id: Optional[Union[str, List[str], Set[str]]] = None) -> List[Dict[str, Any]]:
         term = f"%{query.strip()}%"
         with self._get_connection() as conn:
-            if library_id:
+            if isinstance(library_id, str) and "," in library_id:
+                library_id = [x.strip() for x in library_id.split(",") if x.strip()]
+
+            if isinstance(library_id, (list, set, tuple)):
+                lib_list = [str(x) for x in library_id if str(x).strip()]
+                if not lib_list:
+                    rows = conn.execute("SELECT dto_json FROM books WHERE (name LIKE ? OR dto_json LIKE ?) ORDER BY name ASC", (term, term)).fetchall()
+                elif len(lib_list) == 1:
+                    rows = conn.execute("SELECT dto_json FROM books WHERE library_id = ? AND (name LIKE ? OR dto_json LIKE ?) ORDER BY name ASC", (lib_list[0], term, term)).fetchall()
+                else:
+                    placeholders = ",".join("?" * len(lib_list))
+                    rows = conn.execute(f"SELECT dto_json FROM books WHERE library_id IN ({placeholders}) AND (name LIKE ? OR dto_json LIKE ?) ORDER BY name ASC", lib_list + [term, term]).fetchall()
+            elif library_id:
                 rows = conn.execute(
                     "SELECT dto_json FROM books WHERE library_id = ? AND (name LIKE ? OR dto_json LIKE ?) ORDER BY name ASC",
                     (str(library_id), term, term)

@@ -5,7 +5,7 @@ import base64
 import time
 import httpx
 import urllib.parse
-from typing import Optional, Dict, Any, List, Tuple, Set
+from typing import Optional, Dict, Any, List, Tuple, Set, Union
 from cachetools import TTLCache
 from app.config import settings
 from app.dto_utils import ensure_page_dto, ensure_book_dto, raw_app_book_to_dto, ensure_series_dto, disambiguate_series_dto
@@ -2061,18 +2061,45 @@ class GrimmoryClient:
         pwd: str,
         page: int = 0,
         size: int = 20,
-        library_id: Optional[str] = None
+        library_id: Optional[Union[str, List[str], Set[str]]] = None
     ) -> Dict[str, Any]:
         """Search series by title/name."""
-        all_series = await self.get_all_series(user, pwd, library_id=library_id)
-        q_lower = query.strip().lower()
-        matching = [
-            s for s in all_series
-            if q_lower in (s.get("name") or "").lower() or q_lower in (s.get("metadata", {}).get("title") or "").lower()
-        ]
+        q_clean = query.strip()
+        matching = db.search_series(q_clean, library_id=library_id)
+
+        # Also search custom series that match
+        q_lower = q_clean.lower()
+        for s_id, custom_info in self.custom_series.items():
+            if not library_id or str(custom_info.get("lib_id")) == str(library_id):
+                s_name = (custom_info.get("name") or "").lower()
+                if q_lower in s_name and not any(existing.get("id") == s_id for existing in matching):
+                    s_dto = custom_info.get("dto", {})
+                    if s_dto:
+                        matching.append(s_dto)
+
+        user_libs = await self.get_user_library_ids(user, pwd)
+        if user_libs is not None:
+            matching = [s for s in matching if str(s.get("libraryId") or s.get("library_id", "")) in user_libs]
+
+        # If DB had no matches, only then try upstream Grimmory series
+        if not matching:
+            all_series = await self.get_all_series(user, pwd, library_id=library_id)
+            matching = [
+                s for s in all_series
+                if q_lower in (s.get("name") or "").lower() or q_lower in (s.get("metadata", {}).get("title") or "").lower()
+            ]
+            if user_libs is not None:
+                matching = [s for s in matching if str(s.get("libraryId") or s.get("library_id", "")) in user_libs]
+
         total = len(matching)
         start = page * size
         paged = matching[start:start + size]
+        u = (user or "default").lower().strip()
+        u_map = db.get_all_read_progress_map(u)
+        for s in paged:
+            disambiguate_series_dto(s)
+            ensure_series_dto(s, user=user, progress_map=u_map)
+
         return ensure_page_dto({
             "content": paged,
             "totalElements": total,
@@ -2087,63 +2114,42 @@ class GrimmoryClient:
         pwd: str,
         page: int = 0,
         size: int = 20,
-        library_id: Optional[str] = None
+        library_id: Optional[Union[str, List[str], Set[str]]] = None
     ) -> Dict[str, Any]:
-        """Search books by title/metadata via Grimmory native search and fallback."""
-        native_headers = await self.get_native_headers(user, pwd)
+        """Search books by title/metadata via persistent DB first, then native Grimmory search."""
         q_clean = query.strip()
         matching_books = []
 
-        # 1. Try native Grimmory search endpoint
-        for param_key in ["query", "search", "q"]:
-            try:
-                resp = await self.client.get(
-                    "/api/v1/app/books/search",
-                    params={param_key: q_clean, "size": 100},
-                    headers=native_headers
-                )
-                if resp.status_code == 200:
-                    data = resp.json()
-                    raw = data.get("content", []) if isinstance(data, dict) else data if isinstance(data, list) else []
-                    if raw:
-                        for b in raw:
-                            if library_id and str(b.get("libraryId") or b.get("library_id")) != str(library_id):
-                                continue
-                            matching_books.append(raw_app_book_to_dto(b))
-                        break
-            except Exception:
-                pass
+        # 1. Search persistent SQLite database first for instant snappy results
+        try:
+            db_matched = db.search_books(q_clean, library_id)
+            if db_matched:
+                matching_books.extend(db_matched)
+        except Exception:
+            pass
 
-        # 2. If native search returned nothing, search recently added / cached books
+        # 2. If nothing found in DB, try Grimmory native search with strict timeout
         if not matching_books:
-            try:
-                resp = await self.client.get(
-                    "/api/v1/app/books/recently-added",
-                    params={"size": 500},
-                    headers=native_headers
-                )
-                if resp.status_code == 200:
-                    data = resp.json()
-                    raw = data.get("content", []) if isinstance(data, dict) else data if isinstance(data, list) else []
-                    q_lower = q_clean.lower()
-                    for b in raw:
-                        if library_id and str(b.get("libraryId") or b.get("library_id")) != str(library_id):
-                            continue
-                        name = (b.get("name") or b.get("title") or "").lower()
-                        s_name = (b.get("seriesName") or "").lower()
-                        if q_lower in name or q_lower in s_name:
-                            matching_books.append(raw_app_book_to_dto(b))
-            except Exception:
-                pass
-
-        # 3. If still empty, search persistent database
-        if not matching_books:
-            try:
-                db_matched = db.search_books(q_clean, library_id)
-                if db_matched:
-                    matching_books.extend(db_matched)
-            except Exception:
-                pass
+            native_headers = await self.get_native_headers(user, pwd)
+            for param_key in ["query", "search", "q"]:
+                try:
+                    resp = await self.client.get(
+                        "/api/v1/app/books/search",
+                        params={param_key: q_clean, "size": 100},
+                        headers=native_headers,
+                        timeout=3.0
+                    )
+                    if resp.status_code == 200:
+                        data = resp.json()
+                        raw = data.get("content", []) if isinstance(data, dict) else data if isinstance(data, list) else []
+                        if raw:
+                            for b in raw:
+                                if library_id and str(b.get("libraryId") or b.get("library_id")) != str(library_id):
+                                    continue
+                                matching_books.append(raw_app_book_to_dto(b))
+                            break
+                except Exception:
+                    pass
 
         # Verify user library permissions
         user_libs = await self.get_user_library_ids(user, pwd)
@@ -2158,7 +2164,7 @@ class GrimmoryClient:
         paged = matching_books[start:start + size]
         await self.enrich_books_page_count(paged, user, pwd)
         for b in paged:
-            ensure_book_dto(b)
+            ensure_book_dto(b, user=user)
 
         return ensure_page_dto({
             "content": paged,

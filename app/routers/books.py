@@ -89,7 +89,7 @@ async def list_books(
             return ensure_page_dto(data, default_page=page, default_size=size)
         return ensure_page_dto({"content": []}, default_page=page, default_size=size)
 
-    search_query = params.get("search")
+    search_query = params.get("search") or params.get("searchTerm") or params.get("q") or params.get("query")
     if search_query:
         return await grimmory_client.search_books(search_query, user, pwd, page=page, size=size, library_id=library_id)
 
@@ -263,7 +263,7 @@ async def list_books_post(
     if "readprogress" in sort.lower() or "readdate" in sort.lower():
         return await grimmory_client.get_continue_reading_books(user, pwd, page=page, size=size, library_id=library_id)
 
-    search_query = params.get("search") or filters.get("search")
+    search_query = params.get("search") or params.get("searchTerm") or params.get("q") or params.get("query") or filters.get("search")
     if search_query:
         return await grimmory_client.search_books(search_query, user, pwd, page=page, size=size, library_id=library_id)
 
