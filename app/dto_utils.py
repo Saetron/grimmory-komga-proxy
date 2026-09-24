@@ -58,7 +58,7 @@ def ensure_page_dto(data: Dict[str, Any], default_page: int = 0, default_size: i
     return data
 
 
-def ensure_series_dto(series: Dict[str, Any]) -> Dict[str, Any]:
+def ensure_series_dto(series: Dict[str, Any], user: Optional[str] = None) -> Dict[str, Any]:
     """Ensure all required Komga SeriesDto fields are present for strict Swift/Kotlin clients."""
     now_iso = series.get("created") or series.get("lastModified") or "2026-01-01T00:00:00Z"
     series.setdefault("booksCount", 0)
@@ -70,10 +70,28 @@ def ensure_series_dto(series: Dict[str, Any]) -> Dict[str, Any]:
     series.setdefault("created", now_iso)
     series.setdefault("lastModified", now_iso)
     series.setdefault("fileLastModified", now_iso)
-    series.setdefault("name", series.get("name", "Unknown Series"))
+    
+    s_name = series.get("name")
+    s_id = str(series.get("id", ""))
+    if not s_name or str(s_name).strip().lower() in ("unknown series", "unknown"):
+        # If there are books in DB for this series, pick the book's name
+        try:
+            from app.db import db
+            s_books = db.get_books_by_series(s_id)
+            if s_books:
+                b_name = s_books[0].get("name") or (s_books[0].get("metadata") or {}).get("title")
+                if b_name:
+                    s_name = b_name
+        except Exception:
+            pass
+        if not s_name:
+            s_name = "Untitled Series"
+        series["name"] = s_name
+    else:
+        series.setdefault("name", s_name)
+
     series.setdefault("url", f"/api/v1/series/{series.get('id', '')}")
 
-    s_id = str(series.get("id", ""))
     if s_id:
         try:
             from app.db import db
@@ -81,8 +99,8 @@ def ensure_series_dto(series: Dict[str, Any]) -> Dict[str, Any]:
             if s_books:
                 from app.grimmory_client import grimmory_client
                 series["booksCount"] = len(s_books)
-                read_cnt = sum(1 for b in s_books if grimmory_client._is_book_finished(b))
-                inp_cnt = sum(1 for b in s_books if grimmory_client._is_book_in_progress(b))
+                read_cnt = sum(1 for b in s_books if grimmory_client._is_book_finished(b, user=user))
+                inp_cnt = sum(1 for b in s_books if grimmory_client._is_book_in_progress(b, user=user))
                 series["booksReadCount"] = read_cnt
                 series["booksInProgressCount"] = inp_cnt
                 series["booksUnreadCount"] = max(0, len(s_books) - read_cnt - inp_cnt)
@@ -140,7 +158,7 @@ def ensure_series_dto(series: Dict[str, Any]) -> Dict[str, Any]:
     return series
 
 
-def ensure_book_dto(book: Dict[str, Any]) -> Dict[str, Any]:
+def ensure_book_dto(book: Dict[str, Any], user: Optional[str] = None) -> Dict[str, Any]:
     """Ensure all required Komga BookDto, MediaDto, and BookMetadataDto fields are present."""
     now_iso = book.get("created") or book.get("lastModified") or "2026-01-01T00:00:00Z"
     book.setdefault("created", now_iso)
@@ -155,21 +173,24 @@ def ensure_book_dto(book: Dict[str, Any]) -> Dict[str, Any]:
     book.setdefault("name", "Untitled")
     book.setdefault("url", f"/api/v1/books/{book.get('id', '')}")
 
-    # Fallback series info for standalone books
-    if not book.get("seriesId"):
-        lib_id = book.get("libraryId", "0")
+    # Fallback series info for standalone books (or books without a series)
+    b_title = str(book.get("name") or (book.get("metadata") or {}).get("title") or f"Book {book.get('id', '0')}").strip()
+    s_title = str(book.get("seriesTitle") or "").strip()
+    if not s_title or s_title.lower() in ("unknown series", "unknown", "standalone", "series"):
+        s_title = b_title
+        book["seriesTitle"] = b_title
+
+    s_id = str(book.get("seriesId", ""))
+    if not s_id or "-unknown-series" in s_id:
+        lib_id = str(book.get("libraryId", "0"))
         b_id = str(book.get("id", "0"))
-        book["seriesId"] = f"{lib_id}-standalone-{b_id}"
-        book.setdefault("seriesTitle", book.get("name", "Standalone"))
+        s_id = f"{lib_id}-standalone-{b_id}"
+        book["seriesId"] = s_id
         book["oneshot"] = True
-    elif not book.get("seriesTitle"):
-        book["seriesTitle"] = book.get("name", "Series")
 
     # Disambiguate seriesId if seriesTitle has non-ASCII or seriesId has trailing dash
-    s_id = str(book.get("seriesId", ""))
-    s_title = book.get("seriesTitle", "")
     lib_id = str(book.get("libraryId", "0"))
-    if s_title and (s_id.endswith("-") or any(ord(c) > 127 for c in s_title)):
+    if "-standalone-" not in s_id and s_title and (s_id.endswith("-") or any(ord(c) > 127 for c in s_title)):
         unique_id = compute_unique_series_id(lib_id, s_title)
         book["seriesId"] = unique_id
         from app.grimmory_client import grimmory_client
@@ -184,6 +205,25 @@ def ensure_book_dto(book: Dict[str, Any]) -> Dict[str, Any]:
                 "booksCount": 1,
                 "oneshot": False
             })
+    elif "-standalone-" in s_id:
+        from app.grimmory_client import grimmory_client
+        if s_id not in grimmory_client.custom_series:
+            s_dto = {
+                "id": s_id,
+                "libraryId": lib_id,
+                "name": s_title or b_title,
+                "url": f"/api/v1/series/{s_id}",
+                "created": book.get("created", ""),
+                "lastModified": book.get("lastModified", ""),
+                "booksCount": 1,
+                "oneshot": True
+            }
+            grimmory_client.register_custom_series(s_id, lib_id, s_title or b_title, s_dto)
+            try:
+                from app.db import db
+                db.save_series(s_dto)
+            except Exception:
+                pass
 
     # MediaDto
     media = book.get("media")
@@ -247,11 +287,21 @@ def ensure_book_dto(book: Dict[str, Any]) -> Dict[str, Any]:
     meta.setdefault("created", now_iso)
     meta.setdefault("lastModified", now_iso)
 
-    # Attach readProgress if available in cache and missing on book
-    from app.grimmory_client import read_progress_cache
-    if b_id in read_progress_cache and read_progress_cache[b_id]:
-        if "readProgress" not in book or book.get("readProgress") is None:
-            book["readProgress"] = read_progress_cache[b_id]
+    if "readProgress" not in book or book.get("readProgress") is None:
+        try:
+            from app.grimmory_client import read_progress_cache
+            from app.db import db
+            u = (user or "default").lower().strip()
+            p_key = f"{u}:{b_id}"
+            prog = (
+                read_progress_cache.get(p_key) or
+                (read_progress_cache.get(b_id) if (u == "default" or ":" not in b_id and b_id in read_progress_cache) else None) or
+                db.get_read_progress(u, b_id)
+            )
+            if prog:
+                book["readProgress"] = prog
+        except Exception:
+            pass
 
     prog = book.get("readProgress")
     if isinstance(prog, dict) and prog.get("completed") is True:
@@ -266,15 +316,27 @@ def raw_app_book_to_dto(raw: Dict[str, Any], series_id_override: Optional[str] =
     """Convert Grimmory native /api/v1/app/books/* object into a compliant Komga BookDto."""
     b_id = str(raw["id"])
     lib_id = str(raw.get("libraryId", "1"))
-    series_name = raw.get("seriesName") or "Unknown Series"
+    title = str(raw.get("title") or raw.get("name") or f"Book {b_id}").strip()
+
+    raw_series = raw.get("seriesName")
+    is_series_missing = (not raw_series) or not str(raw_series).strip() or str(raw_series).strip().lower() in ("unknown series", "unknown")
+
+    if not is_series_missing:
+        series_name = str(raw_series).strip()
+        is_standalone = False
+    else:
+        series_name = title
+        is_standalone = True
+
     if series_id_override:
         series_id = series_id_override
+    elif is_standalone:
+        series_id = f"{lib_id}-standalone-{b_id}"
     elif any(ord(c) > 127 for c in series_name):
         series_id = compute_unique_series_id(lib_id, series_name)
     else:
         series_id = f"{lib_id}-{series_name.lower().replace(' ', '-')}"
     num = raw.get("seriesNumber", 1.0)
-    title = raw.get("title") or f"Book {b_id}"
     added_on = raw.get("addedOn") or "2026-09-23T00:00:00Z"
 
     file_type = raw.get("primaryFileType")
@@ -387,8 +449,29 @@ def raw_app_book_to_dto(raw: Dict[str, Any], series_id_override: Optional[str] =
         },
         "deleted": False,
         "fileHash": "",
-        "oneshot": False
+        "oneshot": is_standalone
     }
+
+    if is_standalone:
+        try:
+            from app.grimmory_client import grimmory_client
+            if series_id not in grimmory_client.custom_series:
+                s_dto = {
+                    "id": series_id,
+                    "libraryId": lib_id,
+                    "name": series_name,
+                    "url": f"/api/v1/series/{series_id}",
+                    "created": added_on,
+                    "lastModified": raw.get("coverUpdatedOn") or added_on,
+                    "booksCount": 1,
+                    "oneshot": True
+                }
+                grimmory_client.register_custom_series(series_id, lib_id, series_name, s_dto)
+                from app.db import db
+                db.save_series(s_dto)
+        except Exception:
+            pass
+
     return ensure_book_dto(dto)
 
 

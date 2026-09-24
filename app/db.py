@@ -62,6 +62,29 @@ class Database:
 
     def _init_db(self):
         with self._get_connection() as conn:
+            # Migration check for read_progress table
+            cursor = conn.execute("PRAGMA table_info(read_progress)")
+            cols = [row["name"] for row in cursor.fetchall()]
+            if cols and "user" not in cols:
+                conn.execute("ALTER TABLE read_progress RENAME TO read_progress_old;")
+                conn.execute("""
+                    CREATE TABLE read_progress (
+                        user TEXT NOT NULL,
+                        book_id TEXT NOT NULL,
+                        page INTEGER,
+                        completed INTEGER,
+                        read_date TEXT,
+                        dto_json TEXT,
+                        updated_at REAL,
+                        PRIMARY KEY (user, book_id)
+                    );
+                """)
+                conn.execute("""
+                    INSERT OR IGNORE INTO read_progress (user, book_id, page, completed, read_date, dto_json, updated_at)
+                    SELECT 'default', book_id, page, completed, read_date, dto_json, updated_at FROM read_progress_old;
+                """)
+                conn.execute("DROP TABLE read_progress_old;")
+
             conn.executescript("""
                 CREATE TABLE IF NOT EXISTS series (
                     id TEXT PRIMARY KEY,
@@ -96,14 +119,17 @@ class Database:
                 );
 
                 CREATE TABLE IF NOT EXISTS read_progress (
-                    book_id TEXT PRIMARY KEY,
+                    user TEXT NOT NULL,
+                    book_id TEXT NOT NULL,
                     page INTEGER,
                     completed INTEGER,
                     read_date TEXT,
                     dto_json TEXT,
-                    updated_at REAL
+                    updated_at REAL,
+                    PRIMARY KEY (user, book_id)
                 );
-                CREATE INDEX IF NOT EXISTS idx_read_progress_completed ON read_progress (completed);
+                CREATE INDEX IF NOT EXISTS idx_read_progress_user ON read_progress (user);
+                CREATE INDEX IF NOT EXISTS idx_read_progress_completed ON read_progress (user, completed);
             """)
 
     # --- Series Operations ---
@@ -191,10 +217,19 @@ class Database:
             num_sort = 1.0
         pages_count = int(book_dto.get("media", {}).get("pagesCount", 1))
         now = time.time()
+        prog = book_dto.get("readProgress")
+        if isinstance(prog, dict):
+            page = prog.get("page", 1)
+            completed = prog.get("completed", False)
+            read_date = prog.get("readDate", "")
+            self.save_read_progress("default", b_id, page, completed, read_date, prog)
+
+        b_clean = dict(book_dto)
+        b_clean.pop("readProgress", None)
         with self._get_connection() as conn:
             conn.execute(
                 "INSERT OR REPLACE INTO books (id, series_id, library_id, name, number_sort, pages_count, dto_json, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-                (b_id, s_id, lib_id, name, num_sort, pages_count, json.dumps(book_dto), now)
+                (b_id, s_id, lib_id, name, num_sort, pages_count, json.dumps(b_clean), now)
             )
 
     def save_books_batch(self, books_list: List[Dict[str, Any]]):
@@ -210,7 +245,15 @@ class Database:
             except Exception:
                 num_sort = 1.0
             pages_count = int(b.get("media", {}).get("pagesCount", 1))
-            rows.append((b_id, s_id, lib_id, name, num_sort, pages_count, json.dumps(b), now))
+            prog = b.get("readProgress")
+            if isinstance(prog, dict):
+                page = prog.get("page", 1)
+                completed = prog.get("completed", False)
+                read_date = prog.get("readDate", "")
+                self.save_read_progress("default", b_id, page, completed, read_date, prog)
+            b_clean = dict(b)
+            b_clean.pop("readProgress", None)
+            rows.append((b_id, s_id, lib_id, name, num_sort, pages_count, json.dumps(b_clean), now))
         with self._get_connection() as conn:
             conn.executemany(
                 "INSERT OR REPLACE INTO books (id, series_id, library_id, name, number_sort, pages_count, dto_json, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
@@ -346,18 +389,57 @@ class Database:
         return None
 
     # --- Read Progress Operations ---
-    def save_read_progress(self, book_id: str, page: int, completed: bool, read_date: str, dto: Dict[str, Any]):
+    def save_read_progress(self, *args, **kwargs):
+        """Save read progress. Supports:
+        save_read_progress(user, book_id, page, completed, read_date, dto)
+        save_read_progress(book_id, page, completed, read_date, dto)  # default user
+        """
         now = time.time()
+        if len(args) == 6:
+            user, book_id, page, completed, read_date, dto = args
+        elif len(args) == 5:
+            user = kwargs.get("user", "default")
+            book_id, page, completed, read_date, dto = args
+        else:
+            user = kwargs.get("user", "default")
+            book_id = kwargs.get("book_id")
+            page = kwargs.get("page", 1)
+            completed = kwargs.get("completed", False)
+            read_date = kwargs.get("read_date", "")
+            dto = kwargs.get("dto", {})
+
+        u = str(user or "default").lower().strip()
         comp_val = 1 if completed else 0
         with self._get_connection() as conn:
             conn.execute(
-                "INSERT OR REPLACE INTO read_progress (book_id, page, completed, read_date, dto_json, updated_at) VALUES (?, ?, ?, ?, ?, ?)",
-                (str(book_id), page, comp_val, read_date, json.dumps(dto), now)
+                "INSERT OR REPLACE INTO read_progress (user, book_id, page, completed, read_date, dto_json, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (u, str(book_id), page, comp_val, read_date, json.dumps(dto), now)
             )
 
-    def get_read_progress(self, book_id: str) -> Optional[Dict[str, Any]]:
+    def get_read_progress(self, arg1: str, arg2: Optional[str] = None) -> Optional[Dict[str, Any]]:
+        """Get read progress. Supports:
+        get_read_progress(user, book_id)
+        get_read_progress(book_id)  # checks default user, or any user
+        """
         with self._get_connection() as conn:
-            row = conn.execute("SELECT dto_json FROM read_progress WHERE book_id = ?", (str(book_id),)).fetchone()
+            if arg2 is not None:
+                user = str(arg1 or "default").lower().strip()
+                book_id = str(arg2)
+                row = conn.execute(
+                    "SELECT dto_json FROM read_progress WHERE user = ? AND book_id = ?",
+                    (user, book_id)
+                ).fetchone()
+                if not row and user != "default":
+                    row = conn.execute(
+                        "SELECT dto_json FROM read_progress WHERE user = 'default' AND book_id = ?",
+                        (book_id,)
+                    ).fetchone()
+            else:
+                book_id = str(arg1)
+                row = conn.execute(
+                    "SELECT dto_json FROM read_progress WHERE book_id = ? ORDER BY updated_at DESC",
+                    (book_id,)
+                ).fetchone()
             if row:
                 try:
                     return json.loads(row["dto_json"])
@@ -365,11 +447,24 @@ class Database:
                     pass
         return None
 
-    def get_all_in_progress(self) -> List[Tuple[str, Dict[str, Any]]]:
+    def get_all_in_progress(self, user: Optional[str] = None) -> List[Tuple[str, Dict[str, Any]]]:
         with self._get_connection() as conn:
-            rows = conn.execute(
-                "SELECT book_id, dto_json FROM read_progress WHERE completed = 0 AND page > 0 ORDER BY updated_at DESC"
-            ).fetchall()
+            if user and user != "default":
+                u = str(user).lower().strip()
+                rows = conn.execute(
+                    """SELECT book_id, dto_json, updated_at FROM read_progress 
+                       WHERE user = ? AND completed = 0 AND page > 0
+                       UNION
+                       SELECT book_id, dto_json, updated_at FROM read_progress 
+                       WHERE user = 'default' AND completed = 0 AND page > 0 
+                         AND book_id NOT IN (SELECT book_id FROM read_progress WHERE user = ?)
+                       ORDER BY updated_at DESC""",
+                    (u, u)
+                ).fetchall()
+            else:
+                rows = conn.execute(
+                    "SELECT book_id, dto_json FROM read_progress WHERE completed = 0 AND page > 0 ORDER BY updated_at DESC"
+                ).fetchall()
             result = []
             for r in rows:
                 try:
@@ -378,31 +473,70 @@ class Database:
                     pass
             return result
 
-    def get_all_read_progress_map(self) -> Dict[str, Dict[str, Any]]:
+    def get_all_read_progress_map(self, user: Optional[str] = None) -> Dict[str, Dict[str, Any]]:
         with self._get_connection() as conn:
-            rows = conn.execute("SELECT book_id, dto_json FROM read_progress").fetchall()
-            result = {}
-            for r in rows:
-                try:
-                    result[r["book_id"]] = json.loads(r["dto_json"])
-                except Exception:
-                    pass
-            return result
+            if user:
+                u = str(user).lower().strip()
+                rows = conn.execute("SELECT book_id, dto_json FROM read_progress WHERE user = ?", (u,)).fetchall()
+                result = {}
+                for r in rows:
+                    try:
+                        result[r["book_id"]] = json.loads(r["dto_json"])
+                    except Exception:
+                        pass
+                return result
+            else:
+                rows = conn.execute("SELECT user, book_id, dto_json FROM read_progress").fetchall()
+                result = {}
+                for r in rows:
+                    try:
+                        key = f"{r['user']}:{r['book_id']}"
+                        result[key] = json.loads(r["dto_json"])
+                        if r["user"] == "default":
+                            result[r["book_id"]] = json.loads(r["dto_json"])
+                    except Exception:
+                        pass
+                return result
 
-    def delete_read_progress(self, book_id: str):
-        with self._get_connection() as conn:
-            conn.execute("DELETE FROM read_progress WHERE book_id = ?", (str(book_id),))
+    def delete_read_progress(self, arg1: str, arg2: Optional[str] = None):
+        """Supports delete_read_progress(user, book_id) or delete_read_progress(book_id)."""
+        if arg2 is not None:
+            user = str(arg1 or "default").lower().strip()
+            book_id = str(arg2)
+            with self._get_connection() as conn:
+                conn.execute("DELETE FROM read_progress WHERE user = ? AND book_id = ?", (user, book_id))
+        else:
+            book_id = str(arg1)
+            with self._get_connection() as conn:
+                conn.execute("DELETE FROM read_progress WHERE book_id = ?", (book_id,))
 
-    def get_active_series_ids(self) -> List[str]:
+    def get_active_series_ids(self, user: Optional[str] = None) -> List[str]:
         with self._get_connection() as conn:
-            rows = conn.execute(
-                "SELECT DISTINCT series_id FROM books WHERE id IN (SELECT book_id FROM read_progress) AND series_id != ''"
-            ).fetchall()
+            if user and user != "default":
+                u = str(user).lower().strip()
+                rows = conn.execute(
+                    "SELECT DISTINCT series_id FROM books WHERE id IN (SELECT book_id FROM read_progress WHERE user = ? OR user = 'default') AND series_id != ''",
+                    (u,)
+                ).fetchall()
+            else:
+                rows = conn.execute(
+                    "SELECT DISTINCT series_id FROM books WHERE id IN (SELECT book_id FROM read_progress) AND series_id != ''"
+                ).fetchall()
             return [str(r["series_id"]) for r in rows if r["series_id"]]
 
-    def get_all_read_book_ids(self) -> Set[str]:
+    def get_all_read_book_ids(self, user: Optional[str] = None) -> Set[str]:
         with self._get_connection() as conn:
-            rows = conn.execute("SELECT book_id FROM read_progress WHERE completed = 1").fetchall()
+            if user and user != "default":
+                u = str(user).lower().strip()
+                rows = conn.execute(
+                    """SELECT book_id FROM read_progress WHERE user = ? AND completed = 1
+                       UNION
+                       SELECT book_id FROM read_progress WHERE user = 'default' AND completed = 1 
+                         AND book_id NOT IN (SELECT book_id FROM read_progress WHERE user = ?)""",
+                    (u, u)
+                ).fetchall()
+            else:
+                rows = conn.execute("SELECT book_id FROM read_progress WHERE completed = 1").fetchall()
             return {str(r["book_id"]) for r in rows}
 
     def clear_all(self):

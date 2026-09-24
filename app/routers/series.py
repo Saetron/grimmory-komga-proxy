@@ -210,14 +210,14 @@ async def get_series(
                 "lastModified": book.get("lastModified", ""),
                 "booksCount": 1,
                 "oneshot": True
-            })
+            }, user=user)
 
     # Handle custom disambiguated series
     if "-u-" in series_id:
         if series_id not in grimmory_client.custom_series:
             await grimmory_client.ensure_custom_series_loaded(series_id, user, pwd)
         if series_id in grimmory_client.custom_series:
-            return ensure_series_dto(grimmory_client.custom_series[series_id]["dto"])
+            return ensure_series_dto(grimmory_client.custom_series[series_id]["dto"], user=user)
 
         books = await grimmory_client.get_series_books_custom(series_id, user, pwd)
         if books:
@@ -235,7 +235,7 @@ async def get_series(
                 "oneshot": False
             }
             grimmory_client.register_custom_series(series_id, lib_id, s_name, fallback_dto)
-            return ensure_series_dto(fallback_dto)
+            return ensure_series_dto(fallback_dto, user=user)
 
         raise HTTPException(status_code=404, detail="Series not found")
 
@@ -243,7 +243,7 @@ async def get_series(
     if db_series:
         if await grimmory_client.user_can_access_series(db_series, user, pwd):
             disambiguate_series_dto(db_series)
-            return ensure_series_dto(db_series)
+            return ensure_series_dto(db_series, user=user)
         raise HTTPException(status_code=404, detail="Series not found")
 
     resp = await grimmory_client.komga_request("GET", f"/api/v1/series/{series_id}", user, pwd)
@@ -251,7 +251,7 @@ async def get_series(
         raise HTTPException(status_code=resp.status_code, detail="Series not found")
     data = resp.json()
     disambiguate_series_dto(data)
-    return ensure_series_dto(data)
+    return ensure_series_dto(data, user=user)
 
 
 @router.get("/{series_id}/collections")

@@ -2104,6 +2104,80 @@ async def test_reconcile_read_progress_heals_stale_cache():
         assert not any(b_id == "stale-101" for b_id, _ in in_prog)
 
 
+def test_series_less_japanese_book_creates_eponymous_series():
+    """Verify that books without a series (including Japanese titles) create an eponymous series with book name, never 'Unknown Series'."""
+    from app.dto_utils import raw_app_book_to_dto
+    japanese_title = "進撃の巨人 特典小冊子"
+    raw_book = {
+        "id": 9999,
+        "libraryId": 14,
+        "title": japanese_title,
+        "seriesName": None,
+        "addedOn": "2026-09-24T12:00:00Z"
+    }
+    dto = raw_app_book_to_dto(raw_book)
+    assert dto["seriesTitle"] == japanese_title
+    assert "Unknown Series" not in dto["seriesTitle"]
+    assert "unknown" not in dto["seriesId"]
+    assert dto["seriesId"] == "14-standalone-9999"
+    assert dto["oneshot"] is True
+
+    s_dto = grimmory_client.custom_series.get("14-standalone-9999")
+    assert s_dto is not None
+    assert s_dto["name"] == japanese_title
+    assert s_dto["dto"]["name"] == japanese_title
+
+
+@pytest.mark.anyio
+async def test_multi_user_read_progress_isolation():
+    """Verify that read progress and read/unread filters are strictly PER USER."""
+    book_id = "isolation-book-1"
+    book_dto = {
+        "id": book_id,
+        "name": "Shared Manga Vol 1",
+        "libraryId": "14",
+        "seriesId": "series-iso",
+        "seriesTitle": "Shared Manga",
+        "media": {"pagesCount": 100}
+    }
+    db.save_book(book_dto)
+
+    user1 = "alice"
+    user2 = "bob"
+
+    # Alice reads to page 25 (in progress)
+    await grimmory_client.update_read_progress(book_id, page=25, completed=False, user=user1, pwd="p1")
+
+    # Bob completes the book (100% finished)
+    await grimmory_client.update_read_progress(book_id, page=100, completed=True, user=user2, pwd="p2")
+
+    # Verify SQLite DB isolation
+    p1 = db.get_read_progress(user1, book_id)
+    p2 = db.get_read_progress(user2, book_id)
+    assert p1 is not None and p1["page"] == 25 and p1["completed"] is False
+    assert p2 is not None and p2["page"] == 100 and p2["completed"] is True
+
+    # Verify status checks per user
+    assert grimmory_client._is_book_in_progress(book_dto, user=user1) is True
+    assert grimmory_client._is_book_finished(book_dto, user=user1) is False
+
+    assert grimmory_client._is_book_in_progress(book_dto, user=user2) is False
+    assert grimmory_client._is_book_finished(book_dto, user=user2) is True
+
+    # Verify read status filtering per user
+    read_for_bob = await grimmory_client.get_books_by_read_status(statuses=["READ"], user=user2, pwd="p2")
+    assert any(b["id"] == book_id for b in read_for_bob["content"])
+
+    read_for_alice = await grimmory_client.get_books_by_read_status(statuses=["READ"], user=user1, pwd="p1")
+    assert not any(b["id"] == book_id for b in read_for_alice["content"])
+
+    inp_for_alice = await grimmory_client.get_books_by_read_status(statuses=["IN_PROGRESS"], user=user1, pwd="p1")
+    assert any(b["id"] == book_id for b in inp_for_alice["content"])
+
+    inp_for_bob = await grimmory_client.get_books_by_read_status(statuses=["IN_PROGRESS"], user=user2, pwd="p2")
+    assert not any(b["id"] == book_id for b in inp_for_bob["content"])
+
+
 if __name__ == "__main__":
     pytest.main(["-v", __file__])
 
