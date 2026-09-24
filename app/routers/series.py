@@ -203,6 +203,13 @@ async def get_series_books(
     page = int(params.get("page", 0))
     size = int(params.get("size", 20))
 
+    read_status_param = params.get("read_status", "") or params.get("readStatus", "")
+    if read_status_param:
+        statuses = [s.strip().upper() for s in str(read_status_param).split(",") if s.strip()]
+        return await grimmory_client.get_books_by_read_status(
+            statuses, user, pwd, page=page, size=size, series_id=series_id, sort=params.get("sort", "")
+        )
+
     # Handle virtual standalone series
     if "-standalone-" in series_id:
         b_id = series_id.split("-standalone-")[-1]

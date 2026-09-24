@@ -11,5 +11,6 @@ class Settings:
     DATABASE_PATH: str = os.getenv("DATABASE_PATH", os.path.join(os.getenv("DATA_DIR", "data"), "bridge.db"))
     SYNC_INTERVAL_MINUTES: int = int(os.getenv("SYNC_INTERVAL_MINUTES", "30"))
     SYNC_ON_STARTUP: bool = os.getenv("SYNC_ON_STARTUP", "true").lower() in ("true", "1", "yes")
+    SYNC_CONCURRENCY: int = int(os.getenv("SYNC_CONCURRENCY", "6"))
 
 settings = Settings()

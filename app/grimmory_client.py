@@ -5,7 +5,7 @@ import base64
 import time
 import httpx
 import urllib.parse
-from typing import Optional, Dict, Any, List, Tuple
+from typing import Optional, Dict, Any, List, Tuple, Set
 from cachetools import TTLCache
 from app.config import settings
 from app.dto_utils import ensure_page_dto, ensure_book_dto, raw_app_book_to_dto, ensure_series_dto, disambiguate_series_dto
@@ -64,6 +64,7 @@ class GrimmoryClient:
         self.custom_series: Dict[str, Dict[str, Any]] = {}
         self.custom_series_books_cache: TTLCache = TTLCache(maxsize=1000, ttl=300)
         self.all_series_cache: TTLCache = TTLCache(maxsize=100, ttl=60)
+        self.user_libraries_cache: TTLCache = TTLCache(maxsize=100, ttl=60)
         self.last_credentials: Optional[Tuple[str, str]] = None
 
     def get_client(self) -> httpx.AsyncClient:
@@ -159,6 +160,52 @@ class GrimmoryClient:
             json=json_data,
             headers=req_headers
         )
+
+    async def get_user_library_ids(self, user: str, pwd: str) -> Optional[Set[str]]:
+        """Fetch the set of library IDs that the given user has access to."""
+        cache_key = f"{user}:{pwd}"
+        if cache_key in self.user_libraries_cache:
+            return self.user_libraries_cache[cache_key]
+
+        try:
+            resp = await self.komga_request("GET", "/api/v1/libraries", user, pwd)
+            if resp.status_code == 200:
+                libs = resp.json()
+                if isinstance(libs, list):
+                    lib_ids = {str(lib.get("id")) for lib in libs if lib.get("id")}
+                    self.user_libraries_cache[cache_key] = lib_ids
+                    return lib_ids
+        except Exception:
+            pass
+
+        return None
+
+    async def user_can_access_library(self, library_id: str, user: str, pwd: str) -> bool:
+        """Verify whether user has access to this library."""
+        if not library_id:
+            return True
+        user_libs = await self.get_user_library_ids(user, pwd)
+        if user_libs is not None:
+            return str(library_id) in user_libs
+        return True
+
+    async def user_can_access_book(self, book_dto: Dict[str, Any], user: str, pwd: str) -> bool:
+        """Verify whether user has access to the book's library."""
+        if not book_dto or not isinstance(book_dto, dict):
+            return False
+        lib_id = str(book_dto.get("libraryId") or book_dto.get("library_id") or "")
+        if not lib_id:
+            return True
+        return await self.user_can_access_library(lib_id, user, pwd)
+
+    async def user_can_access_series(self, series_dto: Dict[str, Any], user: str, pwd: str) -> bool:
+        """Verify whether user has access to the series' library."""
+        if not series_dto or not isinstance(series_dto, dict):
+            return False
+        lib_id = str(series_dto.get("libraryId") or series_dto.get("library_id") or "")
+        if not lib_id:
+            return True
+        return await self.user_can_access_library(lib_id, user, pwd)
 
     async def native_request(
         self,
@@ -324,16 +371,36 @@ class GrimmoryClient:
                 pass
 
         if not pages:
-            # Fallback 1 page
-            pages = [{
-                "number": 1,
-                "fileName": "001.jpg",
-                "mediaType": "image/jpeg",
-                "width": 1080,
-                "height": 1920,
-                "sizeBytes": 0,
-                "size": "0 B"
-            }]
+            page_count = await self.get_book_page_count(book_id, user, pwd)
+            is_epub = False
+            if book_id in book_cache and "epub" in str(book_cache[book_id].get("media", {}).get("mediaType", "")).lower():
+                is_epub = True
+            db_b = db.get_book(book_id)
+            if db_b and "epub" in str(db_b.get("media", {}).get("mediaType", "")).lower():
+                is_epub = True
+
+            if page_count > 1:
+                ext = "xhtml" if is_epub else "jpg"
+                m_type = "application/xhtml+xml" if is_epub else "image/jpeg"
+                pages = [{
+                    "number": p,
+                    "fileName": f"page_{p:03d}.{ext}",
+                    "mediaType": m_type,
+                    "width": 1080 if not is_epub else None,
+                    "height": 1920 if not is_epub else None,
+                    "sizeBytes": 0,
+                    "size": "0 B"
+                } for p in range(1, page_count + 1)]
+            else:
+                pages = [{
+                    "number": 1,
+                    "fileName": "001.xhtml" if is_epub else "001.jpg",
+                    "mediaType": "application/xhtml+xml" if is_epub else "image/jpeg",
+                    "width": 1080 if not is_epub else None,
+                    "height": 1920 if not is_epub else None,
+                    "sizeBytes": 0,
+                    "size": "0 B"
+                }]
 
         page_cache[book_id] = pages
         page_count_cache[book_id] = len(pages)
@@ -395,7 +462,55 @@ class GrimmoryClient:
         except Exception:
             pass
 
-        # 4. Try Komga layer: /komga/api/v1/books/{book_id}/pages
+        # 4. Try EPUB pages/chapters/spine: /api/v1/epub/{book_id}/pages, /chapters, /spine
+        for epub_path in [
+            f"/api/v1/epub/{book_id}/pages",
+            f"/api/v1/epub/{book_id}/chapters",
+            f"/api/v1/epub/{book_id}/spine"
+        ]:
+            try:
+                resp = await self.client.get(epub_path, headers=native_headers)
+                if resp.status_code == 200:
+                    data = resp.json()
+                    count = data if isinstance(data, int) else len(data) if isinstance(data, list) else 0
+                    if count > 0:
+                        page_count_cache[book_id] = count
+                        return count
+            except Exception:
+                pass
+
+        # 5. Try native app book info: /api/v1/app/books/{book_id}
+        try:
+            resp = await self.client.get(f"/api/v1/app/books/{book_id}", headers=native_headers)
+            if resp.status_code == 200:
+                raw = resp.json()
+                if isinstance(raw, dict):
+                    raw_pc = raw.get("pageCount") or raw.get("pagesCount") or raw.get("pages") or raw.get("numberOfPages")
+                    if isinstance(raw_pc, int) and raw_pc > 0:
+                        page_count_cache[book_id] = raw_pc
+                        return raw_pc
+                    # Check epubProgress
+                    epub_prog = raw.get("epubProgress")
+                    if isinstance(epub_prog, dict):
+                        p = epub_prog.get("page", 0)
+                        pct = epub_prog.get("percentage", 0)
+                        if p > 0 and pct > 0:
+                            calc = round(p * 100 / pct)
+                            if calc > 0:
+                                page_count_cache[book_id] = calc
+                                return calc
+                    # If EPUB, calculate from fileSizeKb
+                    if raw.get("primaryFileType") == "EPUB":
+                        file_size_kb = raw.get("fileSizeKb", 0)
+                        if file_size_kb > 0:
+                            usable_kb = max(5, file_size_kb - 60)
+                            calc = max(1, int(usable_kb / 2.0))
+                            page_count_cache[book_id] = calc
+                            return calc
+        except Exception:
+            pass
+
+        # 6. Try Komga layer: /komga/api/v1/books/{book_id}/pages
         try:
             resp = await self.komga_request("GET", f"/api/v1/books/{book_id}/pages", user, pwd)
             if resp.status_code == 200:
@@ -406,6 +521,29 @@ class GrimmoryClient:
                     return count
         except Exception:
             pass
+
+        # 7. Check if cached book or DB has sizeBytes and is EPUB
+        if book_id in book_cache:
+            b = book_cache[book_id]
+            m_type = str(b.get("media", {}).get("mediaType", "")).lower()
+            if "epub" in m_type:
+                size_kb = (b.get("sizeBytes") or 0) // 1024
+                if size_kb > 0:
+                    usable_kb = max(5, size_kb - 60)
+                    calc = max(1, int(usable_kb / 2.0))
+                    page_count_cache[book_id] = calc
+                    return calc
+
+        db_b = db.get_book(book_id)
+        if db_b:
+            m_type = str(db_b.get("media", {}).get("mediaType", "")).lower()
+            if "epub" in m_type:
+                size_kb = (db_b.get("sizeBytes") or 0) // 1024
+                if size_kb > 0:
+                    usable_kb = max(5, size_kb - 60)
+                    calc = max(1, int(usable_kb / 2.0))
+                    page_count_cache[book_id] = calc
+                    return calc
 
         return 1
 
@@ -441,11 +579,16 @@ class GrimmoryClient:
     async def get_book_dto(self, book_id: str, user: str, pwd: str) -> Optional[Dict[str, Any]]:
         """Fetch book DTO from Grimmory's Komga layer and enrich it."""
         if book_id in book_cache:
-            return book_cache[book_id]
+            cached_b = book_cache[book_id]
+            if await self.user_can_access_book(cached_b, user, pwd):
+                return cached_b
+            return None
 
         # Check persistent database
         db_book = db.get_book(book_id)
         if db_book:
+            if not await self.user_can_access_book(db_book, user, pwd):
+                return None
             if book_id in read_progress_cache:
                 db_book["readProgress"] = read_progress_cache[book_id]
             ensure_book_dto(db_book)
@@ -521,13 +664,23 @@ class GrimmoryClient:
                     pct = data["epubProgress"].get("percentage", 0)
 
                 date_finished = data.get("dateFinished")
-                if date_finished or data.get("completed") or data.get("isRead") or pct == 100:
+                if (
+                    date_finished or data.get("completed") or data.get("isRead") or
+                    data.get("readStatus") == "READ" or data.get("status") == "READ" or
+                    pct == 100
+                ):
                     completed = True
 
                 # Check if total pages is known and page >= total pages
                 if book_id in page_count_cache and page_count_cache[book_id] > 1:
                     if page >= page_count_cache[book_id]:
                         completed = True
+
+                if completed:
+                    count = await self.get_book_page_count(book_id, user, pwd)
+                    if count > 1:
+                        page = count
+                    pct = 100
 
                 # If book has never been opened or started (page 1, 0%, not finished, not valid)
                 if not completed and pct == 0 and page <= 1 and (date_finished is None) and data.get("progressValid") is False:
@@ -599,6 +752,8 @@ class GrimmoryClient:
         is_completed = completed or (total_pages > 1 and page >= total_pages)
         if is_completed:
             percentage = 100
+            if total_pages > 1:
+                page = max(page, total_pages)
             date_finished = now_iso
         else:
             percentage = max(1, min(99, round((page / total_pages) * 100))) if total_pages > 1 else (100 if completed else 0)
@@ -836,6 +991,145 @@ class GrimmoryClient:
 
         return False
 
+    def _is_book_in_progress(self, book_obj: Dict[str, Any]) -> bool:
+        if not book_obj or not isinstance(book_obj, dict):
+            return False
+        if self._is_book_finished(book_obj):
+            return False
+        b_id = str(book_obj.get("id"))
+        prog = book_obj.get("readProgress") or read_progress_cache.get(b_id) or db.get_read_progress(b_id)
+        if isinstance(prog, dict):
+            if prog.get("completed") is True:
+                return False
+            page = prog.get("page", 0)
+            if page > 1 or (page == 1 and prog.get("readDate")):
+                return True
+        for p_key in ["cbxProgress", "pdfProgress", "epubProgress"]:
+            p = book_obj.get(p_key)
+            if isinstance(p, dict):
+                pct = p.get("percentage", 0)
+                page = p.get("page", 0)
+                if (page > 1 or pct > 0) and pct < 100:
+                    return True
+        return False
+
+    def _is_book_unread(self, book_obj: Dict[str, Any]) -> bool:
+        return not self._is_book_finished(book_obj) and not self._is_book_in_progress(book_obj)
+
+    async def get_books_by_read_status(
+        self,
+        statuses: List[str],
+        user: str,
+        pwd: str,
+        page: int = 0,
+        size: int = 20,
+        series_id: Optional[str] = None,
+        library_id: Optional[str] = None,
+        sort: str = ""
+    ) -> Dict[str, Any]:
+        """Fetch books filtered by readStatus (e.g. READ, UNREAD, IN_PROGRESS)."""
+        norm_statuses = {str(s).upper().strip() for s in statuses if str(s).strip()}
+        if not norm_statuses:
+            norm_statuses = {"UNREAD"}
+
+        # Fast path: If only IN_PROGRESS is asked for and no series_id is specified
+        if norm_statuses == {"IN_PROGRESS"} and not series_id:
+            return await self.get_ondeck_books(user, pwd, page=page, size=size, library_id=library_id)
+
+        all_books = []
+        if series_id:
+            if "-standalone-" in series_id:
+                b_id = series_id.split("-standalone-")[-1]
+                b = await self.get_book_dto(b_id, user, pwd)
+                all_books = [ensure_book_dto(b)] if b else []
+            elif "-u-" in series_id:
+                all_books = await self.get_series_books_custom(series_id, user, pwd)
+            else:
+                all_books = db.get_books_by_series(series_id)
+                if not all_books:
+                    try:
+                        resp = await self.komga_request("GET", f"/api/v1/series/{series_id}/books?size=500", user, pwd)
+                        if resp.status_code == 200:
+                            data = resp.json()
+                            all_books = data.get("content", []) if isinstance(data, dict) else []
+                    except Exception:
+                        pass
+        else:
+            all_books = db.get_all_books(library_id=library_id)
+            if not all_books:
+                try:
+                    resp = await self.komga_request("GET", "/api/v1/books?size=500", user, pwd)
+                    if resp.status_code == 200:
+                        data = resp.json()
+                        all_books = data.get("content", []) if isinstance(data, dict) else []
+                except Exception:
+                    pass
+
+        # Verify user library permissions
+        user_libs = await self.get_user_library_ids(user, pwd)
+        if user_libs is not None:
+            all_books = [b for b in all_books if str(b.get("libraryId") or b.get("library_id", "")) in user_libs]
+
+        await self.enrich_books_page_count(all_books, user, pwd)
+        for b in all_books:
+            ensure_book_dto(b)
+
+        matched_books = []
+        for b in all_books:
+            if library_id:
+                b_lib = str(b.get("libraryId") or b.get("library_id", ""))
+                if b_lib and b_lib != str(library_id):
+                    continue
+            is_fin = self._is_book_finished(b)
+            is_inp = self._is_book_in_progress(b)
+            is_unr = (not is_fin) and (not is_inp)
+
+            matched = False
+            if "READ" in norm_statuses and is_fin:
+                matched = True
+            elif "IN_PROGRESS" in norm_statuses and is_inp:
+                matched = True
+            elif "UNREAD" in norm_statuses and is_unr:
+                matched = True
+
+            if matched:
+                matched_books.append(b)
+
+        sort_lower = sort.lower()
+        if "readdate" in sort_lower or "readprogress" in sort_lower:
+            matched_books.sort(
+                key=lambda x: (x.get("readProgress") or {}).get("readDate") or "",
+                reverse=True
+            )
+        elif "releasedate" in sort_lower:
+            matched_books.sort(
+                key=lambda x: (x.get("metadata") or {}).get("releaseDate") or "",
+                reverse=True
+            )
+        elif any(k in sort_lower for k in ["created", "added", "lastmodified"]):
+            matched_books.sort(
+                key=lambda x: x.get("created") or x.get("lastModified") or "",
+                reverse=True
+            )
+        else:
+            try:
+                matched_books.sort(
+                    key=lambda x: float((x.get("metadata") or {}).get("numberSort", x.get("number", 1.0)))
+                )
+            except Exception:
+                pass
+
+        total = len(matched_books)
+        start = page * size
+        paged_content = matched_books[start:start + size]
+
+        return ensure_page_dto({
+            "content": paged_content,
+            "totalElements": total,
+            "number": page,
+            "size": size
+        }, default_page=page, default_size=size)
+
     async def get_ondeck_books(
         self,
         user: str,
@@ -928,6 +1222,14 @@ class GrimmoryClient:
                 continue
             final_books.append(b)
         raw_books = final_books
+
+        # Verify user library permissions
+        user_libs = await self.get_user_library_ids(user, pwd)
+        if user_libs is not None:
+            raw_books = [
+                b for b in raw_books
+                if str(b.get("libraryId") or b.get("library_id", "")) in user_libs
+            ]
 
         if library_id:
             raw_books = [
@@ -1040,9 +1342,12 @@ class GrimmoryClient:
             except Exception:
                 pass
 
-        # 4. Strict filter: MUST have non-empty releaseDate
+        # 4. Strict filter: MUST have non-empty releaseDate and user access
+        user_libs = await self.get_user_library_ids(user, pwd)
         valid_released_books = []
         for b in candidate_books:
+            if user_libs is not None and str(b.get("libraryId") or b.get("library_id", "")) not in user_libs:
+                continue
             if library_id and str(b.get("libraryId") or b.get("library_id")) != str(library_id):
                 continue
             rd = b.get("metadata", {}).get("releaseDate")
@@ -1086,6 +1391,12 @@ class GrimmoryClient:
                 data = resp.json()
                 raw_books = data.get("content", []) if isinstance(data, dict) else data if isinstance(data, list) else []
                 if raw_books:
+                    user_libs = await self.get_user_library_ids(user, pwd)
+                    if user_libs is not None:
+                        raw_books = [
+                            b for b in raw_books
+                            if str(b.get("libraryId") or b.get("library_id", "")) in user_libs
+                        ]
                     if library_id:
                         raw_books = [
                             b for b in raw_books
@@ -1233,6 +1544,11 @@ class GrimmoryClient:
             db.save_series_batch(all_series)
         except Exception:
             pass
+
+        user_libs = await self.get_user_library_ids(user, pwd)
+        if user_libs is not None:
+            all_series = [s for s in all_series if str(s.get("libraryId") or s.get("library_id", "")) in user_libs]
+
         return all_series
 
     async def search_series(
@@ -1325,6 +1641,14 @@ class GrimmoryClient:
                     matching_books.extend(db_matched)
             except Exception:
                 pass
+
+        # Verify user library permissions
+        user_libs = await self.get_user_library_ids(user, pwd)
+        if user_libs is not None:
+            matching_books = [
+                b for b in matching_books
+                if str(b.get("libraryId") or b.get("library_id", "")) in user_libs
+            ]
 
         total = len(matching_books)
         start = page * size

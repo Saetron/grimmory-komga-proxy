@@ -241,6 +241,23 @@ class Database:
                     pass
             return result
 
+    def get_all_books(self, library_id: Optional[str] = None) -> List[Dict[str, Any]]:
+        with self._get_connection() as conn:
+            if library_id:
+                rows = conn.execute(
+                    "SELECT dto_json FROM books WHERE library_id = ? ORDER BY number_sort ASC",
+                    (str(library_id),)
+                ).fetchall()
+            else:
+                rows = conn.execute("SELECT dto_json FROM books ORDER BY number_sort ASC").fetchall()
+            result = []
+            for r in rows:
+                try:
+                    result.append(json.loads(r["dto_json"]))
+                except Exception:
+                    pass
+            return result
+
     def search_books(self, query: str, library_id: Optional[str] = None) -> List[Dict[str, Any]]:
         term = f"%{query.strip()}%"
         with self._get_connection() as conn:

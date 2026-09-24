@@ -24,6 +24,7 @@ def clear_caches():
     grimmory_client.custom_series.clear()
     grimmory_client.all_series_cache.clear()
     grimmory_client.custom_series_books_cache.clear()
+    grimmory_client.user_libraries_cache.clear()
     db.clear_all()
 
 
@@ -1653,6 +1654,206 @@ def test_recently_released_books_only_with_release_date():
     rel_resp = client.get("/api/v1/books/released", headers=AUTH_HEADER)
     assert rel_resp.status_code == 200
     assert len(rel_resp.json()["content"]) == 2
+
+
+def test_epub_page_calculation_and_metadata():
+    """Verify EPUB mediaProfile, synthetic page count from size, and xhtml page generation."""
+    # 1. Test raw EPUB book without endpoint response calculates synthetic page count from size
+    raw_epub = {
+        "id": "epub-novel-1",
+        "title": "A Great Light Novel",
+        "primaryFileType": "EPUB",
+        "fileSizeKb": 560,
+        "libraryId": "lib-books",
+        "addedOn": "2026-09-24T10:00:00Z"
+    }
+
+    mock_client = AsyncMock()
+    # When probed for cbx/pdf/epub endpoints, return 404
+    mock_client.get = AsyncMock(return_value=httpx.Response(404))
+
+    with patch.object(grimmory_client, "get_client", return_value=mock_client), \
+         patch.object(grimmory_client, "get_native_token", new_callable=AsyncMock, return_value="dummy-token"):
+
+        from app.dto_utils import raw_app_book_to_dto, ensure_book_dto
+        dto = raw_app_book_to_dto(raw_epub)
+        ensure_book_dto(dto)
+
+        assert dto["media"]["mediaProfile"] == "EPUB"
+        assert dto["media"]["mediaType"] == "application/epub+zip"
+        # 560 KB -> (560 - 60) / 2 = 250 pages
+        assert dto["media"]["pagesCount"] == 250
+
+        # Save to DB and check pages metadata endpoint
+        db.save_book(dto)
+        resp = client.get("/api/v1/books/epub-novel-1/pages", headers=AUTH_HEADER)
+        assert resp.status_code == 200
+        pages = resp.json()
+        assert len(pages) == 250
+        assert pages[0]["mediaType"] == "application/xhtml+xml"
+        assert pages[0]["fileName"].endswith(".xhtml")
+        assert pages[-1]["number"] == 250
+
+
+def test_read_and_unread_books_filtering():
+    """Verify filtering by readStatus (READ, UNREAD, IN_PROGRESS) in GET, POST, and Series books."""
+    books = [
+        {
+            "id": "b-read-1",
+            "name": "Finished Book",
+            "seriesId": "s-test",
+            "media": {"pagesCount": 100, "mediaType": "application/x-cbz"},
+            "readProgress": {"page": 100, "completed": True, "readDate": "2026-09-24T11:00:00Z"}
+        },
+        {
+            "id": "b-in-progress-1",
+            "name": "Reading Book",
+            "seriesId": "s-test",
+            "media": {"pagesCount": 100, "mediaType": "application/x-cbz"},
+            "readProgress": {"page": 35, "completed": False, "readDate": "2026-09-24T11:30:00Z"}
+        },
+        {
+            "id": "b-unread-1",
+            "name": "Unread Book",
+            "seriesId": "s-test",
+            "media": {"pagesCount": 100, "mediaType": "application/x-cbz"},
+            "readProgress": None
+        }
+    ]
+    db.save_books_batch(books)
+
+    # 1. POST /api/v1/books/list with readStatus=["READ"]
+    resp_read = client.post("/api/v1/books/list", json={"readStatus": ["READ"]}, headers=AUTH_HEADER)
+    assert resp_read.status_code == 200
+    content_read = resp_read.json()["content"]
+    assert len(content_read) == 1
+    assert content_read[0]["id"] == "b-read-1"
+
+    # 2. POST /api/v1/books/list with readStatus=["UNREAD"]
+    resp_unread = client.post("/api/v1/books/list", json={"readStatus": ["UNREAD"]}, headers=AUTH_HEADER)
+    assert resp_unread.status_code == 200
+    content_unread = resp_unread.json()["content"]
+    assert len(content_unread) == 1
+    assert content_unread[0]["id"] == "b-unread-1"
+
+    # 3. GET /api/v1/books?read_status=READ
+    get_read = client.get("/api/v1/books?read_status=READ", headers=AUTH_HEADER)
+    assert get_read.status_code == 200
+    assert len(get_read.json()["content"]) == 1
+    assert get_read.json()["content"][0]["id"] == "b-read-1"
+
+    # 4. GET /api/v1/books?read_status=UNREAD
+    get_unread = client.get("/api/v1/books?read_status=UNREAD", headers=AUTH_HEADER)
+    assert get_unread.status_code == 200
+    assert len(get_unread.json()["content"]) == 1
+    assert get_unread.json()["content"][0]["id"] == "b-unread-1"
+
+    # 5. GET /api/v1/series/s-test/books?read_status=UNREAD
+    series_unread = client.get("/api/v1/series/s-test/books?read_status=UNREAD", headers=AUTH_HEADER)
+    assert series_unread.status_code == 200
+    assert len(series_unread.json()["content"]) == 1
+    assert series_unread.json()["content"][0]["id"] == "b-unread-1"
+
+
+def test_read_book_progress_100_percent():
+    """Verify that books marked as read in Grimmory have 100% progress and page == pagesCount."""
+    raw_read = {
+        "id": "book-read-100",
+        "title": "Completed Manga",
+        "primaryFileType": "CBX",
+        "fileSizeKb": 1024,
+        "readStatus": "READ",
+        "dateFinished": "2026-09-24T12:00:00Z"
+    }
+
+    mock_client = AsyncMock()
+    mock_client.get = AsyncMock(return_value=httpx.Response(200, json={
+        "readStatus": "READ",
+        "dateFinished": "2026-09-24T12:00:00Z",
+        "cbxProgress": {"page": 1, "percentage": 100}
+    }))
+
+    from app.dto_utils import raw_app_book_to_dto, ensure_book_dto
+    dto = raw_app_book_to_dto(raw_read)
+    dto["media"]["pagesCount"] = 180
+    ensure_book_dto(dto)
+
+    assert dto["readProgress"] is not None
+    assert dto["readProgress"]["completed"] is True
+    # Progress page must equal pagesCount so Komic shows 100%
+    assert dto["readProgress"]["page"] == 180
+
+
+def test_book_file_download_with_fallback_and_proper_extensions():
+    """Verify downloading book file falls back to Grimmory native endpoints and gives correct filename extension."""
+    epub_book = {
+        "id": "epub-dl-1",
+        "name": "Overlord Volume 1",
+        "media": {"mediaType": "application/epub+zip", "pagesCount": 350}
+    }
+    db.save_book(epub_book)
+
+    fake_epub_bytes = b"PK\x03\x04fakepubcontent"
+
+    async def mock_native_get(url, **kwargs):
+        if "/app/books/epub-dl-1/file" in url:
+            return httpx.Response(200, content=fake_epub_bytes, headers={"Content-Type": "application/epub+zip"})
+        return httpx.Response(404)
+
+    mock_client = AsyncMock()
+    mock_client.get = AsyncMock(side_effect=mock_native_get)
+
+    with patch.object(grimmory_client, "komga_request", new_callable=AsyncMock) as mock_komga, \
+         patch.object(grimmory_client, "get_client", return_value=mock_client), \
+         patch.object(grimmory_client, "get_native_token", new_callable=AsyncMock, return_value="dummy-token"):
+
+        # Grimmory Komga endpoint returns 404 for /books/{id}/file
+        mock_komga.return_value = httpx.Response(404)
+
+        resp = client.get("/api/v1/books/epub-dl-1/file", headers=AUTH_HEADER)
+        assert resp.status_code == 200
+        assert resp.content == fake_epub_bytes
+        assert resp.headers["Content-Type"] == "application/epub+zip"
+        assert "Overlord Volume 1.epub" in resp.headers["Content-Disposition"]
+
+
+def test_user_library_access_cached_books():
+    """Verify that cached books from libraries the user has no access to are forbidden."""
+    db.save_book({
+        "id": "book-allowed",
+        "name": "Allowed Book",
+        "libraryId": "lib-allowed",
+        "media": {"pagesCount": 10}
+    })
+    db.save_book({
+        "id": "book-forbidden",
+        "name": "Forbidden Book",
+        "libraryId": "lib-secret",
+        "media": {"pagesCount": 10}
+    })
+
+    async def mock_komga_req(method, path, user, pwd, **kwargs):
+        if path == "/api/v1/libraries":
+            return httpx.Response(200, json=[{"id": "lib-allowed", "name": "Allowed"}])
+        return httpx.Response(404)
+
+    with patch.object(grimmory_client, "komga_request", side_effect=mock_komga_req):
+        # 1. Allowed book should succeed
+        resp_allowed = client.get("/api/v1/books/book-allowed", headers=AUTH_HEADER)
+        assert resp_allowed.status_code == 200
+        assert resp_allowed.json()["id"] == "book-allowed"
+
+        # 2. Forbidden book should return 404
+        resp_forbidden = client.get("/api/v1/books/book-forbidden", headers=AUTH_HEADER)
+        assert resp_forbidden.status_code == 404
+
+        # 3. Read status query should only return books from lib-allowed
+        resp_unread = client.get("/api/v1/books?read_status=UNREAD", headers=AUTH_HEADER)
+        assert resp_unread.status_code == 200
+        content = resp_unread.json()["content"]
+        book_ids = [b["id"] for b in content]
+        assert "book-allowed" in book_ids
+        assert "book-forbidden" not in book_ids
 
 
 if __name__ == "__main__":

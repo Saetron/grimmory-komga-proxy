@@ -176,7 +176,14 @@ def ensure_book_dto(book: Dict[str, Any]) -> Dict[str, Any]:
         book["media"] = media
     media.setdefault("status", "READY")
     media.setdefault("mediaType", "application/x-cbz")
-    media.setdefault("mediaProfile", "DIVINA")
+    m_type = str(media.get("mediaType", "")).lower()
+    if "epub" in m_type:
+        media["mediaProfile"] = "EPUB"
+    elif "pdf" in m_type:
+        media["mediaProfile"] = "PDF"
+    else:
+        media.setdefault("mediaProfile", "DIVINA")
+
     b_id = str(book.get("id"))
     from app.grimmory_client import page_cache, page_count_cache
     if b_id in page_count_cache and page_count_cache[b_id] > 0:
@@ -184,7 +191,12 @@ def ensure_book_dto(book: Dict[str, Any]) -> Dict[str, Any]:
     elif b_id in page_cache and len(page_cache[b_id]) > 0:
         media["pagesCount"] = len(page_cache[b_id])
     elif "pagesCount" not in media or media["pagesCount"] is None or media["pagesCount"] <= 0:
-        media["pagesCount"] = 1
+        if "epub" in m_type:
+            size_kb = (book.get("sizeBytes") or 0) // 1024
+            usable_kb = max(5, size_kb - 60) if size_kb > 0 else 50
+            media["pagesCount"] = max(1, int(usable_kb / 2.0))
+        else:
+            media["pagesCount"] = 1
     media.setdefault("comment", "")
     media.setdefault("epubDivinaCompatible", False)
     media.setdefault("epubIsKepub", False)
@@ -225,6 +237,12 @@ def ensure_book_dto(book: Dict[str, Any]) -> Dict[str, Any]:
         if "readProgress" not in book or book.get("readProgress") is None:
             book["readProgress"] = read_progress_cache[b_id]
 
+    prog = book.get("readProgress")
+    if isinstance(prog, dict) and prog.get("completed") is True:
+        p_count = media.get("pagesCount", 1)
+        if p_count > 1:
+            prog["page"] = max(prog.get("page", 1), p_count)
+
     return book
 
 
@@ -245,6 +263,7 @@ def raw_app_book_to_dto(raw: Dict[str, Any], series_id_override: Optional[str] =
 
     file_type = raw.get("primaryFileType")
     media_type = "application/x-cbz" if file_type == "CBX" else "application/pdf" if file_type == "PDF" else "application/epub+zip"
+    media_profile = "DIVINA" if file_type == "CBX" else "PDF" if file_type == "PDF" else "EPUB"
 
     # Check for embedded progress in raw object or cache
     page_prog = 1
@@ -263,14 +282,38 @@ def raw_app_book_to_dto(raw: Dict[str, Any], series_id_override: Optional[str] =
         pct_prog = raw["epubProgress"].get("percentage", 0)
         has_prog = True
 
+    date_fin = raw.get("dateFinished")
+    is_comp = bool(
+        date_fin or pct_prog == 100 or raw.get("completed") or raw.get("isRead") or
+        raw.get("readStatus") == "READ" or raw.get("status") == "READ"
+    )
+
+    file_size_kb = raw.get("fileSizeKb", 0)
+    pages_cnt = 1
+    raw_pc = raw.get("pageCount") or raw.get("pagesCount") or raw.get("pages") or raw.get("numberOfPages")
+    if isinstance(raw_pc, int) and raw_pc > 0:
+        pages_cnt = raw_pc
+    elif file_type == "EPUB":
+        if pct_prog > 0 and page_prog > 0:
+            pages_cnt = max(1, round(page_prog * 100 / pct_prog))
+        elif file_size_kb > 0:
+            usable_kb = max(5, file_size_kb - 60)
+            pages_cnt = max(1, int(usable_kb / 2.0))
+
+    if is_comp:
+        pct_prog = 100
+        page_prog = max(page_prog, pages_cnt)
+
     from app.grimmory_client import read_progress_cache
     cached_prog = read_progress_cache.get(b_id)
     read_prog = None
     if cached_prog:
         read_prog = cached_prog
-    elif has_prog:
-        date_fin = raw.get("dateFinished")
-        is_comp = bool(date_fin or pct_prog == 100 or raw.get("completed") or raw.get("isRead"))
+        if is_comp:
+            read_prog["completed"] = True
+            if pages_cnt > 1:
+                read_prog["page"] = max(read_prog.get("page", 1), pages_cnt)
+    elif has_prog or is_comp:
         read_prog = {
             "page": page_prog,
             "completed": is_comp,
@@ -298,8 +341,8 @@ def raw_app_book_to_dto(raw: Dict[str, Any], series_id_override: Optional[str] =
         "media": {
             "status": "READY",
             "mediaType": media_type,
-            "mediaProfile": "DIVINA",
-            "pagesCount": 1,
+            "mediaProfile": media_profile,
+            "pagesCount": pages_cnt,
             "comment": "",
             "epubDivinaCompatible": False,
             "epubIsKepub": False

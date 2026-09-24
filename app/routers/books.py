@@ -22,9 +22,17 @@ async def list_books(
         params["library_id"] = params.pop("libraryId")
     library_id = params.get("library_id")
 
+    read_status_param = params.get("read_status", "") or params.get("readStatus", "")
+
     # If series_id is specified in query, Grimmory requires querying /series/{id}/books
     series_id = params.pop("series_id", None) or params.pop("seriesId", None)
     if series_id:
+        if read_status_param:
+            statuses = [s.strip().upper() for s in str(read_status_param).split(",") if s.strip()]
+            return await grimmory_client.get_books_by_read_status(
+                statuses, user, pwd, page=page, size=size, series_id=series_id, library_id=library_id, sort=sort
+            )
+
         if "-standalone-" in series_id:
             b_id = series_id.split("-standalone-")[-1]
             book = await grimmory_client.get_book_dto(b_id, user, pwd)
@@ -59,8 +67,13 @@ async def list_books(
     if search_query:
         return await grimmory_client.search_books(search_query, user, pwd, page=page, size=size, library_id=library_id)
 
-    read_status_param = params.get("read_status", "") or params.get("readStatus", "")
-    if "in_progress" in str(read_status_param).lower() or "readprogress" in sort.lower() or "readdate" in sort.lower():
+    if read_status_param:
+        statuses = [s.strip().upper() for s in str(read_status_param).split(",") if s.strip()]
+        return await grimmory_client.get_books_by_read_status(
+            statuses, user, pwd, page=page, size=size, library_id=library_id, sort=sort
+        )
+
+    if "readprogress" in sort.lower() or "readdate" in sort.lower():
         return await grimmory_client.get_ondeck_books(user, pwd, page=page, size=size, library_id=library_id)
 
     if "releasedate" in sort.lower():
@@ -101,9 +114,25 @@ async def list_books_post(
 
     filters = extract_search_filters(body)
 
+    read_status = filters.get("read_status", [])
+    query_read_status = params.get("read_status", "") or params.get("readStatus", "")
+    all_raw_statuses = []
+    if isinstance(read_status, list):
+        all_raw_statuses.extend(read_status)
+    elif read_status:
+        all_raw_statuses.append(str(read_status))
+    if query_read_status:
+        all_raw_statuses.extend(str(query_read_status).split(","))
+    statuses = [str(s).strip().upper() for s in all_raw_statuses if str(s).strip()]
+
     # 1. Check if filtering by series
     series_id = filters.get("series_id") or params.get("series_id") or params.get("seriesId")
     if series_id:
+        if statuses:
+            return await grimmory_client.get_books_by_read_status(
+                statuses, user, pwd, page=page, size=size, series_id=series_id, library_id=library_id, sort=sort
+            )
+
         if "-standalone-" in series_id:
             b_id = series_id.split("-standalone-")[-1]
             book = await grimmory_client.get_book_dto(b_id, user, pwd)
@@ -145,11 +174,13 @@ async def list_books_post(
         params["library_id"] = params.pop("libraryId")
     library_id = params.get("library_id")
 
-    # 2. Check if filtering by read status / in-progress
-    read_status = filters.get("read_status", [])
-    query_read_status = params.get("read_status", "") or params.get("readStatus", "")
-    is_in_prog = any("in_progress" in str(s).lower() for s in (read_status if isinstance(read_status, list) else [read_status]))
-    if is_in_prog or "in_progress" in str(query_read_status).lower() or "readprogress" in sort.lower() or "readdate" in sort.lower():
+    # 2. Check if filtering by read status
+    if statuses:
+        return await grimmory_client.get_books_by_read_status(
+            statuses, user, pwd, page=page, size=size, library_id=library_id, sort=sort
+        )
+
+    if "readprogress" in sort.lower() or "readdate" in sort.lower():
         return await grimmory_client.get_ondeck_books(user, pwd, page=page, size=size, library_id=library_id)
 
     search_query = params.get("search") or filters.get("search")
@@ -365,19 +396,70 @@ async def get_book_page(
 async def download_book_file(
     book_id: str,
     authorization: Optional[str] = Header(None)
-) -> StreamingResponse:
+) -> Response:
     user, pwd = grimmory_client.extract_credentials(authorization)
+    book = await grimmory_client.get_book_dto(book_id, user, pwd)
+    ext = "cbz"
+    m_type = "application/x-cbz"
+    name = f"book-{book_id}"
+    if book:
+        name = book.get("name") or f"book-{book_id}"
+        media_type = str(book.get("media", {}).get("mediaType", "")).lower()
+        if "epub" in media_type:
+            ext = "epub"
+            m_type = "application/epub+zip"
+        elif "pdf" in media_type:
+            ext = "pdf"
+            m_type = "application/pdf"
+        elif "cbr" in media_type:
+            ext = "cbr"
+            m_type = "application/x-cbr"
+
+    safe_name = "".join(c for c in name if c.isalnum() or c in (" ", "-", "_", ".")).strip() or f"book-{book_id}"
+    filename = safe_name if safe_name.lower().endswith(f".{ext}") else f"{safe_name}.{ext}"
+
+    # 1. Try Grimmory Komga layer
     resp = await grimmory_client.komga_request("GET", f"/api/v1/books/{book_id}/file", user, pwd)
     if resp.status_code == 200:
+        cd = resp.headers.get("Content-Disposition") or f'attachment; filename="{filename}"'
+        ct = resp.headers.get("Content-Type") or m_type
         return StreamingResponse(
-            content=iter([resp.content]),
+            iter([resp.content]),
             status_code=200,
             headers={
-                "Content-Type": resp.headers.get("Content-Type", "application/octet-stream"),
-                "Content-Disposition": resp.headers.get("Content-Disposition", f'attachment; filename="book-{book_id}.cbz"')
+                "Content-Type": ct,
+                "Content-Disposition": cd
             }
         )
-    raise HTTPException(status_code=resp.status_code, detail="Failed to download book file")
+
+    # 2. Try Grimmory native endpoints
+    native_headers = await grimmory_client.get_native_headers(user, pwd)
+    candidate_paths = [
+        f"/api/v1/app/books/{book_id}/file",
+        f"/api/v1/app/books/{book_id}/download",
+        f"/api/v1/books/{book_id}/file",
+        f"/api/v1/books/{book_id}/download",
+        f"/api/v1/books/{book_id}/files/primary",
+        f"/api/v1/app/books/{book_id}/files/primary",
+    ]
+    for path in candidate_paths:
+        try:
+            native_resp = await grimmory_client.client.get(path, headers=native_headers)
+            if native_resp.status_code == 200 and len(native_resp.content) > 0:
+                cd = native_resp.headers.get("Content-Disposition") or f'attachment; filename="{filename}"'
+                ct = native_resp.headers.get("Content-Type") or m_type
+                return StreamingResponse(
+                    iter([native_resp.content]),
+                    status_code=200,
+                    headers={
+                        "Content-Type": ct,
+                        "Content-Disposition": cd
+                    }
+                )
+        except Exception:
+            pass
+
+    raise HTTPException(status_code=resp.status_code if resp.status_code != 200 else 404, detail="Failed to download book file")
 
 
 # Support both /read-progress and /progression (Komga & Komic variants)

@@ -50,29 +50,58 @@ class SyncService:
                 db.save_series_batch(all_series)
             logger.info(f"[BackgroundSync] Validated {len(all_series)} series from Grimmory.")
 
-            # 3. For each series, validate and sync books & page counts
+            # 3. For each series, validate and sync books & page counts concurrently
             total_books_synced = 0
-            for s in all_series:
-                if self._stop_event.is_set():
-                    break
-                s_id = str(s.get("id"))
-                if "-u-" in s_id:
-                    series_books = await grimmory_client.get_series_books_custom(s_id, user, pwd)
-                else:
-                    resp = await grimmory_client.komga_request("GET", f"/api/v1/series/{s_id}/books?size=500", user, pwd)
-                    if resp.status_code == 200:
-                        data = resp.json()
-                        series_books = data.get("content", []) if isinstance(data, dict) else []
-                    else:
-                        series_books = []
+            completed_series_count = 0
+            total_series = len(all_series)
+            concurrency = max(1, settings.SYNC_CONCURRENCY)
+            sem = asyncio.Semaphore(concurrency)
+            lock = asyncio.Lock()
 
-                if series_books:
-                    # Pre-warm accurate page counts & dimensions
-                    await grimmory_client.enrich_books_page_count(series_books, user, pwd)
-                    for b in series_books:
-                        ensure_book_dto(b)
-                    db.save_books_batch(series_books)
-                    total_books_synced += len(series_books)
+            async def _sync_single_series(idx: int, s: Dict[str, Any]):
+                nonlocal total_books_synced, completed_series_count
+                async with sem:
+                    if self._stop_event.is_set():
+                        return
+                    s_id = str(s.get("id"))
+                    s_name = s.get("name") or s.get("metadata", {}).get("title") or s_id
+                    try:
+                        if "-u-" in s_id:
+                            series_books = await grimmory_client.get_series_books_custom(s_id, user, pwd)
+                        else:
+                            resp = await grimmory_client.komga_request("GET", f"/api/v1/series/{s_id}/books?size=500", user, pwd)
+                            if resp.status_code == 200:
+                                data = resp.json()
+                                series_books = data.get("content", []) if isinstance(data, dict) else []
+                            else:
+                                series_books = []
+
+                        if series_books:
+                            await grimmory_client.enrich_books_page_count(series_books, user, pwd)
+                            for b in series_books:
+                                ensure_book_dto(b)
+                            db.save_books_batch(series_books)
+
+                        async with lock:
+                            completed_series_count += 1
+                            total_books_synced += len(series_books)
+                            pct = int((completed_series_count / total_series) * 100) if total_series > 0 else 100
+                            logger.info(
+                                f"[BackgroundSync] Progress: [{completed_series_count}/{total_series}] ({pct}%) "
+                                f"- Synced series '{s_name}' ({len(series_books)} books, total books: {total_books_synced})"
+                            )
+                    except Exception as err:
+                        async with lock:
+                            completed_series_count += 1
+                            pct = int((completed_series_count / total_series) * 100) if total_series > 0 else 100
+                            logger.warning(
+                                f"[BackgroundSync] Progress: [{completed_series_count}/{total_series}] ({pct}%) "
+                                f"- Error syncing series '{s_name}': {err}"
+                            )
+
+            if all_series:
+                logger.info(f"[BackgroundSync] Starting concurrent sync of {total_series} series with concurrency={concurrency}...")
+                await asyncio.gather(*[_sync_single_series(i, s) for i, s in enumerate(all_series, start=1)], return_exceptions=True)
 
             stats["booksCount"] = total_books_synced
             logger.info(f"[BackgroundSync] Validated {total_books_synced} books across all series.")
