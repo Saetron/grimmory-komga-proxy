@@ -1607,6 +1607,8 @@ class GrimmoryClient:
         u = (user or "default").lower().strip()
         user_libs = await self.get_user_library_ids(user, pwd)
         active_series_ids = db.get_active_series_ids(user=u)
+        u_map = db.get_all_read_progress_map(u)
+        default_map = db.get_all_read_progress_map("default") if u != "default" else {}
 
         ondeck_books = []
         seen_book_ids = set()
@@ -1636,16 +1638,16 @@ class GrimmoryClient:
                 b_id = str(b.get("id"))
                 b_copy = dict(b)
                 p_key = f"{u}:{b_id}"
-                prog = read_progress_cache.get(p_key) or (read_progress_cache.get(b_id) if u == "default" else None) or db.get_read_progress(u, b_id)
+                prog = read_progress_cache.get(p_key) or u_map.get(b_id) or (read_progress_cache.get(b_id) if u == "default" else None) or default_map.get(b_id)
                 if prog:
                     b_copy["readProgress"] = prog
 
-                if self._is_book_finished(b_copy, user=user):
+                if self._is_book_finished(b_copy, user=user, progress=prog):
                     highest_read_idx = max(highest_read_idx, idx)
                     r_date = (b_copy.get("readProgress") or {}).get("readDate") or ""
                     if r_date > latest_read_date:
                         latest_read_date = r_date
-                elif self._is_book_in_progress(b_copy, user=user):
+                elif self._is_book_in_progress(b_copy, user=user, progress=prog):
                     if in_prog_book is None:
                         in_prog_book = b_copy
                         r_date = (b_copy.get("readProgress") or {}).get("readDate") or ""
@@ -1658,10 +1660,10 @@ class GrimmoryClient:
             elif highest_read_idx >= 0 and highest_read_idx + 1 < len(s_books):
                 candidate = dict(s_books[highest_read_idx + 1])
                 c_id = str(candidate.get("id"))
-                c_prog = read_progress_cache.get(f"{u}:{c_id}") or (read_progress_cache.get(c_id) if u == "default" else None) or db.get_read_progress(u, c_id)
+                c_prog = read_progress_cache.get(f"{u}:{c_id}") or u_map.get(c_id) or (read_progress_cache.get(c_id) if u == "default" else None) or default_map.get(c_id)
                 if c_prog:
                     candidate["readProgress"] = c_prog
-                if not self._is_book_finished(candidate, user=user):
+                if not self._is_book_finished(candidate, user=user, progress=c_prog):
                     target_book = candidate
 
             if target_book and str(target_book.get("id")) not in seen_book_ids:
@@ -1673,7 +1675,7 @@ class GrimmoryClient:
         # Merge active in-progress books from Grimmory continue-reading if not yet included
         try:
             native_headers = await self.get_native_headers(user, pwd)
-            resp = await self.client.get("/api/v1/app/books/continue-reading", params={"size": 100}, headers=native_headers)
+            resp = await self.client.get("/api/v1/app/books/continue-reading", params={"size": 100}, headers=native_headers, timeout=5.0)
             if resp.status_code == 200:
                 data = resp.json()
                 items = data if isinstance(data, list) else data.get("content", []) if isinstance(data, dict) else []
@@ -1949,28 +1951,24 @@ class GrimmoryClient:
         if user_libs is not None:
             all_series = [s for s in all_series if str(s.get("libraryId") or s.get("library_id", "")) in user_libs]
 
-        for s in all_series:
-            disambiguate_series_dto(s)
-            ensure_series_dto(s)
-
         recent_series_names = []
         recent_books = db.get_latest_books(library_id=library_id, limit=200)
         for b in recent_books:
-            s_name = b.get("seriesName") or (b.get("metadata") or {}).get("series")
+            s_name = b.get("seriesName") or (b.get("metadata") or {}).get("series") or b.get("seriesTitle")
             if s_name and s_name not in recent_series_names:
                 recent_series_names.append(s_name)
 
         if not recent_series_names:
             native_headers = await self.get_native_headers(user, pwd)
             try:
-                resp = await self.client.get("/api/v1/app/books/recently-added", params={"size": 100}, headers=native_headers)
+                resp = await self.client.get("/api/v1/app/books/recently-added", params={"size": 100}, headers=native_headers, timeout=5.0)
                 if resp.status_code == 200:
                     raw = resp.json()
                     raw_books = raw.get("content", []) if isinstance(raw, dict) else raw if isinstance(raw, list) else []
                     for b in raw_books:
                         if library_id and str(b.get("libraryId") or b.get("library_id")) != str(library_id):
                             continue
-                        s_name = b.get("seriesName")
+                        s_name = b.get("seriesName") or b.get("seriesTitle")
                         if s_name and s_name not in recent_series_names:
                             recent_series_names.append(s_name)
             except Exception:
@@ -1988,6 +1986,12 @@ class GrimmoryClient:
         total = len(all_series)
         start = page * size
         paged_content = all_series[start:start + size]
+        u = (user or "default").lower().strip()
+        u_map = db.get_all_read_progress_map(u)
+        for s in paged_content:
+            disambiguate_series_dto(s)
+            ensure_series_dto(s, user=user, progress_map=u_map)
+
         return ensure_page_dto({
             "content": paged_content,
             "totalElements": total,
@@ -2023,7 +2027,7 @@ class GrimmoryClient:
                 break
             for s in items:
                 disambiguate_series_dto(s)
-                ensure_series_dto(s)
+                ensure_series_dto(s, compute_read_counts=False)
                 all_series.append(s)
 
             total_pages = data.get("totalPages", 1) if isinstance(data, dict) else 1

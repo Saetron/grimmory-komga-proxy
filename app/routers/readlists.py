@@ -30,7 +30,7 @@ async def get_authors(
     user, pwd = grimmory_client.extract_credentials(authorization)
     native_headers = await grimmory_client.get_native_headers(user, pwd)
     try:
-        resp = await grimmory_client.client.get("/api/v1/app/authors", headers=native_headers)
+        resp = await grimmory_client.client.get("/api/v1/app/authors", headers=native_headers, timeout=5.0)
         if resp.status_code == 200:
             authors_data = resp.json()
             if isinstance(authors_data, list):
@@ -51,7 +51,7 @@ async def get_authors_v2(
     native_headers = await grimmory_client.get_native_headers(user, pwd)
     authors_content = []
     try:
-        resp = await grimmory_client.client.get("/api/v1/app/authors", headers=native_headers)
+        resp = await grimmory_client.client.get("/api/v1/app/authors", headers=native_headers, timeout=5.0)
         if resp.status_code == 200:
             authors_data = resp.json()
             if isinstance(authors_data, list):

@@ -56,9 +56,11 @@ async def list_series(
         total = len(cached_series)
         start = page * size
         paged_content = cached_series[start:start + size]
+        u = (user or "default").lower().strip()
+        u_map = db.get_all_read_progress_map(u)
         for s in paged_content:
             disambiguate_series_dto(s)
-            ensure_series_dto(s, user=user)
+            ensure_series_dto(s, user=user, progress_map=u_map)
         return ensure_page_dto({
             "content": paged_content,
             "totalElements": total,
@@ -71,9 +73,11 @@ async def list_series(
         raise HTTPException(status_code=resp.status_code, detail="Failed to fetch series")
     data = resp.json()
     if "content" in data and isinstance(data["content"], list):
+        u = (user or "default").lower().strip()
+        u_map = db.get_all_read_progress_map(u)
         for s in data["content"]:
             disambiguate_series_dto(s)
-            ensure_series_dto(s)
+            ensure_series_dto(s, user=user, progress_map=u_map)
     return ensure_page_dto(data, default_page=page, default_size=size)
 
 
@@ -152,9 +156,11 @@ async def list_series_post(
         total = len(cached_series)
         start = page * size
         paged_content = cached_series[start:start + size]
+        u = (user or "default").lower().strip()
+        u_map = db.get_all_read_progress_map(u)
         for s in paged_content:
             disambiguate_series_dto(s)
-            ensure_series_dto(s, user=user)
+            ensure_series_dto(s, user=user, progress_map=u_map)
         return ensure_page_dto({
             "content": paged_content,
             "totalElements": total,
@@ -166,9 +172,11 @@ async def list_series_post(
     if resp.status_code == 200:
         data = resp.json()
         if "content" in data and isinstance(data["content"], list):
+            u = (user or "default").lower().strip()
+            u_map = db.get_all_read_progress_map(u)
             for s in data["content"]:
                 disambiguate_series_dto(s)
-                ensure_series_dto(s, user=user)
+                ensure_series_dto(s, user=user, progress_map=u_map)
         return ensure_page_dto(data, default_page=page, default_size=size)
 
     return ensure_page_dto({"content": []}, default_page=page, default_size=size)
@@ -187,6 +195,8 @@ async def list_series_special(
     page = int(params.get("page", 0))
     size = int(params.get("size", 20))
     library_id = params.get("library_id") or params.get("libraryId")
+    if library_id in ("", "null", "None"):
+        library_id = None
     return await grimmory_client.get_updated_series(user, pwd, page=page, size=size, library_id=library_id)
 
 

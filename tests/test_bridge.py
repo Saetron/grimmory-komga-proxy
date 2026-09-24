@@ -2302,6 +2302,46 @@ def test_multi_library_db_query():
     assert ids_str == {"s-1", "s-2"}
 
 
+def test_homepage_endpoints():
+    """Verify that homepage endpoints (new, updated, latest series and books, ondeck) return 200 and valid DTOs."""
+    db.save_series({"id": "hp-s1", "libraryId": "14", "name": "Homepage Series 1"})
+    db.save_book({"id": "hp-b1", "seriesId": "hp-s1", "libraryId": "14", "name": "Book 1", "number": 1})
+
+    with patch.object(grimmory_client, "komga_request", new_callable=AsyncMock) as mock_komga, \
+         patch.object(grimmory_client, "get_user_library_ids", new_callable=AsyncMock, return_value={"14", "15", "16"}):
+        mock_komga.return_value = httpx.Response(200, json={"content": []})
+
+        # Test series homepage endpoints
+        for ep in ["/api/v1/series/new", "/api/v1/series/updated", "/api/v1/series/latest"]:
+            resp = client.get(ep, headers=AUTH_HEADER)
+            assert resp.status_code == 200
+            data = resp.json()
+            assert "content" in data
+            assert "totalElements" in data
+
+            # Also with library_id="null" and library_id=""
+            resp_null = client.get(f"{ep}?library_id=null", headers=AUTH_HEADER)
+            assert resp_null.status_code == 200
+
+        # Test books ondeck (both GET and POST)
+        resp_ondeck = client.get("/api/v1/books/ondeck", headers=AUTH_HEADER)
+        assert resp_ondeck.status_code == 200
+        assert "content" in resp_ondeck.json()
+
+        resp_ondeck_post = client.post("/api/v1/books/ondeck", headers=AUTH_HEADER)
+        assert resp_ondeck_post.status_code == 200
+        assert "content" in resp_ondeck_post.json()
+
+        # Test books latest (both GET and POST)
+        resp_latest = client.get("/api/v1/books/latest", headers=AUTH_HEADER)
+        assert resp_latest.status_code == 200
+        assert "content" in resp_latest.json()
+
+        resp_latest_post = client.post("/api/v1/books/latest", headers=AUTH_HEADER)
+        assert resp_latest_post.status_code == 200
+        assert "content" in resp_latest_post.json()
+
+
 if __name__ == "__main__":
     pytest.main(["-v", __file__])
 

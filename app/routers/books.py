@@ -307,6 +307,7 @@ async def list_books_post(
 
 
 @router.get("/ondeck")
+@router.post("/ondeck")
 async def get_ondeck_books(
     request: Request,
     authorization: Optional[str] = Header(None)
@@ -316,10 +317,13 @@ async def get_ondeck_books(
     page = int(params.get("page", 0))
     size = int(params.get("size", 20))
     library_id = params.get("library_id") or params.get("libraryId")
+    if library_id in ("", "null", "None"):
+        library_id = None
     return await grimmory_client.get_ondeck_books(user, pwd, page=page, size=size, library_id=library_id)
 
 
 @router.get("/latest")
+@router.post("/latest")
 async def get_latest_books(
     request: Request,
     authorization: Optional[str] = Header(None)
@@ -329,10 +333,13 @@ async def get_latest_books(
     page = int(params.get("page", 0))
     size = int(params.get("size", 20))
     library_id = params.get("library_id") or params.get("libraryId")
+    if library_id in ("", "null", "None"):
+        library_id = None
     return await grimmory_client.get_latest_books(user, pwd, page=page, size=size, library_id=library_id)
 
 
 @router.get("/released")
+@router.post("/released")
 async def get_released_books_endpoint(
     request: Request,
     authorization: Optional[str] = Header(None)
@@ -342,6 +349,8 @@ async def get_released_books_endpoint(
     page = int(params.get("page", 0))
     size = int(params.get("size", 20))
     library_id = params.get("library_id") or params.get("libraryId")
+    if library_id in ("", "null", "None"):
+        library_id = None
     return await grimmory_client.get_released_books(user, pwd, page=page, size=size, library_id=library_id)
 
 

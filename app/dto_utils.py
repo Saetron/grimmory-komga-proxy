@@ -58,7 +58,12 @@ def ensure_page_dto(data: Dict[str, Any], default_page: int = 0, default_size: i
     return data
 
 
-def ensure_series_dto(series: Dict[str, Any], user: Optional[str] = None) -> Dict[str, Any]:
+def ensure_series_dto(
+    series: Dict[str, Any],
+    user: Optional[str] = None,
+    progress_map: Optional[Dict[str, Any]] = None,
+    compute_read_counts: bool = True
+) -> Dict[str, Any]:
     """Ensure all required Komga SeriesDto fields are present for strict Swift/Kotlin clients."""
     now_iso = series.get("created") or series.get("lastModified") or "2026-01-01T00:00:00Z"
     series.setdefault("booksCount", 0)
@@ -92,7 +97,7 @@ def ensure_series_dto(series: Dict[str, Any], user: Optional[str] = None) -> Dic
 
     series.setdefault("url", f"/api/v1/series/{series.get('id', '')}")
 
-    if s_id:
+    if s_id and compute_read_counts:
         try:
             from app.db import db
             s_books = db.get_books_by_series(s_id)
@@ -100,7 +105,7 @@ def ensure_series_dto(series: Dict[str, Any], user: Optional[str] = None) -> Dic
                 from app.grimmory_client import grimmory_client
                 series["booksCount"] = len(s_books)
                 u = (user or "default").lower().strip()
-                u_map = db.get_all_read_progress_map(u)
+                u_map = progress_map if progress_map is not None else db.get_all_read_progress_map(u)
                 read_cnt = sum(1 for b in s_books if grimmory_client._is_book_finished(b, user=user, progress=u_map.get(str(b.get("id")))))
                 inp_cnt = sum(1 for b in s_books if grimmory_client._is_book_in_progress(b, user=user, progress=u_map.get(str(b.get("id")))))
                 series["booksReadCount"] = read_cnt
