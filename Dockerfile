@@ -18,8 +18,8 @@ FROM python:3.12-slim
 
 WORKDIR /app
 
-# Create a non-privileged user
-RUN useradd -u 10001 -m appuser
+# Create a non-privileged user (standard UID 1000 for container host volume compatibility)
+RUN useradd -u 1000 -m appuser
 
 # Copy installed Python packages from builder
 COPY --from=builder /root/.local /home/appuser/.local
@@ -29,7 +29,7 @@ ENV PYTHONDONTWRITEBYTECODE=1
 
 # Copy application source code
 COPY --chown=appuser:appuser app/ ./app
-RUN mkdir -p /app/data && chown -R appuser:appuser /app/data
+RUN mkdir -p /app/data /tmp && chown -R appuser:appuser /app/data && chmod 777 /app/data /tmp
 VOLUME ["/app/data"]
 
 USER appuser

@@ -1459,6 +1459,20 @@ def test_sqlite_db_performance():
     assert avg_ms < 1.0, f"Average query time {avg_ms:.3f}ms exceeded 1ms target"
 
 
+def test_sqlite_db_unwritable_fallback():
+    """Verify that Database initialization does not crash if preferred path is unwritable."""
+    from app.db import Database
+    fallback_db = Database(db_path="/proc/sys/nonexistent/forbidden.db")
+    assert fallback_db.db_path != "/proc/sys/nonexistent/forbidden.db"
+    assert "bridge.db" in fallback_db.db_path or "bridge_mem" in fallback_db.db_path
+
+    # Verify write and read work on fallback
+    fallback_db.save_series({"id": "fallback-1", "name": "Fallback Test"})
+    retrieved = fallback_db.get_series("fallback-1")
+    assert retrieved is not None
+    assert retrieved["name"] == "Fallback Test"
+
+
 if __name__ == "__main__":
     pytest.main(["-v", __file__])
 

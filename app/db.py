@@ -2,21 +2,62 @@ import sqlite3
 import json
 import os
 import time
+import tempfile
+import logging
 from typing import Optional, Dict, Any, List, Tuple
 from app.config import settings
 
+logger = logging.getLogger("grimmory-komga-bridge")
+
 class Database:
     def __init__(self, db_path: Optional[str] = None):
-        self.db_path = db_path or settings.DATABASE_PATH
-        db_dir = os.path.dirname(os.path.abspath(self.db_path))
-        os.makedirs(db_dir, exist_ok=True)
+        preferred_path = db_path or settings.DATABASE_PATH
+        self.db_path = self._resolve_writable_db_path(preferred_path)
         self._init_db()
 
+    def _resolve_writable_db_path(self, preferred_path: str) -> str:
+        candidates = [
+            preferred_path,
+            os.path.join(tempfile.gettempdir(), "bridge.db"),
+            "file:bridge_mem?mode=memory&cache=shared"
+        ]
+        for candidate in candidates:
+            if candidate.startswith("file:"):
+                logger.info("Using in-memory SQLite database as fallback")
+                return candidate
+            try:
+                db_dir = os.path.dirname(os.path.abspath(candidate))
+                os.makedirs(db_dir, exist_ok=True)
+                test_conn = sqlite3.connect(candidate, timeout=5.0, uri=True)
+                test_conn.execute("CREATE TABLE IF NOT EXISTS _test_write (id INTEGER PRIMARY KEY);")
+                test_conn.execute("INSERT OR REPLACE INTO _test_write (id) VALUES (1);")
+                test_conn.execute("DROP TABLE _test_write;")
+                test_conn.commit()
+                test_conn.close()
+                if candidate != preferred_path:
+                    logger.warning(
+                        f"Database path '{preferred_path}' is not writable. Falling back to '{candidate}'."
+                    )
+                else:
+                    logger.info(f"Using persistent SQLite database at '{candidate}'")
+                return candidate
+            except (sqlite3.OperationalError, PermissionError, OSError) as e:
+                logger.warning(f"Could not open or write database at '{candidate}': {e}")
+                continue
+
+        return "file:bridge_mem?mode=memory&cache=shared"
+
     def _get_connection(self) -> sqlite3.Connection:
-        conn = sqlite3.connect(self.db_path, timeout=30.0, check_same_thread=False)
+        conn = sqlite3.connect(self.db_path, timeout=30.0, check_same_thread=False, uri=True)
         conn.row_factory = sqlite3.Row
-        conn.execute("PRAGMA journal_mode=WAL;")
-        conn.execute("PRAGMA synchronous=NORMAL;")
+        try:
+            conn.execute("PRAGMA journal_mode=WAL;")
+            conn.execute("PRAGMA synchronous=NORMAL;")
+        except Exception:
+            try:
+                conn.execute("PRAGMA journal_mode=DELETE;")
+            except Exception:
+                pass
         return conn
 
     def _init_db(self):
