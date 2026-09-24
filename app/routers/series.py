@@ -21,6 +21,10 @@ async def list_series(
     library_id = params.get("library_id")
     sort = params.get("sort", "")
 
+    search_query = params.get("search")
+    if search_query:
+        return await grimmory_client.search_series(search_query, user, pwd, page=page, size=size, library_id=library_id)
+
     if any(k in sort.lower() for k in ["lastmodified", "created", "updated"]):
         return await grimmory_client.get_updated_series(user, pwd, page=page, size=size, library_id=library_id)
 
@@ -71,6 +75,10 @@ async def list_series_post(
     sort_val = sort
     if not sort_val and "sort" in body:
         sort_val = str(body["sort"])
+
+    search_query = params.get("search") or filters.get("search")
+    if search_query:
+        return await grimmory_client.search_series(search_query, user, pwd, page=page, size=size, library_id=library_id)
 
     if any(k in sort_val.lower() for k in ["lastmodified", "created", "updated"]):
         return await grimmory_client.get_updated_series(user, pwd, page=page, size=size, library_id=library_id)

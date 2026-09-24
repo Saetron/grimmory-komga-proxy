@@ -83,16 +83,25 @@ def test_series_post_list_translation_mock():
         mock_req.return_value = mock_komga_resp
         resp = client.post(
             "/api/v1/series/list",
-            json={"libraryIds": ["lib-1"], "search": "demo"},
+            json={"libraryIds": ["lib-1"], "search": "Series"},
             headers=AUTH_HEADER
         )
         assert resp.status_code == 200
         data = resp.json()
         assert len(data["content"]) == 1
         assert data["content"][0]["name"] == "Series 1"
-        mock_req.assert_called_once()
-        _, kwargs = mock_req.call_args
+        assert mock_req.call_count >= 1
+        _, kwargs = mock_req.call_args_list[0]
         assert kwargs.get("params", {}).get("library_id") == "lib-1"
+
+        # Searching for non-matching term returns 0
+        resp_nomatch = client.post(
+            "/api/v1/series/list",
+            json={"libraryIds": ["lib-1"], "search": "nonexistent"},
+            headers=AUTH_HEADER
+        )
+        assert resp_nomatch.status_code == 200
+        assert len(resp_nomatch.json()["content"]) == 0
 
 
 def test_series_special_endpoints_mock():
@@ -1197,8 +1206,147 @@ def test_recently_updated_series_chronological_ordering():
         assert d_p0["content"][0]["name"] == "Series Z"
 
 
+def test_series_search_filtering():
+    """Verify that searching series filters correctly case-insensitively and returns only matching series."""
+    mock_series_data = {
+        "content": [
+            {"id": "1", "name": "Nekopara Extra", "metadata": {"title": "Nekopara Extra", "status": "ONGOING"}},
+            {"id": "2", "name": "Blade Runner 2029", "metadata": {"title": "Blade Runner 2029", "status": "ENDED"}},
+            {"id": "3", "name": "Neko Maid Cafe", "metadata": {"title": "Neko Maid Cafe", "status": "ONGOING"}},
+        ],
+        "totalElements": 3,
+        "totalPages": 1
+    }
+
+    grimmory_client.all_series_cache.clear()
+
+    with patch.object(grimmory_client, "komga_request", new_callable=AsyncMock) as mock_komga:
+        mock_komga.return_value = httpx.Response(200, json=mock_series_data)
+
+        # 1. GET /api/v1/series?search=Neko (case-insensitive)
+        resp1 = client.get("/api/v1/series?search=neko", headers=AUTH_HEADER)
+        assert resp1.status_code == 200
+        data1 = resp1.json()
+        assert data1["totalElements"] == 2
+        names1 = [s["name"] for s in data1["content"]]
+        assert "Nekopara Extra" in names1
+        assert "Neko Maid Cafe" in names1
+        assert "Blade Runner 2029" not in names1
+
+        # 2. POST /api/v1/series/list with searchTerm="Blade"
+        grimmory_client.all_series_cache.clear()
+        resp2 = client.post(
+            "/api/v1/series/list",
+            json={"searchTerm": "Blade"},
+            headers=AUTH_HEADER
+        )
+        assert resp2.status_code == 200
+        data2 = resp2.json()
+        assert data2["totalElements"] == 1
+        assert data2["content"][0]["name"] == "Blade Runner 2029"
+
+        # 3. POST /api/v1/series/list with search that doesn't match
+        resp3 = client.post(
+            "/api/v1/series/list",
+            json={"search": "NonExistentSeries"},
+            headers=AUTH_HEADER
+        )
+        assert resp3.status_code == 200
+        data3 = resp3.json()
+        assert data3["totalElements"] == 0
+        assert len(data3["content"]) == 0
+
+
+def test_books_search_filtering():
+    """Verify that searching books routes to search_books and returns matching BookDtos."""
+    raw_search_books = [
+        {"id": 8801, "title": "Nekopara Vol 1", "seriesName": "Nekopara", "libraryId": 14}
+    ]
+
+    async def mock_native_get(url, **kwargs):
+        if "search" in url:
+            return httpx.Response(200, json=raw_search_books)
+        return httpx.Response(404)
+
+    mock_client = AsyncMock()
+    mock_client.get = AsyncMock(side_effect=mock_native_get)
+
+    with patch.object(grimmory_client, "get_client", return_value=mock_client), \
+         patch.object(grimmory_client, "get_native_token", new_callable=AsyncMock, return_value="dummy-token"):
+
+        # 1. GET /api/v1/books?search=Nekopara
+        resp1 = client.get("/api/v1/books?search=Nekopara", headers=AUTH_HEADER)
+        assert resp1.status_code == 200
+        data1 = resp1.json()
+        assert data1["totalElements"] == 1
+        assert data1["content"][0]["id"] == "8801"
+
+        # 2. POST /api/v1/books/list with {"search": "Nekopara"}
+        resp2 = client.post(
+            "/api/v1/books/list",
+            json={"search": "Nekopara"},
+            headers=AUTH_HEADER
+        )
+        assert resp2.status_code == 200
+        data2 = resp2.json()
+        assert data2["totalElements"] == 1
+        assert data2["content"][0]["id"] == "8801"
+
+
+def test_read_progress_persistence_and_ondeck():
+    """Verify that read progress persists across cache reload and appears in On Deck on startup."""
+    import tempfile
+    import os
+    from app.grimmory_client import read_progress_cache, save_progress_cache, load_progress_cache
+
+    with tempfile.NamedTemporaryFile(suffix=".json", delete=False) as f:
+        temp_progress_file = f.name
+
+    try:
+        with patch("app.grimmory_client.PROGRESS_FILE", temp_progress_file):
+            # 1. Populate progress and save
+            read_progress_cache["777"] = {"page": 25, "completed": False, "readDate": "2026-09-24T10:00:00Z"}
+            save_progress_cache()
+
+            # 2. Clear in-memory cache and reload from disk
+            read_progress_cache.clear()
+            assert "777" not in read_progress_cache
+            load_progress_cache()
+            assert "777" in read_progress_cache
+            assert read_progress_cache["777"]["page"] == 25
+            assert read_progress_cache["777"]["completed"] is False
+
+            # 3. Simulate bridge startup query for On Deck
+            mock_client = AsyncMock()
+            mock_client.get = AsyncMock(return_value=httpx.Response(200, json=[]))
+
+            async def mock_get_book(b_id, user, pwd):
+                return {
+                    "id": str(b_id),
+                    "name": f"Book {b_id}",
+                    "libraryId": "14",
+                    "media": {"pagesCount": 100}
+                }
+
+            with patch.object(grimmory_client, "get_client", return_value=mock_client), \
+                 patch.object(grimmory_client, "get_book_dto", side_effect=mock_get_book), \
+                 patch.object(grimmory_client, "get_native_token", new_callable=AsyncMock, return_value="dummy-token"):
+
+                resp = client.get("/api/v1/books/ondeck", headers=AUTH_HEADER)
+                assert resp.status_code == 200
+                content = resp.json()["content"]
+                assert any(b["id"] == "777" for b in content)
+                b777 = next(b for b in content if b["id"] == "777")
+                assert b777["readProgress"]["page"] == 25
+                assert b777["readProgress"]["completed"] is False
+    finally:
+        if os.path.exists(temp_progress_file):
+            os.remove(temp_progress_file)
+
+
 if __name__ == "__main__":
     pytest.main(["-v", __file__])
+
 
 
 

@@ -1,3 +1,6 @@
+import os
+import json
+import tempfile
 import base64
 import time
 import httpx
@@ -8,6 +11,8 @@ from app.config import settings
 from app.dto_utils import ensure_page_dto, ensure_book_dto, raw_app_book_to_dto, ensure_series_dto, disambiguate_series_dto
 import asyncio
 
+PROGRESS_FILE = os.getenv("PROGRESS_FILE", os.path.join(tempfile.gettempdir(), "grimmory_progress_cache.json"))
+
 # In-memory caches:
 # Cache JWT tokens for native Grimmory API (1 hour TTL)
 token_cache: TTLCache = TTLCache(maxsize=100, ttl=3600)
@@ -15,12 +20,34 @@ token_cache: TTLCache = TTLCache(maxsize=100, ttl=3600)
 page_cache: TTLCache = TTLCache(maxsize=5000, ttl=3600)
 # Cache page count per book (24 hour TTL)
 page_count_cache: TTLCache = TTLCache(maxsize=10000, ttl=86400)
-# Cache read progress per book (5 min TTL)
-read_progress_cache: TTLCache = TTLCache(maxsize=10000, ttl=300)
+# Cache read progress per book (30 days TTL)
+read_progress_cache: TTLCache = TTLCache(maxsize=10000, ttl=86400 * 30)
 # Cache book DTOs (5 min TTL)
 book_cache: TTLCache = TTLCache(maxsize=5000, ttl=300)
 # Active reading sessions: session_key -> dict
 active_sessions: Dict[str, Dict[str, Any]] = {}
+
+def load_progress_cache():
+    try:
+        if os.path.exists(PROGRESS_FILE):
+            with open(PROGRESS_FILE, "r", encoding="utf-8") as f:
+                data = json.load(f)
+                if isinstance(data, dict):
+                    for k, v in data.items():
+                        if isinstance(v, dict):
+                            read_progress_cache[k] = v
+    except Exception:
+        pass
+
+def save_progress_cache():
+    try:
+        data = {k: v for k, v in read_progress_cache.items() if isinstance(v, dict)}
+        with open(PROGRESS_FILE, "w", encoding="utf-8") as f:
+            json.dump(data, f)
+    except Exception:
+        pass
+
+load_progress_cache()
 
 
 class GrimmoryClient:
@@ -30,6 +57,7 @@ class GrimmoryClient:
         self._client_loop = None
         self.custom_series: Dict[str, Dict[str, Any]] = {}
         self.custom_series_books_cache: TTLCache = TTLCache(maxsize=1000, ttl=300)
+        self.all_series_cache: TTLCache = TTLCache(maxsize=100, ttl=60)
 
     def get_client(self) -> httpx.AsyncClient:
         try:
@@ -466,6 +494,7 @@ class GrimmoryClient:
                     "deviceName": "Komic"
                 }
                 read_progress_cache[book_id] = progress_dto
+                save_progress_cache()
                 return progress_dto
         except Exception:
             pass
@@ -531,6 +560,7 @@ class GrimmoryClient:
             "deviceName": "Komic"
         }
         read_progress_cache[book_id] = progress_dto
+        save_progress_cache()
         if book_id in book_cache:
             book_cache[book_id]["readProgress"] = progress_dto
 
@@ -585,7 +615,18 @@ class GrimmoryClient:
         except Exception:
             pass
 
-        # 2. Record reading session to Grimmory (non-blocking)
+        # 2. Update native Grimmory book read status
+        status_val = "READ" if is_completed else "READING"
+        try:
+            await self.client.put(
+                f"/api/v1/app/books/{book_id}/status",
+                json={"status": status_val, "readStatus": status_val},
+                headers=native_headers
+            )
+        except Exception:
+            pass
+
+        # 3. Record reading session to Grimmory (non-blocking)
         try:
             asyncio.create_task(
                 self.record_reading_session(
@@ -602,7 +643,7 @@ class GrimmoryClient:
         except Exception:
             pass
 
-        # 3. If completed, clear session
+        # 4. If completed, clear session
         if is_completed:
             active_sessions.pop(session_key, None)
 
@@ -611,11 +652,21 @@ class GrimmoryClient:
     async def reset_read_progress(self, book_id: str, user: str, pwd: str) -> bool:
         """Reset progress in Grimmory."""
         read_progress_cache.pop(book_id, None)
+        save_progress_cache()
         active_sessions.pop(f"{user}:{book_id}", None)
         if book_id in book_cache:
             book_cache[book_id]["readProgress"] = None
 
         native_headers = await self.get_native_headers(user, pwd)
+        try:
+            await self.client.put(
+                f"/api/v1/app/books/{book_id}/status",
+                json={"status": "UNREAD", "readStatus": "UNREAD"},
+                headers=native_headers
+            )
+        except Exception:
+            pass
+
         try:
             resp = await self.client.post(
                 "/api/v1/books/reset-progress",
@@ -700,14 +751,66 @@ class GrimmoryClient:
         except Exception:
             pass
 
-        # Merge active in-progress books from cache
         seen_ids = {str(b.get("id")) for b in raw_books if b.get("id")}
+
+        # 2. Check magic shelves if continue-reading is empty
+        if not raw_books:
+            try:
+                resp = await self.client.get("/api/v1/app/shelves/magic", headers=native_headers)
+                if resp.status_code == 200:
+                    shelves = resp.json()
+                    if isinstance(shelves, list):
+                        for s in shelves:
+                            s_name = (s.get("name") or "").lower()
+                            if any(k in s_name for k in ["reading", "in progress", "currently"]):
+                                s_id = s.get("id")
+                                if s_id:
+                                    b_resp = await self.client.get(f"/api/v1/app/shelves/magic/{s_id}/books", headers=native_headers)
+                                    if b_resp.status_code == 200:
+                                        b_data = b_resp.json()
+                                        b_list = b_data.get("content", []) if isinstance(b_data, dict) else b_data if isinstance(b_data, list) else []
+                                        for b in b_list:
+                                            b_id = str(b.get("id"))
+                                            if b_id and b_id not in seen_ids:
+                                                raw_books.append(b)
+                                                seen_ids.add(b_id)
+            except Exception:
+                pass
+
+        # 3. If still empty, check top recently added/active books
+        if not raw_books and len(seen_ids) == 0:
+            try:
+                resp = await self.client.get("/api/v1/app/books/recently-added", params={"size": 15}, headers=native_headers)
+                if resp.status_code == 200:
+                    r_data = resp.json()
+                    r_books = r_data.get("content", []) if isinstance(r_data, dict) else r_data if isinstance(r_data, list) else []
+                    for b in r_books:
+                        b_id = str(b.get("id"))
+                        if b_id and b_id not in seen_ids:
+                            prog = await self.get_read_progress(b_id, user, pwd)
+                            if prog and not prog.get("completed") and prog.get("page", 0) > 0:
+                                raw_books.append(b)
+                                seen_ids.add(b_id)
+            except Exception:
+                pass
+
+        # 4. Merge active in-progress books from cache
         for b_id, prog in list(read_progress_cache.items()):
             if prog and not prog.get("completed") and prog.get("page", 0) > 0 and str(b_id) not in seen_ids:
                 cached_b = await self.get_book_dto(str(b_id), user, pwd)
                 if cached_b:
                     raw_books.insert(0, cached_b)
                     seen_ids.add(str(b_id))
+
+        # 5. Filter out completed books
+        final_books = []
+        for b in raw_books:
+            b_id = str(b.get("id"))
+            prog = read_progress_cache.get(b_id)
+            if prog and prog.get("completed"):
+                continue
+            final_books.append(b)
+        raw_books = final_books
 
         if library_id:
             raw_books = [
@@ -863,6 +966,148 @@ class GrimmoryClient:
         paged_content = all_series[start:start + size]
         return ensure_page_dto({
             "content": paged_content,
+            "totalElements": total,
+            "number": page,
+            "size": size
+        }, default_page=page, default_size=size)
+
+    async def get_all_series(
+        self,
+        user: str,
+        pwd: str,
+        library_id: Optional[str] = None
+    ) -> List[Dict[str, Any]]:
+        """Fetch all series (from Komga layer + custom disambiguated series) with caching."""
+        cache_key = f"{user}:{library_id or 'all'}"
+        if cache_key in self.all_series_cache:
+            return list(self.all_series_cache[cache_key])
+
+        params = {"size": 500}
+        if library_id:
+            params["library_id"] = str(library_id)
+
+        all_series = []
+        page_idx = 0
+        while True:
+            params["page"] = page_idx
+            resp = await self.komga_request("GET", "/api/v1/series", user, pwd, params=params)
+            if resp.status_code != 200:
+                break
+            data = resp.json()
+            items = data.get("content", []) if isinstance(data, dict) else []
+            if not items:
+                break
+            for s in items:
+                disambiguate_series_dto(s)
+                ensure_series_dto(s)
+                all_series.append(s)
+
+            total_pages = data.get("totalPages", 1) if isinstance(data, dict) else 1
+            page_idx += 1
+            if page_idx >= total_pages or page_idx >= 10:
+                break
+
+        # Also merge custom_series that match the library_id
+        for s_id, custom_info in self.custom_series.items():
+            if not library_id or str(custom_info.get("lib_id")) == str(library_id):
+                s_dto = custom_info.get("dto", {})
+                if s_dto and not any(existing.get("id") == s_id for existing in all_series):
+                    all_series.append(s_dto)
+
+        self.all_series_cache[cache_key] = all_series
+        return all_series
+
+    async def search_series(
+        self,
+        query: str,
+        user: str,
+        pwd: str,
+        page: int = 0,
+        size: int = 20,
+        library_id: Optional[str] = None
+    ) -> Dict[str, Any]:
+        """Search series by title/name."""
+        all_series = await self.get_all_series(user, pwd, library_id=library_id)
+        q_lower = query.strip().lower()
+        matching = [
+            s for s in all_series
+            if q_lower in (s.get("name") or "").lower() or q_lower in (s.get("metadata", {}).get("title") or "").lower()
+        ]
+        total = len(matching)
+        start = page * size
+        paged = matching[start:start + size]
+        return ensure_page_dto({
+            "content": paged,
+            "totalElements": total,
+            "number": page,
+            "size": size
+        }, default_page=page, default_size=size)
+
+    async def search_books(
+        self,
+        query: str,
+        user: str,
+        pwd: str,
+        page: int = 0,
+        size: int = 20,
+        library_id: Optional[str] = None
+    ) -> Dict[str, Any]:
+        """Search books by title/metadata via Grimmory native search and fallback."""
+        native_headers = await self.get_native_headers(user, pwd)
+        q_clean = query.strip()
+        matching_books = []
+
+        # 1. Try native Grimmory search endpoint
+        for param_key in ["query", "search", "q"]:
+            try:
+                resp = await self.client.get(
+                    "/api/v1/app/books/search",
+                    params={param_key: q_clean, "size": 100},
+                    headers=native_headers
+                )
+                if resp.status_code == 200:
+                    data = resp.json()
+                    raw = data.get("content", []) if isinstance(data, dict) else data if isinstance(data, list) else []
+                    if raw:
+                        for b in raw:
+                            if library_id and str(b.get("libraryId") or b.get("library_id")) != str(library_id):
+                                continue
+                            matching_books.append(raw_app_book_to_dto(b))
+                        break
+            except Exception:
+                pass
+
+        # 2. If native search returned nothing, search recently added / cached books
+        if not matching_books:
+            try:
+                resp = await self.client.get(
+                    "/api/v1/app/books/recently-added",
+                    params={"size": 500},
+                    headers=native_headers
+                )
+                if resp.status_code == 200:
+                    data = resp.json()
+                    raw = data.get("content", []) if isinstance(data, dict) else data if isinstance(data, list) else []
+                    q_lower = q_clean.lower()
+                    for b in raw:
+                        if library_id and str(b.get("libraryId") or b.get("library_id")) != str(library_id):
+                            continue
+                        name = (b.get("name") or b.get("title") or "").lower()
+                        s_name = (b.get("seriesName") or "").lower()
+                        if q_lower in name or q_lower in s_name:
+                            matching_books.append(raw_app_book_to_dto(b))
+            except Exception:
+                pass
+
+        total = len(matching_books)
+        start = page * size
+        paged = matching_books[start:start + size]
+        await self.enrich_books_page_count(paged, user, pwd)
+        for b in paged:
+            ensure_book_dto(b)
+
+        return ensure_page_dto({
+            "content": paged,
             "totalElements": total,
             "number": page,
             "size": size

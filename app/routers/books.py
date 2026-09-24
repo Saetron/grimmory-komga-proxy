@@ -55,6 +55,10 @@ async def list_books(
             return ensure_page_dto(data, default_page=page, default_size=size)
         return ensure_page_dto({"content": []}, default_page=page, default_size=size)
 
+    search_query = params.get("search")
+    if search_query:
+        return await grimmory_client.search_books(search_query, user, pwd, page=page, size=size, library_id=library_id)
+
     read_status_param = params.get("read_status", "") or params.get("readStatus", "")
     if "in_progress" in str(read_status_param).lower() or "readprogress" in sort.lower() or "readdate" in sort.lower():
         return await grimmory_client.get_ondeck_books(user, pwd, page=page, size=size, library_id=library_id)
@@ -145,12 +149,13 @@ async def list_books_post(
     if is_in_prog or "in_progress" in str(query_read_status).lower() or "readprogress" in sort.lower() or "readdate" in sort.lower():
         return await grimmory_client.get_ondeck_books(user, pwd, page=page, size=size, library_id=library_id)
 
+    search_query = params.get("search") or filters.get("search")
+    if search_query:
+        return await grimmory_client.search_books(search_query, user, pwd, page=page, size=size, library_id=library_id)
+
     # 3. Check if sorting by recently added or released
     if any(k in sort.lower() for k in ["createddate", "releasedate", "lastmodified", "created", "addedon"]):
         return await grimmory_client.get_latest_books(user, pwd, page=page, size=size, library_id=library_id)
-
-    if "search" in filters:
-        params["search"] = filters["search"]
 
     resp = await grimmory_client.komga_request("GET", "/api/v1/books", user, pwd, params=params)
     if resp.status_code == 200:

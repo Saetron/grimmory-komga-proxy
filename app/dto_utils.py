@@ -382,13 +382,18 @@ def extract_search_filters(body: Any) -> Dict[str, Any]:
                     elif isinstance(v, str):
                         filters["read_status"] = [v]
 
-                elif k_lower in ["searchterm", "fulltextsearch", "search"]:
+                elif k_lower in ["searchterm", "fulltextsearch", "search", "q", "query"]:
                     if isinstance(v, str) and v and "search" not in filters:
                         filters["search"] = v
-                elif k_lower == "title" and isinstance(v, dict):
-                    val = v.get("value")
-                    if isinstance(val, str) and val and "search" not in filters:
-                        filters["search"] = val
+                    elif isinstance(v, list) and len(v) > 0 and isinstance(v[0], str) and "search" not in filters:
+                        filters["search"] = v[0]
+                elif k_lower in ["title", "name"]:
+                    if isinstance(v, dict):
+                        val = v.get("value")
+                        if isinstance(val, str) and val and "search" not in filters:
+                            filters["search"] = val
+                    elif isinstance(v, str) and v and "search" not in filters:
+                        filters["search"] = v
 
                 walk(v)
         elif isinstance(obj, list):
