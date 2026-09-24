@@ -29,6 +29,8 @@ ENV PYTHONDONTWRITEBYTECODE=1
 
 # Copy application source code
 COPY --chown=appuser:appuser app/ ./app
+RUN mkdir -p /app/data && chown -R appuser:appuser /app/data
+VOLUME ["/app/data"]
 
 USER appuser
 

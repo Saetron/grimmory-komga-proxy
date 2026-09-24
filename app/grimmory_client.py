@@ -9,6 +9,7 @@ from typing import Optional, Dict, Any, List, Tuple
 from cachetools import TTLCache
 from app.config import settings
 from app.dto_utils import ensure_page_dto, ensure_book_dto, raw_app_book_to_dto, ensure_series_dto, disambiguate_series_dto
+from app.db import db
 import asyncio
 
 PROGRESS_FILE = os.getenv("PROGRESS_FILE", os.path.join(tempfile.gettempdir(), "grimmory_progress_cache.json"))
@@ -29,6 +30,11 @@ active_sessions: Dict[str, Dict[str, Any]] = {}
 
 def load_progress_cache():
     try:
+        # Load from persistent SQLite database first
+        for k, v in db.get_all_read_progress_map().items():
+            if isinstance(v, dict):
+                read_progress_cache[k] = v
+        # Backward compatibility with PROGRESS_FILE if present
         if os.path.exists(PROGRESS_FILE):
             with open(PROGRESS_FILE, "r", encoding="utf-8") as f:
                 data = json.load(f)
@@ -181,6 +187,15 @@ class GrimmoryClient:
         if book_id in page_cache:
             return page_cache[book_id]
 
+        # Check persistent database
+        db_pages_info = db.get_book_pages(book_id)
+        if db_pages_info:
+            cached_pages, cached_count = db_pages_info
+            if cached_pages:
+                page_cache[book_id] = cached_pages
+                page_count_cache[book_id] = cached_count or len(cached_pages)
+                return cached_pages
+
         native_headers = await self.get_native_headers(user, pwd)
 
         # 1. Try CBX pages list: /api/v1/cbx/{book_id}/pages returns array of page numbers e.g. [1, 2, 3, ...]
@@ -318,6 +333,10 @@ class GrimmoryClient:
 
         page_cache[book_id] = pages
         page_count_cache[book_id] = len(pages)
+        try:
+            db.save_book_pages(book_id, pages, len(pages))
+        except Exception:
+            pass
         return pages
 
     async def get_book_page_count(self, book_id: str, user: str, pwd: str) -> int:
@@ -328,6 +347,11 @@ class GrimmoryClient:
             count = len(page_cache[book_id])
             page_count_cache[book_id] = count
             return count
+
+        db_count = db.get_book_page_count(book_id)
+        if db_count is not None and db_count > 0:
+            page_count_cache[book_id] = db_count
+            return db_count
 
         native_headers = await self.get_native_headers(user, pwd)
 
@@ -405,17 +429,35 @@ class GrimmoryClient:
                     book["readProgress"] = None
 
         await asyncio.gather(*[_enrich_one(b) for b in books], return_exceptions=True)
+        try:
+            db.save_books_batch(books)
+        except Exception:
+            pass
 
     async def get_book_dto(self, book_id: str, user: str, pwd: str) -> Optional[Dict[str, Any]]:
         """Fetch book DTO from Grimmory's Komga layer and enrich it."""
         if book_id in book_cache:
             return book_cache[book_id]
+
+        # Check persistent database
+        db_book = db.get_book(book_id)
+        if db_book:
+            if book_id in read_progress_cache:
+                db_book["readProgress"] = read_progress_cache[book_id]
+            ensure_book_dto(db_book)
+            book_cache[book_id] = db_book
+            return db_book
+
         resp = await self.komga_request("GET", f"/api/v1/books/{book_id}", user, pwd)
         if resp.status_code != 200:
             return None
         book = resp.json()
         await self.enrich_book(book, user, pwd, fetch_dimensions=True)
         book_cache[book_id] = book
+        try:
+            db.save_book(book)
+        except Exception:
+            pass
         return book
 
     async def enrich_book(self, book: Dict[str, Any], user: str, pwd: str, fetch_dimensions: bool = False) -> None:
@@ -446,6 +488,11 @@ class GrimmoryClient:
         """Fetch read progress from Grimmory native API and format as Komga ReadProgressDto."""
         if book_id in read_progress_cache:
             return read_progress_cache[book_id]
+
+        db_prog = db.get_read_progress(book_id)
+        if db_prog:
+            read_progress_cache[book_id] = db_prog
+            return db_prog
 
         native_headers = await self.get_native_headers(user, pwd)
         try:
@@ -495,6 +542,10 @@ class GrimmoryClient:
                 }
                 read_progress_cache[book_id] = progress_dto
                 save_progress_cache()
+                try:
+                    db.save_read_progress(book_id, page, completed, date_finished or now_iso, progress_dto)
+                except Exception:
+                    pass
                 return progress_dto
         except Exception:
             pass
@@ -561,6 +612,10 @@ class GrimmoryClient:
         }
         read_progress_cache[book_id] = progress_dto
         save_progress_cache()
+        try:
+            db.save_read_progress(book_id, page, is_completed, date_finished or now_iso, progress_dto)
+        except Exception:
+            pass
         if book_id in book_cache:
             book_cache[book_id]["readProgress"] = progress_dto
 
@@ -653,6 +708,10 @@ class GrimmoryClient:
         """Reset progress in Grimmory."""
         read_progress_cache.pop(book_id, None)
         save_progress_cache()
+        try:
+            db.delete_read_progress(book_id)
+        except Exception:
+            pass
         active_sessions.pop(f"{user}:{book_id}", None)
         if book_id in book_cache:
             book_cache[book_id]["readProgress"] = None
@@ -794,7 +853,19 @@ class GrimmoryClient:
             except Exception:
                 pass
 
-        # 4. Merge active in-progress books from cache
+        # 4. Merge active in-progress books from DB and cache
+        try:
+            db_in_progress = db.get_all_in_progress()
+            for b_id, prog in db_in_progress:
+                read_progress_cache[b_id] = prog
+                if str(b_id) not in seen_ids:
+                    cached_b = await self.get_book_dto(str(b_id), user, pwd)
+                    if cached_b:
+                        raw_books.insert(0, cached_b)
+                        seen_ids.add(str(b_id))
+        except Exception:
+            pass
+
         for b_id, prog in list(read_progress_cache.items()):
             if prog and not prog.get("completed") and prog.get("page", 0) > 0 and str(b_id) not in seen_ids:
                 cached_b = await self.get_book_dto(str(b_id), user, pwd)
@@ -1015,6 +1086,10 @@ class GrimmoryClient:
                     all_series.append(s_dto)
 
         self.all_series_cache[cache_key] = all_series
+        try:
+            db.save_series_batch(all_series)
+        except Exception:
+            pass
         return all_series
 
     async def search_series(
@@ -1099,6 +1174,15 @@ class GrimmoryClient:
             except Exception:
                 pass
 
+        # 3. If still empty, search persistent database
+        if not matching_books:
+            try:
+                db_matched = db.search_books(q_clean, library_id)
+                if db_matched:
+                    matching_books.extend(db_matched)
+            except Exception:
+                pass
+
         total = len(matching_books)
         start = page * size
         paged = matching_books[start:start + size]
@@ -1148,6 +1232,12 @@ class GrimmoryClient:
         if unique_id in self.custom_series_books_cache:
             return self.custom_series_books_cache[unique_id]
 
+        # Check persistent database
+        db_books = db.get_books_by_series(unique_id)
+        if db_books:
+            self.custom_series_books_cache[unique_id] = db_books
+            return db_books
+
         if unique_id not in self.custom_series and "-u-" in unique_id:
             await self.ensure_custom_series_loaded(unique_id, user, pwd)
 
@@ -1192,9 +1282,17 @@ class GrimmoryClient:
                 dtos = [raw_app_book_to_dto(b, series_id_override=unique_id) for b in chosen if b.get("id")]
                 dtos.sort(key=lambda x: x.get("metadata", {}).get("numberSort", 1.0))
                 self.custom_series_books_cache[unique_id] = dtos
+                try:
+                    db.save_books_batch(dtos)
+                except Exception:
+                    pass
                 if unique_id in self.custom_series:
                     self.custom_series[unique_id]["dto"]["booksCount"] = len(dtos)
                     self.custom_series[unique_id]["dto"].setdefault("metadata", {})["totalBookCount"] = len(dtos)
+                    try:
+                        db.save_series(self.custom_series[unique_id]["dto"])
+                    except Exception:
+                        pass
                 return dtos
         except Exception:
             pass
@@ -1210,9 +1308,17 @@ class GrimmoryClient:
                     dtos = [raw_app_book_to_dto(b, series_id_override=unique_id) for b in matched if b.get("id")]
                     dtos.sort(key=lambda x: x.get("metadata", {}).get("numberSort", 1.0))
                     self.custom_series_books_cache[unique_id] = dtos
+                    try:
+                        db.save_books_batch(dtos)
+                    except Exception:
+                        pass
                     if unique_id in self.custom_series:
                         self.custom_series[unique_id]["dto"]["booksCount"] = len(dtos)
                         self.custom_series[unique_id]["dto"].setdefault("metadata", {})["totalBookCount"] = len(dtos)
+                        try:
+                            db.save_series(self.custom_series[unique_id]["dto"])
+                        except Exception:
+                            pass
                     return dtos
         except Exception:
             pass
@@ -1228,9 +1334,17 @@ class GrimmoryClient:
                     dtos = [raw_app_book_to_dto(b, series_id_override=unique_id) for b in matched if b.get("id")]
                     dtos.sort(key=lambda x: x.get("metadata", {}).get("numberSort", 1.0))
                     self.custom_series_books_cache[unique_id] = dtos
+                    try:
+                        db.save_books_batch(dtos)
+                    except Exception:
+                        pass
                     if unique_id in self.custom_series:
                         self.custom_series[unique_id]["dto"]["booksCount"] = len(dtos)
                         self.custom_series[unique_id]["dto"].setdefault("metadata", {})["totalBookCount"] = len(dtos)
+                        try:
+                            db.save_series(self.custom_series[unique_id]["dto"])
+                        except Exception:
+                            pass
                     return dtos
         except Exception:
             pass
@@ -1248,9 +1362,17 @@ class GrimmoryClient:
                         ensure_book_dto(b)
                     matched.sort(key=lambda x: x.get("metadata", {}).get("numberSort", 1.0))
                     self.custom_series_books_cache[unique_id] = matched
+                    try:
+                        db.save_books_batch(matched)
+                    except Exception:
+                        pass
                     if unique_id in self.custom_series:
                         self.custom_series[unique_id]["dto"]["booksCount"] = len(matched)
                         self.custom_series[unique_id]["dto"].setdefault("metadata", {})["totalBookCount"] = len(matched)
+                        try:
+                            db.save_series(self.custom_series[unique_id]["dto"])
+                        except Exception:
+                            pass
                     return matched
         except Exception:
             pass

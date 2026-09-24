@@ -5,6 +5,7 @@ import httpx
 from fastapi.testclient import TestClient
 from app.main import app
 from app.grimmory_client import grimmory_client, token_cache, page_cache, page_count_cache, read_progress_cache, book_cache, active_sessions
+from app.db import db
 
 client = TestClient(app)
 
@@ -21,6 +22,7 @@ def clear_caches():
     book_cache.clear()
     active_sessions.clear()
     grimmory_client.custom_series.clear()
+    db.clear_all()
 
 
 # ============================================================================
@@ -1342,6 +1344,119 @@ def test_read_progress_persistence_and_ondeck():
     finally:
         if os.path.exists(temp_progress_file):
             os.remove(temp_progress_file)
+
+
+def test_sqlite_db_cache_and_persistence():
+    """Verify SQLite database persists series, books, and read progress with fast lookups."""
+    # 1. Test series saving and retrieval
+    series_dto = {
+        "id": "ser-42",
+        "libraryId": "14",
+        "name": "One Piece",
+        "booksCount": 105,
+        "metadata": {"title": "One Piece"}
+    }
+    db.save_series(series_dto)
+    fetched_series = db.get_series("ser-42")
+    assert fetched_series is not None
+    assert fetched_series["id"] == "ser-42"
+    assert fetched_series["name"] == "One Piece"
+
+    all_series = db.get_all_series(library_id="14")
+    assert any(s["id"] == "ser-42" for s in all_series)
+
+    search_res = db.search_series("Piece")
+    assert any(s["id"] == "ser-42" for s in search_res)
+
+    # 2. Test books batch saving and retrieval
+    books = [
+        {"id": "b-1", "seriesId": "ser-42", "libraryId": "14", "name": "Chapter 1", "number": 1.0, "media": {"pagesCount": 55}},
+        {"id": "b-2", "seriesId": "ser-42", "libraryId": "14", "name": "Chapter 2", "number": 2.0, "media": {"pagesCount": 48}}
+    ]
+    db.save_books_batch(books)
+
+    b1 = db.get_book("b-1")
+    assert b1 is not None
+    assert b1["name"] == "Chapter 1"
+
+    series_books = db.get_books_by_series("ser-42")
+    assert len(series_books) == 2
+    assert series_books[0]["id"] == "b-1"
+    assert series_books[1]["id"] == "b-2"
+
+    book_search = db.search_books("Chapter 2")
+    assert any(b["id"] == "b-2" for b in book_search)
+
+    # 3. Test read progress saving and in-progress retrieval
+    prog_dto = {
+        "page": 20,
+        "completed": False,
+        "readDate": "2026-09-24T10:00:00Z"
+    }
+    db.save_read_progress("b-1", 20, False, "2026-09-24T10:00:00Z", prog_dto)
+    read_p = db.get_read_progress("b-1")
+    assert read_p is not None
+    assert read_p["page"] == 20
+    assert read_p["completed"] is False
+
+    in_prog = db.get_all_in_progress()
+    assert any(b_id == "b-1" for b_id, _ in in_prog)
+
+    # Test delete progress
+    db.delete_read_progress("b-1")
+    assert db.get_read_progress("b-1") is None
+
+
+@pytest.mark.anyio
+async def test_sqlite_db_pages_zero_network():
+    """Verify that cached pages in SQLite return immediately without making any HTTP requests."""
+    book_id = "book-cached-999"
+    cached_pages = [
+        {"number": 1, "fileName": "001.jpg", "mediaType": "image/jpeg", "width": 1200, "height": 1800, "sizeBytes": 0, "size": "0 B"},
+        {"number": 2, "fileName": "002.jpg", "mediaType": "image/jpeg", "width": 1200, "height": 1800, "sizeBytes": 0, "size": "0 B"},
+        {"number": 3, "fileName": "003.jpg", "mediaType": "image/jpeg", "width": 1200, "height": 1800, "sizeBytes": 0, "size": "0 B"}
+    ]
+    # Save into DB
+    db.save_book_pages(book_id, cached_pages, len(cached_pages))
+
+    # Mock client that raises error if any network call is attempted
+    mock_client = AsyncMock()
+    mock_client.get = AsyncMock(side_effect=RuntimeError("Network call should not occur when DB has cached pages!"))
+
+    with patch.object(grimmory_client, "get_client", return_value=mock_client):
+        # Call get_book_pages_metadata
+        pages = await grimmory_client.get_book_pages_metadata(book_id, "user", "pass")
+        assert len(pages) == 3
+        assert pages[0]["width"] == 1200
+        assert mock_client.get.call_count == 0
+
+        # Call get_book_page_count
+        count = await grimmory_client.get_book_page_count(book_id, "user", "pass")
+        assert count == 3
+        assert mock_client.get.call_count == 0
+
+
+def test_sqlite_db_performance():
+    """Verify that SQLite queries complete in sub-millisecond time (<1ms per operation)."""
+    import time
+
+    # Pre-populate database with 500 books
+    books = [
+        {"id": f"bench-b-{i}", "seriesId": "bench-s-1", "libraryId": "14", "name": f"Benchmark Chapter {i}", "number": float(i), "media": {"pagesCount": 20}}
+        for i in range(500)
+    ]
+    db.save_books_batch(books)
+
+    start = time.perf_counter()
+    iterations = 500
+    for i in range(iterations):
+        b = db.get_book(f"bench-b-{i}")
+        assert b is not None
+    duration = time.perf_counter() - start
+    avg_ms = (duration / iterations) * 1000.0
+
+    # Ensure average read time is well under 1ms
+    assert avg_ms < 1.0, f"Average query time {avg_ms:.3f}ms exceeded 1ms target"
 
 
 if __name__ == "__main__":

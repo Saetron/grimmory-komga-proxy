@@ -8,5 +8,6 @@ class Settings:
     DEFAULT_USERNAME: str = os.getenv("GRIMMORY_USERNAME", "")
     DEFAULT_PASSWORD: str = os.getenv("GRIMMORY_PASSWORD", "")
     LOG_LEVEL: str = os.getenv("LOG_LEVEL", "info")
+    DATABASE_PATH: str = os.getenv("DATABASE_PATH", os.path.join(os.getenv("DATA_DIR", "data"), "bridge.db"))
 
 settings = Settings()
