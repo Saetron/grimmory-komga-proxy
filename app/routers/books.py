@@ -144,15 +144,18 @@ async def list_books(
                 "size": size
             }, default_page=page, default_size=size)
 
-        resp = await grimmory_client.komga_request("GET", f"/api/v1/series/{series_id}/books", user, pwd, params=params)
-        if resp.status_code == 200:
-            data = resp.json()
-            if "content" in data and isinstance(data["content"], list):
-                await grimmory_client.enrich_books_page_count(data["content"], user, pwd)
-                for b in data["content"]:
-                    ensure_book_dto(b)
-            return ensure_page_dto(data, default_page=page, default_size=size)
-        return ensure_page_dto({"content": []}, default_page=page, default_size=size)
+        books = await grimmory_client.get_series_books_custom(series_id, user, pwd)
+        start = page * size
+        paged_content = books[start:start + size]
+        await grimmory_client.enrich_books_page_count(paged_content, user, pwd)
+        for b in paged_content:
+            ensure_book_dto(b)
+        return ensure_page_dto({
+            "content": paged_content,
+            "totalElements": len(books),
+            "number": page,
+            "size": size
+        }, default_page=page, default_size=size)
 
     search_query = params.get("search") or params.get("searchTerm") or params.get("q") or params.get("query")
     if search_query:
@@ -193,15 +196,7 @@ async def list_books(
             "size": size
         }, default_page=page, default_size=size)
 
-    resp = await grimmory_client.komga_request("GET", "/api/v1/books", user, pwd, params=params)
-    if resp.status_code != 200:
-        raise HTTPException(status_code=resp.status_code, detail="Failed to fetch books")
-    data = resp.json()
-    if "content" in data and isinstance(data["content"], list):
-        await grimmory_client.enrich_books_page_count(data["content"], user, pwd)
-        for b in data["content"]:
-            ensure_book_dto(b)
-    return ensure_page_dto(data, default_page=page, default_size=size)
+    return ensure_page_dto({"content": []}, default_page=page, default_size=size)
 
 
 @router.post("/list")
@@ -309,18 +304,18 @@ async def list_books_post(
                 "size": size
             }, default_page=page, default_size=size)
 
-        # Grimmory ONLY returns books for a series via /series/{id}/books
-        params.pop("series_id", None)
-        params.pop("seriesId", None)
-        resp = await grimmory_client.komga_request("GET", f"/api/v1/series/{series_id}/books", user, pwd, params=params)
-        if resp.status_code == 200:
-            data = resp.json()
-            if "content" in data and isinstance(data["content"], list):
-                await grimmory_client.enrich_books_page_count(data["content"], user, pwd)
-                for b in data["content"]:
-                    ensure_book_dto(b)
-            return ensure_page_dto(data, default_page=page, default_size=size)
-        return ensure_page_dto({"content": []}, default_page=page, default_size=size)
+        books = await grimmory_client.get_series_books_custom(series_id, user, pwd)
+        start = page * size
+        paged_content = books[start:start + size]
+        await grimmory_client.enrich_books_page_count(paged_content, user, pwd)
+        for b in paged_content:
+            ensure_book_dto(b)
+        return ensure_page_dto({
+            "content": paged_content,
+            "totalElements": len(books),
+            "number": page,
+            "size": size
+        }, default_page=page, default_size=size)
 
 
     # 2. Check if filtering by read status
@@ -364,15 +359,6 @@ async def list_books_post(
             "number": page,
             "size": size
         }, default_page=page, default_size=size)
-
-    resp = await grimmory_client.komga_request("GET", "/api/v1/books", user, pwd, params=params)
-    if resp.status_code == 200:
-        data = resp.json()
-        if "content" in data and isinstance(data["content"], list):
-            await grimmory_client.enrich_books_page_count(data["content"], user, pwd)
-            for b in data["content"]:
-                ensure_book_dto(b)
-        return ensure_page_dto(data, default_page=page, default_size=size)
 
     return ensure_page_dto({"content": []}, default_page=page, default_size=size)
 
@@ -451,20 +437,11 @@ async def get_book_previous(
     current_book = await grimmory_client.get_book_dto(book_id, user, pwd)
     s_id = current_book.get("seriesId", "") if current_book else ""
 
-    if not s_id or "-u-" in s_id:
-        book = await grimmory_client.get_adjacent_book(book_id, direction="previous", user=user, pwd=pwd)
-        if not book:
-            raise HTTPException(status_code=404, detail="No previous book")
-        return ensure_book_dto(book)
-
-    try:
-        resp = await grimmory_client.komga_request("GET", f"/api/v1/books/{book_id}/previous", user, pwd)
-        if resp.status_code == 200:
-            book = resp.json()
-            await grimmory_client.enrich_book(book, user, pwd, fetch_dimensions=True)
-            return ensure_book_dto(book)
-    except Exception:
-        pass
+    # 1. Check SQLite DB first!
+    prev_book = db.get_previous_book(book_id)
+    if prev_book:
+        if await grimmory_client.user_can_access_book(prev_book, user, pwd):
+            return ensure_book_dto(prev_book)
 
     book = await grimmory_client.get_adjacent_book(book_id, direction="previous", user=user, pwd=pwd)
     if not book:
@@ -478,23 +455,11 @@ async def get_book_next(
     authorization: Optional[str] = Header(None)
 ) -> Dict[str, Any]:
     user, pwd = grimmory_client.extract_credentials(authorization)
-    current_book = await grimmory_client.get_book_dto(book_id, user, pwd)
-    s_id = current_book.get("seriesId", "") if current_book else ""
-
-    if not s_id or "-u-" in s_id:
-        book = await grimmory_client.get_adjacent_book(book_id, direction="next", user=user, pwd=pwd)
-        if not book:
-            raise HTTPException(status_code=404, detail="No next book")
-        return ensure_book_dto(book)
-
-    try:
-        resp = await grimmory_client.komga_request("GET", f"/api/v1/books/{book_id}/next", user, pwd)
-        if resp.status_code == 200:
-            book = resp.json()
-            await grimmory_client.enrich_book(book, user, pwd, fetch_dimensions=True)
-            return ensure_book_dto(book)
-    except Exception:
-        pass
+    # 1. Check SQLite DB first!
+    next_book = db.get_next_book(book_id)
+    if next_book:
+        if await grimmory_client.user_can_access_book(next_book, user, pwd):
+            return ensure_book_dto(next_book)
 
     book = await grimmory_client.get_adjacent_book(book_id, direction="next", user=user, pwd=pwd)
     if not book:
@@ -523,8 +488,10 @@ async def get_book_thumbnail(
     user, pwd = grimmory_client.extract_credentials(authorization)
     native_headers = await grimmory_client.get_native_headers(user, pwd)
 
-    # 1. Try Grimmory native book covers/thumbnails
+    # Grimmory native book covers/thumbnails
     for path in [
+        f"/api/v1/media/book/{book_id}/thumbnail",
+        f"/api/v1/media/book/{book_id}/cover",
         f"/api/v1/app/books/{book_id}/cover",
         f"/api/v1/app/books/{book_id}/thumbnail",
         f"/api/v1/books/{book_id}/cover",
@@ -546,30 +513,7 @@ async def get_book_thumbnail(
         except Exception:
             pass
 
-    try:
-        resp = await grimmory_client.komga_request("GET", f"/api/v1/books/{book_id}/thumbnail", user, pwd)
-        if resp.status_code == 200:
-            c_type = resp.headers.get("Content-Type", "image/jpeg")
-            thumbnail_cache[cache_key] = (resp.content, c_type)
-            return Response(
-                content=resp.content,
-                status_code=200,
-                headers={
-                    "Content-Type": c_type,
-                    "Cache-Control": "public, max-age=604800, immutable"
-                }
-            )
-        return Response(
-            content=resp.content,
-            status_code=resp.status_code,
-            headers={"Content-Type": resp.headers.get("Content-Type", "image/jpeg")}
-        )
-    except (httpx.TimeoutException, httpx.HTTPError) as e:
-        logger.warning(f"[Thumbnail] Timeout or network error fetching thumbnail for book {book_id}: {e}")
-        return Response(status_code=404, content=b"", media_type="image/jpeg")
-    except Exception as e:
-        logger.error(f"[Thumbnail] Error fetching thumbnail for book {book_id}: {e}")
-        return Response(status_code=404, content=b"", media_type="image/jpeg")
+    return Response(status_code=404, content=b"", media_type="image/jpeg")
 
 
 @router.get("/{book_id}/pages")
@@ -627,27 +571,6 @@ async def get_book_page(
         except Exception:
             pass
 
-    # 2. Fallback to Komga endpoint
-    try:
-        komga_resp = await grimmory_client.komga_request(
-            "GET",
-            f"/api/v1/books/{book_id}/pages/{page_number}",
-            user,
-            pwd,
-            params=params
-        )
-        if is_valid_page_image(komga_resp):
-            media_type = komga_resp.headers.get("Content-Type") or "image/jpeg"
-            if "text/" in media_type:
-                media_type = "image/jpeg"
-            return StreamingResponse(
-                content=iter([komga_resp.content]),
-                status_code=200,
-                media_type=media_type
-            )
-    except Exception:
-        pass
-
     raise HTTPException(status_code=404, detail="Page not found")
 
 
@@ -688,38 +611,24 @@ async def download_book_file(
             return False
         return True
 
-    # 1. Try Grimmory Komga layer first
-    try:
-        resp = await grimmory_client.komga_request("GET", f"/api/v1/books/{book_id}/file", user, pwd)
-        if is_valid_file_response(resp):
-            cd = resp.headers.get("Content-Disposition") or f'attachment; filename="{filename}"'
-            ct = resp.headers.get("Content-Type") or m_type
-            if "text/" in ct:
-                ct = m_type
-            return StreamingResponse(
-                iter([resp.content]),
-                status_code=200,
-                headers={
-                    "Content-Type": ct,
-                    "Content-Disposition": cd
-                }
-            )
-    except Exception:
-        pass
-
-    # 2. Try Grimmory native endpoints fallback
+    # Grimmory native endpoints for file content and downloads
     native_headers = await grimmory_client.get_native_headers(user, pwd)
+    token = await grimmory_client.get_native_token(user, pwd)
     candidate_paths = [
-        f"/api/v1/app/books/{book_id}/file",
-        f"/api/v1/books/{book_id}/file",
-        f"/api/v1/app/books/{book_id}/download",
+        f"/api/v1/books/{book_id}/content",
         f"/api/v1/books/{book_id}/download",
+        f"/api/v1/app/books/{book_id}/file",
+        f"/api/v1/app/books/{book_id}/download",
         f"/api/v1/books/{book_id}/files/primary",
         f"/api/v1/app/books/{book_id}/files/primary",
     ]
     for path in candidate_paths:
         try:
-            native_resp = await grimmory_client.client.get(path, headers=native_headers)
+            native_resp = await grimmory_client.client.get(
+                path,
+                headers=native_headers,
+                params={"token": token} if token else None
+            )
             if is_valid_file_response(native_resp):
                 cd = native_resp.headers.get("Content-Disposition") or f'attachment; filename="{filename}"'
                 ct = native_resp.headers.get("Content-Type") or m_type

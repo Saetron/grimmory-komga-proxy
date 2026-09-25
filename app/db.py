@@ -294,6 +294,52 @@ class Database:
                     pass
         return None
 
+    def get_previous_book(self, book_id: str) -> Optional[Dict[str, Any]]:
+        current = self.get_book(book_id)
+        if not current:
+            return None
+        series_id = current.get("seriesId")
+        if not series_id:
+            return None
+        try:
+            num_sort = float(current.get("metadata", {}).get("numberSort", current.get("number", 1.0)))
+        except Exception:
+            num_sort = 1.0
+        with self._get_connection() as conn:
+            row = conn.execute(
+                "SELECT dto_json FROM books WHERE series_id = ? AND number_sort < ? ORDER BY number_sort DESC, id DESC LIMIT 1",
+                (str(series_id), num_sort)
+            ).fetchone()
+            if row:
+                try:
+                    return json.loads(row["dto_json"])
+                except Exception:
+                    pass
+        return None
+
+    def get_next_book(self, book_id: str) -> Optional[Dict[str, Any]]:
+        current = self.get_book(book_id)
+        if not current:
+            return None
+        series_id = current.get("seriesId")
+        if not series_id:
+            return None
+        try:
+            num_sort = float(current.get("metadata", {}).get("numberSort", current.get("number", 1.0)))
+        except Exception:
+            num_sort = 1.0
+        with self._get_connection() as conn:
+            row = conn.execute(
+                "SELECT dto_json FROM books WHERE series_id = ? AND number_sort > ? ORDER BY number_sort ASC, id ASC LIMIT 1",
+                (str(series_id), num_sort)
+            ).fetchone()
+            if row:
+                try:
+                    return json.loads(row["dto_json"])
+                except Exception:
+                    pass
+        return None
+
     def get_books_by_series(self, series_id: str) -> List[Dict[str, Any]]:
         with self._get_connection() as conn:
             rows = conn.execute(

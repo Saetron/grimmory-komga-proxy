@@ -163,7 +163,7 @@ async def catch_all_api_v1(path: str, request: Request):
         except Exception:
             body = await request.body()
 
-    resp = await grimmory_client.komga_request(
+    resp = await grimmory_client.native_request(
         method=method,
         path=f"/api/v1/{path}",
         user=user,

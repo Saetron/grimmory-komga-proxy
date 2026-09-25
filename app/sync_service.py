@@ -96,15 +96,9 @@ class SyncService:
                     s_id = str(s.get("id"))
                     s_name = s.get("name") or s.get("metadata", {}).get("title") or s_id
                     try:
-                        if "-u-" in s_id:
-                            series_books = await grimmory_client.get_series_books_custom(s_id, user, pwd)
-                        else:
-                            resp = await grimmory_client.komga_request("GET", f"/api/v1/series/{s_id}/books?size=500", user, pwd)
-                            if resp.status_code == 200:
-                                data = resp.json()
-                                series_books = data.get("content", []) if isinstance(data, dict) else []
-                            else:
-                                series_books = []
+                        series_books = await grimmory_client.get_series_books_custom(s_id, user, pwd)
+                        if not series_books:
+                            series_books = db.get_books_by_series(s_id)
 
                         if series_books:
                             await grimmory_client.enrich_books_page_count(series_books, user, pwd)

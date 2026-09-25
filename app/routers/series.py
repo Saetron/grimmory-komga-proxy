@@ -68,17 +68,27 @@ async def list_series(
             "size": size
         }, default_page=page, default_size=size)
 
-    resp = await grimmory_client.komga_request("GET", "/api/v1/series", user, pwd, params=params)
-    if resp.status_code != 200:
-        raise HTTPException(status_code=resp.status_code, detail="Failed to fetch series")
-    data = resp.json()
-    if "content" in data and isinstance(data["content"], list):
+    all_s = await grimmory_client.get_all_series(user, pwd, library_id=library_id)
+    if all_s:
+        user_libs = await grimmory_client.get_user_library_ids(user, pwd)
+        if user_libs is not None:
+            all_s = [s for s in all_s if str(s.get("libraryId") or s.get("library_id", "")) in user_libs]
+        total = len(all_s)
+        start = page * size
+        paged_content = all_s[start:start + size]
         u = (user or "default").lower().strip()
         u_map = db.get_all_read_progress_map(u)
-        for s in data["content"]:
+        for s in paged_content:
             disambiguate_series_dto(s)
             ensure_series_dto(s, user=user, progress_map=u_map)
-    return ensure_page_dto(data, default_page=page, default_size=size)
+        return ensure_page_dto({
+            "content": paged_content,
+            "totalElements": total,
+            "number": page,
+            "size": size
+        }, default_page=page, default_size=size)
+
+    return ensure_page_dto({"content": []}, default_page=page, default_size=size)
 
 
 @router.post("/list")
@@ -168,16 +178,25 @@ async def list_series_post(
             "size": size
         }, default_page=page, default_size=size)
 
-    resp = await grimmory_client.komga_request("GET", "/api/v1/series", user, pwd, params=params)
-    if resp.status_code == 200:
-        data = resp.json()
-        if "content" in data and isinstance(data["content"], list):
-            u = (user or "default").lower().strip()
-            u_map = db.get_all_read_progress_map(u)
-            for s in data["content"]:
-                disambiguate_series_dto(s)
-                ensure_series_dto(s, user=user, progress_map=u_map)
-        return ensure_page_dto(data, default_page=page, default_size=size)
+    all_s = await grimmory_client.get_all_series(user, pwd, library_id=library_id)
+    if all_s:
+        user_libs = await grimmory_client.get_user_library_ids(user, pwd)
+        if user_libs is not None:
+            all_s = [s for s in all_s if str(s.get("libraryId") or s.get("library_id", "")) in user_libs]
+        total = len(all_s)
+        start = page * size
+        paged_content = all_s[start:start + size]
+        u = (user or "default").lower().strip()
+        u_map = db.get_all_read_progress_map(u)
+        for s in paged_content:
+            disambiguate_series_dto(s)
+            ensure_series_dto(s, user=user, progress_map=u_map)
+        return ensure_page_dto({
+            "content": paged_content,
+            "totalElements": total,
+            "number": page,
+            "size": size
+        }, default_page=page, default_size=size)
 
     return ensure_page_dto({"content": []}, default_page=page, default_size=size)
 
@@ -272,12 +291,28 @@ async def get_series(
             return ensure_series_dto(db_series, user=user)
         raise HTTPException(status_code=404, detail="Series not found")
 
-    resp = await grimmory_client.komga_request("GET", f"/api/v1/series/{series_id}", user, pwd)
-    if resp.status_code != 200:
-        raise HTTPException(status_code=resp.status_code, detail="Series not found")
-    data = resp.json()
-    disambiguate_series_dto(data)
-    return ensure_series_dto(data, user=user)
+    # Check books by series
+    series_books = db.get_books_by_series(series_id)
+    if not series_books:
+        series_books = await grimmory_client.get_series_books_custom(series_id, user, pwd)
+    if series_books:
+        first_b = series_books[0]
+        s_name = first_b.get("seriesTitle") or first_b.get("metadata", {}).get("series") or "Series"
+        lib_id = str(first_b.get("libraryId", "0"))
+        fallback_dto = {
+            "id": series_id,
+            "libraryId": lib_id,
+            "name": s_name,
+            "url": f"/api/v1/series/{series_id}",
+            "created": first_b.get("created", ""),
+            "lastModified": first_b.get("lastModified", ""),
+            "booksCount": len(series_books),
+            "oneshot": False
+        }
+        db.save_series(fallback_dto)
+        return ensure_series_dto(fallback_dto, user=user)
+
+    raise HTTPException(status_code=404, detail="Series not found")
 
 
 @router.get("/{series_id}/collections")
@@ -347,15 +382,25 @@ async def get_series_books(
             "size": size
         }, default_page=page, default_size=size)
 
-    resp = await grimmory_client.komga_request("GET", f"/api/v1/series/{series_id}/books", user, pwd, params=params)
-    if resp.status_code != 200:
-        raise HTTPException(status_code=resp.status_code, detail="Failed to fetch books for series")
-    data = resp.json()
-    if "content" in data and isinstance(data["content"], list):
-        await grimmory_client.enrich_books_page_count(data["content"], user, pwd)
-        for b in data["content"]:
+    books = await grimmory_client.get_series_books_custom(series_id, user, pwd)
+    if books:
+        user_libs = await grimmory_client.get_user_library_ids(user, pwd)
+        if user_libs is not None:
+            books = [b for b in books if str(b.get("libraryId") or b.get("library_id", "")) in user_libs]
+        total = len(books)
+        start = page * size
+        paged_content = books[start:start + size]
+        await grimmory_client.enrich_books_page_count(paged_content, user, pwd)
+        for b in paged_content:
             ensure_book_dto(b)
-    return ensure_page_dto(data, default_page=page, default_size=size)
+        return ensure_page_dto({
+            "content": paged_content,
+            "totalElements": total,
+            "number": page,
+            "size": size
+        }, default_page=page, default_size=size)
+
+    return ensure_page_dto({"content": []}, default_page=page, default_size=size)
 
 
 @router.get("/{series_id}/thumbnail")
@@ -377,99 +422,28 @@ async def get_series_thumbnail(
         )
 
     user, pwd = grimmory_client.extract_credentials(authorization)
+    native_headers = await grimmory_client.get_native_headers(user, pwd)
 
     try:
+        first_b_id = None
         # Handle virtual standalone series
         if "-standalone-" in series_id:
-            b_id = series_id.split("-standalone-")[-1]
-            b_cache_key = f"b:{b_id}"
-            if b_cache_key in thumbnail_cache:
-                cached_content, cached_type = thumbnail_cache[b_cache_key]
-                return Response(
-                    content=cached_content,
-                    status_code=200,
-                    headers={
-                        "Content-Type": cached_type,
-                        "Cache-Control": "public, max-age=604800, immutable"
-                    }
-                )
-            resp = await grimmory_client.komga_request("GET", f"/api/v1/books/{b_id}/thumbnail", user, pwd)
-            if resp.status_code == 200:
-                c_type = resp.headers.get("Content-Type", "image/jpeg")
-                thumbnail_cache[cache_key] = (resp.content, c_type)
-                thumbnail_cache[b_cache_key] = (resp.content, c_type)
-                return Response(
-                    content=resp.content,
-                    status_code=200,
-                    headers={
-                        "Content-Type": c_type,
-                        "Cache-Control": "public, max-age=604800, immutable"
-                    }
-                )
-            return Response(
-                content=resp.content,
-                status_code=resp.status_code,
-                headers={"Content-Type": resp.headers.get("Content-Type", "image/jpeg")}
-            )
-
-        # Handle custom disambiguated series: use first book's thumbnail
-        if "-u-" in series_id:
+            first_b_id = series_id.split("-standalone-")[-1]
+        elif "-u-" in series_id:
             books = await grimmory_client.get_series_books_custom(series_id, user, pwd)
             if books:
                 first_b_id = str(books[0]["id"])
-                b_cache_key = f"b:{first_b_id}"
-                if b_cache_key in thumbnail_cache:
-                    cached_content, cached_type = thumbnail_cache[b_cache_key]
-                    thumbnail_cache[cache_key] = (cached_content, cached_type)
-                    return Response(
-                        content=cached_content,
-                        status_code=200,
-                        headers={
-                            "Content-Type": cached_type,
-                            "Cache-Control": "public, max-age=604800, immutable"
-                        }
-                    )
-                # Try native cover first
-                native_headers = await grimmory_client.get_native_headers(user, pwd)
-                for path in [
-                    f"/api/v1/app/books/{first_b_id}/cover",
-                    f"/api/v1/app/books/{first_b_id}/thumbnail",
-                ]:
-                    try:
-                        b_resp = await grimmory_client.client.get(path, headers=native_headers)
-                        c_type = b_resp.headers.get("Content-Type", "")
-                        if b_resp.status_code == 200 and len(b_resp.content) > 0 and c_type.startswith("image/"):
-                            thumbnail_cache[cache_key] = (b_resp.content, c_type)
-                            thumbnail_cache[b_cache_key] = (b_resp.content, c_type)
-                            return Response(
-                                content=b_resp.content,
-                                status_code=200,
-                                headers={
-                                    "Content-Type": c_type,
-                                    "Cache-Control": "public, max-age=604800, immutable"
-                                }
-                            )
-                    except Exception:
-                        pass
+        else:
+            s_books = db.get_books_by_series(series_id)
+            if s_books:
+                first_b_id = str(s_books[0]["id"])
+            else:
+                books = await grimmory_client.get_series_books_custom(series_id, user, pwd)
+                if books:
+                    first_b_id = str(books[0]["id"])
 
-                resp = await grimmory_client.komga_request("GET", f"/api/v1/books/{first_b_id}/thumbnail", user, pwd)
-                if resp.status_code == 200:
-                    c_type = resp.headers.get("Content-Type", "image/jpeg")
-                    thumbnail_cache[cache_key] = (resp.content, c_type)
-                    thumbnail_cache[b_cache_key] = (resp.content, c_type)
-                    return Response(
-                        content=resp.content,
-                        status_code=200,
-                        headers={
-                            "Content-Type": c_type,
-                            "Cache-Control": "public, max-age=604800, immutable"
-                        }
-                    )
-
-        # Check if first book's thumbnail is available for standard series
-        s_books = db.get_books_by_series(series_id)
-        if s_books:
-            first_b_id = str(s_books[0]["id"])
+        candidate_paths = []
+        if first_b_id:
             b_cache_key = f"b:{first_b_id}"
             if b_cache_key in thumbnail_cache:
                 cached_content, cached_type = thumbnail_cache[b_cache_key]
@@ -482,24 +456,43 @@ async def get_series_thumbnail(
                         "Cache-Control": "public, max-age=604800, immutable"
                     }
                 )
+            candidate_paths.extend([
+                f"/api/v1/media/book/{first_b_id}/thumbnail",
+                f"/api/v1/media/book/{first_b_id}/cover",
+                f"/api/v1/app/books/{first_b_id}/cover",
+                f"/api/v1/app/books/{first_b_id}/thumbnail",
+                f"/api/v1/books/{first_b_id}/cover",
+                f"/api/v1/books/{first_b_id}/thumbnail",
+            ])
 
-        resp = await grimmory_client.komga_request("GET", f"/api/v1/series/{series_id}/thumbnail", user, pwd)
-        if resp.status_code == 200:
-            c_type = resp.headers.get("Content-Type", "image/jpeg")
-            thumbnail_cache[cache_key] = (resp.content, c_type)
-            return Response(
-                content=resp.content,
-                status_code=200,
-                headers={
-                    "Content-Type": c_type,
-                    "Cache-Control": "public, max-age=604800, immutable"
-                }
-            )
-        return Response(
-            content=resp.content,
-            status_code=resp.status_code,
-            headers={"Content-Type": resp.headers.get("Content-Type", "image/jpeg")}
-        )
+        candidate_paths.extend([
+            f"/api/v1/media/series/{series_id}/thumbnail",
+            f"/api/v1/media/series/{series_id}/cover",
+            f"/api/v1/app/series/{series_id}/cover",
+            f"/api/v1/app/series/{series_id}/thumbnail",
+            f"/api/v1/series/{series_id}/thumbnail",
+        ])
+
+        for path in candidate_paths:
+            try:
+                resp = await grimmory_client.client.get(path, headers=native_headers)
+                c_type = resp.headers.get("Content-Type", "")
+                if resp.status_code == 200 and len(resp.content) > 0 and c_type.startswith("image/"):
+                    thumbnail_cache[cache_key] = (resp.content, c_type)
+                    if first_b_id:
+                        thumbnail_cache[f"b:{first_b_id}"] = (resp.content, c_type)
+                    return Response(
+                        content=resp.content,
+                        status_code=200,
+                        headers={
+                            "Content-Type": c_type,
+                            "Cache-Control": "public, max-age=604800, immutable"
+                        }
+                    )
+            except Exception:
+                pass
+
+        return Response(status_code=404, content=b"", media_type="image/jpeg")
     except (httpx.TimeoutException, httpx.HTTPError) as e:
         logger.warning(f"[Thumbnail] Timeout or network error fetching thumbnail for series {series_id}: {e}")
         return Response(status_code=404, content=b"", media_type="image/jpeg")

@@ -273,23 +273,22 @@ class GrimmoryClient:
         json_data: Optional[Any] = None,
         headers: Optional[Dict[str, str]] = None
     ) -> httpx.Response:
-        """Forward request to Grimmory's /komga base path."""
-        target_path = f"/komga{path}" if not path.startswith("/komga") else path
-        req_headers = self.get_basic_auth_header(user, pwd)
-        if headers:
-            req_headers.update(headers)
-        return await self.client.request(
-            method,
-            target_path,
+        """Deprecated: Grimmory's /komga endpoint is disabled. Forward to native_request."""
+        clean_path = path[6:] if path.startswith("/komga") else path
+        return await self.native_request(
+            method=method,
+            path=clean_path,
+            user=user,
+            pwd=pwd,
             params=params,
-            json=json_data,
-            headers=req_headers
+            json_data=json_data,
+            headers=headers
         )
 
     async def get_libraries(self, user: str, pwd: str) -> List[Dict[str, Any]]:
-        """Fetch libraries via Grimmory native API or fallback."""
+        """Fetch libraries via Grimmory native API."""
         native_headers = await self.get_native_headers(user, pwd)
-        for path in ["/api/v1/app/libraries", "/api/v1/libraries"]:
+        for path in ["/api/v1/libraries", "/api/v1/app/libraries"]:
             try:
                 resp = await self.client.get(path, headers=native_headers)
                 if resp.status_code == 200:
@@ -300,15 +299,6 @@ class GrimmoryClient:
                         return data["content"]
             except Exception:
                 pass
-        # Fallback to Komga endpoint only if native failed
-        try:
-            resp = await self.komga_request("GET", "/api/v1/libraries", user, pwd)
-            if resp.status_code == 200:
-                data = resp.json()
-                if isinstance(data, list):
-                    return data
-        except Exception:
-            pass
         return []
 
     async def get_user_library_ids(self, user: str, pwd: str) -> Optional[Set[str]]:
@@ -376,6 +366,74 @@ class GrimmoryClient:
             json=json_data,
             headers=req_headers
         )
+
+    async def fetch_and_cache_native_books(
+        self,
+        user: str,
+        pwd: str,
+        library_id: Optional[str] = None
+    ) -> List[Dict[str, Any]]:
+        """Fetch all books from native Grimmory /api/v1/books and synchronize them into SQLite cache."""
+        native_headers = await self.get_native_headers(user, pwd)
+        raw_books = []
+        paths = ["/api/v1/books", "/api/v1/app/books"]
+        for p in paths:
+            try:
+                params = {"stripForListView": "false"}
+                if library_id:
+                    params["libraryId"] = str(library_id)
+                resp = await self.client.get(p, headers=native_headers, params=params)
+                if resp.status_code == 200:
+                    data = resp.json()
+                    if isinstance(data, list):
+                        raw_books = data
+                        break
+                    elif isinstance(data, dict):
+                        raw_books = data.get("content", [])
+                        break
+            except Exception:
+                pass
+
+        if not raw_books:
+            return []
+
+        all_book_dtos = []
+        series_map: Dict[str, Dict[str, Any]] = {}
+        for b in raw_books:
+            try:
+                dto = raw_app_book_to_dto(b)
+                all_book_dtos.append(dto)
+                s_id = dto.get("seriesId")
+                lib = str(dto.get("libraryId", "1"))
+                s_title = dto.get("seriesTitle") or dto.get("name")
+                if s_id and s_id not in series_map:
+                    series_map[s_id] = {
+                        "id": s_id,
+                        "libraryId": lib,
+                        "name": s_title,
+                        "url": f"/api/v1/series/{s_id}",
+                        "created": dto.get("created", ""),
+                        "lastModified": dto.get("lastModified", ""),
+                        "booksCount": 0,
+                        "oneshot": dto.get("oneshot", False),
+                        "books": []
+                    }
+                if s_id in series_map:
+                    series_map[s_id]["books"].append(dto)
+            except Exception:
+                pass
+
+        for s_id, s_info in series_map.items():
+            books = s_info.pop("books", [])
+            s_info["booksCount"] = len(books)
+            s_dto = ensure_series_dto(s_info)
+            self.register_custom_series(s_id, s_info["libraryId"], s_info["name"], s_dto)
+            db.save_series(s_dto)
+
+        if all_book_dtos:
+            db.save_books_batch(all_book_dtos)
+
+        return all_book_dtos
 
     async def get_book_pages_metadata(self, book_id: str, user: str, pwd: str) -> List[Dict[str, Any]]:
         """
@@ -497,26 +555,6 @@ class GrimmoryClient:
             except Exception:
                 pass
 
-        if not pages:
-            # 5. Try Grimmory Komga layer: /komga/api/v1/books/{book_id}/pages
-            try:
-                komga_resp = await self.komga_request("GET", f"/api/v1/books/{book_id}/pages", user, pwd)
-                if komga_resp.status_code == 200:
-                    k_data = komga_resp.json()
-                    if isinstance(k_data, list) and len(k_data) > 0:
-                        for idx, p in enumerate(k_data, start=1):
-                            num = p.get("number") or idx
-                            pages.append({
-                                "number": num,
-                                "fileName": p.get("fileName") or f"{num:03d}.jpg",
-                                "mediaType": p.get("mediaType", "image/jpeg"),
-                                "width": p.get("width", 1080),
-                                "height": p.get("height", 1920),
-                                "sizeBytes": 0,
-                                "size": "0 B"
-                            })
-            except Exception:
-                pass
 
         if not pages:
             page_count = await self.get_book_page_count(book_id, user, pwd)
@@ -658,17 +696,6 @@ class GrimmoryClient:
         except Exception:
             pass
 
-        # 6. Try Komga layer: /komga/api/v1/books/{book_id}/pages
-        try:
-            resp = await self.komga_request("GET", f"/api/v1/books/{book_id}/pages", user, pwd)
-            if resp.status_code == 200:
-                data = resp.json()
-                if isinstance(data, list) and len(data) > 0:
-                    count = len(data)
-                    page_count_cache[book_id] = count
-                    return count
-        except Exception:
-            pass
 
         # 7. Check if cached book or DB has sizeBytes and is EPUB
         if book_id in book_cache:
@@ -762,17 +789,23 @@ class GrimmoryClient:
             book_cache[b_key] = db_book
             return db_book
 
-        resp = await self.komga_request("GET", f"/api/v1/books/{book_id}", user, pwd)
-        if resp.status_code != 200:
-            return None
-        book = resp.json()
-        await self.enrich_book(book, user, pwd, fetch_dimensions=True)
-        book_cache[b_key] = book
-        try:
-            db.save_book(book)
-        except Exception:
-            pass
-        return book
+        native_headers = await self.get_native_headers(user, pwd)
+        for p in [f"/api/v1/books/{book_id}", f"/api/v1/app/books/{book_id}"]:
+            try:
+                resp = await self.client.get(p, headers=native_headers)
+                if resp.status_code == 200:
+                    raw_data = resp.json()
+                    book = raw_app_book_to_dto(raw_data)
+                    await self.enrich_book(book, user, pwd, fetch_dimensions=True)
+                    book_cache[b_key] = book
+                    try:
+                        db.save_book(book)
+                    except Exception:
+                        pass
+                    return book
+            except Exception:
+                pass
+        return None
 
     async def enrich_book(self, book: Dict[str, Any], user: str, pwd: str, fetch_dimensions: bool = False) -> None:
         """Ensure all required BookDto fields are present and optionally attach dimensions & progress."""
@@ -1119,14 +1152,9 @@ class GrimmoryClient:
         if not series_id or "-standalone-" in series_id:
             return None
 
-        if "-u-" in series_id:
+        books = db.get_books_by_series(series_id)
+        if not books:
             books = await self.get_series_books_custom(series_id, user, pwd)
-        else:
-            resp = await self.komga_request("GET", f"/api/v1/series/{series_id}/books", user, pwd, params={"size": 1000})
-            if resp.status_code != 200:
-                return None
-            data = resp.json()
-            books = data.get("content", []) if isinstance(data, dict) else data if isinstance(data, list) else []
 
         if not books:
             return None
@@ -1419,23 +1447,11 @@ class GrimmoryClient:
             else:
                 all_books = db.get_books_by_series(series_id)
                 if not all_books:
-                    try:
-                        resp = await self.komga_request("GET", f"/api/v1/series/{series_id}/books?size=500", user, pwd)
-                        if resp.status_code == 200:
-                            data = resp.json()
-                            all_books = data.get("content", []) if isinstance(data, dict) else []
-                    except Exception:
-                        pass
+                    all_books = await self.get_series_books_custom(series_id, user, pwd)
         else:
             all_books = db.get_all_books(library_id=library_id)
             if not all_books:
-                try:
-                    resp = await self.komga_request("GET", "/api/v1/books?size=500", user, pwd)
-                    if resp.status_code == 200:
-                        data = resp.json()
-                        all_books = data.get("content", []) if isinstance(data, dict) else []
-                except Exception:
-                    pass
+                all_books = await self.fetch_and_cache_native_books(user, pwd, library_id=library_id)
 
         # Verify user library permissions
         user_libs = await self.get_user_library_ids(user, pwd)
@@ -1813,17 +1829,16 @@ class GrimmoryClient:
             except Exception:
                 pass
 
-        # 3. If needed, query Grimmory Komga endpoint with releaseDate sort
+        # 3. If needed, query Grimmory native endpoint
         if not candidate_books:
             try:
-                params = {"size": 100, "sort": "metadata.releaseDate,desc"}
-                if library_id:
-                    params["library_id"] = str(library_id)
-                k_resp = await self.komga_request("GET", "/api/v1/books", user, pwd, params=params)
-                if k_resp.status_code == 200:
-                    k_data = k_resp.json()
-                    k_items = k_data.get("content", []) if isinstance(k_data, dict) else []
-                    for b in k_items:
+                native_headers = await self.get_native_headers(user, pwd)
+                resp = await self.client.get("/api/v1/books", headers=native_headers)
+                if resp.status_code == 200:
+                    raw_data = resp.json()
+                    k_items = raw_data if isinstance(raw_data, list) else raw_data.get("content", []) if isinstance(raw_data, dict) else []
+                    for raw_b in k_items:
+                        b = raw_app_book_to_dto(raw_b)
                         b_id = str(b.get("id"))
                         rd = b.get("metadata", {}).get("releaseDate")
                         if rd and str(rd).strip() not in ("", "null", "None") and b_id not in seen_ids:
@@ -1929,24 +1944,17 @@ class GrimmoryClient:
         except Exception:
             pass
 
-        # Fallback to standard /komga/api/v1/books
-        params = {"page": page, "size": size}
-        if library_id:
-            params["library_id"] = library_id
-        resp = await self.komga_request(
-            "GET",
-            "/api/v1/books",
-            user,
-            pwd,
-            params=params
-        )
-        if resp.status_code == 200:
-            data = resp.json()
-            if "content" in data and isinstance(data["content"], list):
-                await self.enrich_books_page_count(data["content"], user, pwd)
-                for b in data["content"]:
-                    ensure_book_dto(b)
-            return ensure_page_dto(data, default_page=page, default_size=size)
+        # Fallback to native /api/v1/books
+        all_b = await self.fetch_and_cache_native_books(user, pwd, library_id=library_id)
+        if all_b:
+            start = page * size
+            paged = all_b[start:start + size]
+            return ensure_page_dto({
+                "content": paged,
+                "totalElements": len(all_b),
+                "number": page,
+                "size": size
+            }, default_page=page, default_size=size)
 
         return ensure_page_dto({"content": []}, default_page=page, default_size=size)
 
@@ -1962,13 +1970,7 @@ class GrimmoryClient:
         # 1. Check SQLite DB for series first
         all_series = db.get_all_series(library_id=library_id)
         if not all_series:
-            # Fetch series from Grimmory
-            params = {"size": 500}
-            if library_id:
-                params["library_id"] = str(library_id)
-            resp = await self.komga_request("GET", "/api/v1/series", user, pwd, params=params)
-            if resp.status_code == 200:
-                all_series = resp.json().get("content", []) if isinstance(resp.json(), dict) else []
+            all_series = await self.get_all_series(user, pwd, library_id=library_id)
 
         user_libs = await self.get_user_library_ids(user, pwd)
         if user_libs is not None:
@@ -1984,7 +1986,7 @@ class GrimmoryClient:
         if not recent_series_names:
             native_headers = await self.get_native_headers(user, pwd)
             try:
-                resp = await self.client.get("/api/v1/app/books/recently-added", params={"size": 100}, headers=native_headers, timeout=5.0)
+                resp = await self.get_client().get("/api/v1/app/books/recently-added", params={"size": 100}, headers=native_headers, timeout=5.0)
                 if resp.status_code == 200:
                     raw = resp.json()
                     raw_books = raw.get("content", []) if isinstance(raw, dict) else raw if isinstance(raw, list) else []
@@ -2028,35 +2030,17 @@ class GrimmoryClient:
         pwd: str,
         library_id: Optional[str] = None
     ) -> List[Dict[str, Any]]:
-        """Fetch all series (from Komga layer + custom disambiguated series) with caching."""
+        """Fetch all series (from SQLite DB or native Grimmory books) with caching."""
         cache_key = f"{user}:{library_id or 'all'}"
         if cache_key in self.all_series_cache:
             return list(self.all_series_cache[cache_key])
 
-        params = {"size": 500}
-        if library_id:
-            params["library_id"] = str(library_id)
+        cached = db.get_all_series(library_id=library_id)
+        if not cached:
+            await self.fetch_and_cache_native_books(user, pwd, library_id=library_id)
+            cached = db.get_all_series(library_id=library_id)
 
-        all_series = []
-        page_idx = 0
-        while True:
-            params["page"] = page_idx
-            resp = await self.komga_request("GET", "/api/v1/series", user, pwd, params=params)
-            if resp.status_code != 200:
-                break
-            data = resp.json()
-            items = data.get("content", []) if isinstance(data, dict) else []
-            if not items:
-                break
-            for s in items:
-                disambiguate_series_dto(s)
-                ensure_series_dto(s, compute_read_counts=False)
-                all_series.append(s)
-
-            total_pages = data.get("totalPages", 1) if isinstance(data, dict) else 1
-            page_idx += 1
-            if page_idx >= total_pages or page_idx >= 10:
-                break
+        all_series = list(cached) if cached else []
 
         # Also merge custom_series that match the library_id
         for s_id, custom_info in self.custom_series.items():
@@ -2065,16 +2049,11 @@ class GrimmoryClient:
                 if s_dto and not any(existing.get("id") == s_id for existing in all_series):
                     all_series.append(s_dto)
 
-        self.all_series_cache[cache_key] = all_series
-        try:
-            db.save_series_batch(all_series)
-        except Exception:
-            pass
-
         user_libs = await self.get_user_library_ids(user, pwd)
         if user_libs is not None:
             all_series = [s for s in all_series if str(s.get("libraryId") or s.get("library_id", "")) in user_libs]
 
+        self.all_series_cache[cache_key] = all_series
         return all_series
 
     async def search_series(
@@ -2208,16 +2187,17 @@ class GrimmoryClient:
         """Populate custom_series cache for a library if missing."""
         if unique_id in self.custom_series:
             return
+        db_s = db.get_series(unique_id)
+        if db_s:
+            s_name = db_s.get("name") or db_s.get("metadata", {}).get("title") or ""
+            lib_id = str(db_s.get("libraryId", "1"))
+            self.register_custom_series(unique_id, lib_id, s_name, db_s)
+            return
         if "-u-" not in unique_id:
             return
         lib_id = unique_id.split("-u-")[0]
         try:
-            from app.dto_utils import disambiguate_series_dto
-            # Fetch series for this library (up to 500) to populate disambiguated mappings
-            resp = await self.komga_request("GET", f"/api/v1/series?library_id={lib_id}&size=500", user, pwd)
-            if resp.status_code == 200:
-                for s in resp.json().get("content", []):
-                    disambiguate_series_dto(s)
+            await self.get_all_series(user, pwd, library_id=lib_id)
         except Exception:
             pass
 
@@ -2237,8 +2217,14 @@ class GrimmoryClient:
             self.custom_series_books_cache[unique_id] = db_books
             return db_books
 
-        if unique_id not in self.custom_series and "-u-" in unique_id:
-            await self.ensure_custom_series_loaded(unique_id, user, pwd)
+        if unique_id not in self.custom_series:
+            db_s = db.get_series(unique_id)
+            if db_s:
+                s_name = db_s.get("name") or db_s.get("metadata", {}).get("title") or ""
+                lib_id = str(db_s.get("libraryId", "1"))
+                self.register_custom_series(unique_id, lib_id, s_name, db_s)
+            else:
+                await self.ensure_custom_series_loaded(unique_id, user, pwd)
 
         info = self.custom_series.get(unique_id)
         if not info:
@@ -2348,31 +2334,30 @@ class GrimmoryClient:
         except Exception:
             pass
 
-        # 4. Fallback: filter Grimmory Komga books by seriesTitle == s_name
+        # 4. Fallback: filter Grimmory native books by seriesTitle == s_name
         try:
-            resp = await self.komga_request("GET", f"/api/v1/books?library_id={lib_id}&size=1000", user, pwd)
-            if resp.status_code == 200:
-                data = resp.json()
-                all_komga_books = data.get("content", []) if isinstance(data, dict) else []
-                matched = [b for b in all_komga_books if b.get("seriesTitle") == s_name]
-                if matched:
-                    for b in matched:
-                        b["seriesId"] = unique_id
-                        ensure_book_dto(b)
-                    matched.sort(key=lambda x: x.get("metadata", {}).get("numberSort", 1.0))
-                    self.custom_series_books_cache[unique_id] = matched
-                    try:
-                        db.save_books_batch(matched)
-                    except Exception:
-                        pass
-                    if unique_id in self.custom_series:
-                        self.custom_series[unique_id]["dto"]["booksCount"] = len(matched)
-                        self.custom_series[unique_id]["dto"].setdefault("metadata", {})["totalBookCount"] = len(matched)
+            for path in ["/api/v1/books", f"/api/v1/app/books?libraryId={lib_id}"]:
+                resp = await self.client.get(path, headers=native_headers)
+                if resp.status_code == 200:
+                    data = resp.json()
+                    all_raw = data if isinstance(data, list) else data.get("content", []) if isinstance(data, dict) else []
+                    matched = [b for b in all_raw if b.get("seriesName") == s_name or b.get("title") == s_name]
+                    if matched:
+                        dtos = [raw_app_book_to_dto(b, series_id_override=unique_id) for b in matched if b.get("id")]
+                        dtos.sort(key=lambda x: x.get("metadata", {}).get("numberSort", 1.0))
+                        self.custom_series_books_cache[unique_id] = dtos
                         try:
-                            db.save_series(self.custom_series[unique_id]["dto"])
+                            db.save_books_batch(dtos)
                         except Exception:
                             pass
-                    return matched
+                        if unique_id in self.custom_series:
+                            self.custom_series[unique_id]["dto"]["booksCount"] = len(dtos)
+                            self.custom_series[unique_id]["dto"].setdefault("metadata", {})["totalBookCount"] = len(dtos)
+                            try:
+                                db.save_series(self.custom_series[unique_id]["dto"])
+                            except Exception:
+                                pass
+                        return dtos
         except Exception:
             pass
 

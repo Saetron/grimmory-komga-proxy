@@ -459,25 +459,24 @@ def raw_app_book_to_dto(raw: Dict[str, Any], series_id_override: Optional[str] =
         "oneshot": is_standalone
     }
 
-    if is_standalone:
-        try:
-            from app.grimmory_client import grimmory_client
-            if series_id not in grimmory_client.custom_series:
-                s_dto = {
-                    "id": series_id,
-                    "libraryId": lib_id,
-                    "name": series_name,
-                    "url": f"/api/v1/series/{series_id}",
-                    "created": added_on,
-                    "lastModified": raw.get("coverUpdatedOn") or added_on,
-                    "booksCount": 1,
-                    "oneshot": True
-                }
-                grimmory_client.register_custom_series(series_id, lib_id, series_name, s_dto)
-                from app.db import db
-                db.save_series(s_dto)
-        except Exception:
-            pass
+    try:
+        from app.grimmory_client import grimmory_client
+        if series_id not in grimmory_client.custom_series:
+            s_dto = {
+                "id": series_id,
+                "libraryId": lib_id,
+                "name": series_name,
+                "url": f"/api/v1/series/{series_id}",
+                "created": added_on,
+                "lastModified": raw.get("coverUpdatedOn") or added_on,
+                "booksCount": 1,
+                "oneshot": is_standalone
+            }
+            grimmory_client.register_custom_series(series_id, lib_id, series_name, s_dto)
+            from app.db import db
+            db.save_series(s_dto)
+    except Exception:
+        pass
 
     return ensure_book_dto(dto)
 

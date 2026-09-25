@@ -32,27 +32,23 @@ async def get_current_user(authorization: Optional[str] = Header(None)) -> Dict[
 
     token = await grimmory_client.get_native_token(user, pwd)
     if not token:
-        # Fallback check
-        resp = await grimmory_client.komga_request("GET", "/api/v2/users/me", user, pwd)
-        if resp.status_code != 200:
-            raise HTTPException(
-                status_code=status.HTTP_401_UNAUTHORIZED,
-                detail="Invalid credentials",
-                headers={"WWW-Authenticate": "Basic realm=\"Komga\""}
-            )
-        data = resp.json()
-    else:
-        data = {
-            "id": user,
-            "email": f"{user}@grimmory.local" if "@" not in user else user,
-            "roles": ["ROLE_ADMIN", "ROLE_FILE_DOWNLOAD", "ROLE_PAGE_STREAMING", "USER", "ADMIN", "FILE_DOWNLOAD", "PAGE_STREAMING"],
-            "sharedAllLibraries": True,
-            "sharedLibrariesIds": [],
-            "sharedLibrariesExcludedIds": [],
-            "labelsAllow": [],
-            "labelsExclude": [],
-            "ageRestriction": None
-        }
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid credentials",
+            headers={"WWW-Authenticate": "Basic realm=\"Komga\""}
+        )
+
+    data = {
+        "id": user,
+        "email": f"{user}@grimmory.local" if "@" not in user else user,
+        "roles": ["ROLE_ADMIN", "ROLE_FILE_DOWNLOAD", "ROLE_PAGE_STREAMING", "USER", "ADMIN", "FILE_DOWNLOAD", "PAGE_STREAMING"],
+        "sharedAllLibraries": True,
+        "sharedLibrariesIds": [],
+        "sharedLibrariesExcludedIds": [],
+        "labelsAllow": [],
+        "labelsExclude": [],
+        "ageRestriction": None
+    }
 
     try:
         from app.sync_service import sync_service

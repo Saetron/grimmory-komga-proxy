@@ -16,11 +16,37 @@ async def get_collections(
 ) -> Dict[str, Any]:
     user, pwd = grimmory_client.extract_credentials(authorization)
     params = dict(request.query_params)
-    resp = await grimmory_client.komga_request("GET", "/api/v1/collections", user, pwd, params=params)
-    if resp.status_code == 200:
-        data = resp.json()
-        return ensure_page_dto(data)
-    return ensure_page_dto({"content": []})
+    page = int(params.get("page", 0))
+    size = int(params.get("size", 20))
+    native_headers = await grimmory_client.get_native_headers(user, pwd)
+    try:
+        resp = await grimmory_client.client.get("/api/v1/shelves", headers=native_headers)
+        if resp.status_code == 200:
+            data = resp.json()
+            raw_shelves = data.get("content", []) if isinstance(data, dict) else data if isinstance(data, list) else []
+            collections = []
+            for s in raw_shelves:
+                s_id = str(s.get("id"))
+                collections.append({
+                    "id": s_id,
+                    "name": s.get("name", f"Shelf {s_id}"),
+                    "ordered": False,
+                    "seriesIds": [str(x) for x in s.get("seriesIds", [])],
+                    "createdDate": s.get("createdAt", "2026-09-23T00:00:00Z"),
+                    "lastModifiedDate": s.get("updatedAt", "2026-09-23T00:00:00Z"),
+                    "filtered": False
+                })
+            start = page * size
+            paged = collections[start:start + size]
+            return ensure_page_dto({
+                "content": paged,
+                "totalElements": len(collections),
+                "number": page,
+                "size": size
+            }, default_page=page, default_size=size)
+    except Exception:
+        pass
+    return ensure_page_dto({"content": []}, default_page=page, default_size=size)
 
 @router.get("/api/v1/authors")
 @router.get("/api/v1/authors/names")
