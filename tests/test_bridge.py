@@ -2425,6 +2425,112 @@ def test_debug_logs_endpoints():
     assert resp_empty.json()["total"] == 0
 
 
+def test_download_book_file_prioritizes_komga_and_rejects_html():
+    """Verify that download_book_file prioritizes Komga, rejects HTML SPA fallbacks, and streams binary."""
+    book = {
+        "id": "html-test-1",
+        "name": "Murtagh",
+        "libraryId": "15",
+        "media": {"mediaType": "application/epub+zip", "pagesCount": 100}
+    }
+    db.save_book(book)
+
+    fake_html = b"<!doctype html><html><body>Angular SPA</body></html>"
+    fake_epub = b"PK\x03\x04valid-epub-binary-data"
+
+    # Case A: Komga returns HTML fallback, native returns valid epub -> Should skip HTML and return valid epub
+    async def mock_native_get(url, **kwargs):
+        if "/books/html-test-1/file" in url:
+            return httpx.Response(200, content=fake_epub, headers={"Content-Type": "application/epub+zip"})
+        return httpx.Response(200, content=fake_html, headers={"Content-Type": "text/html"})
+
+    mock_client = AsyncMock()
+    mock_client.get = AsyncMock(side_effect=mock_native_get)
+
+    with patch.object(grimmory_client, "komga_request", new_callable=AsyncMock) as mock_komga, \
+         patch.object(grimmory_client, "get_client", return_value=mock_client), \
+         patch.object(grimmory_client, "get_native_token", new_callable=AsyncMock, return_value="dummy-token"):
+
+        # Komga returns 200 with text/html
+        mock_komga.return_value = httpx.Response(200, content=fake_html, headers={"Content-Type": "text/html"})
+
+        resp = client.get("/api/v1/books/html-test-1/file", headers=AUTH_HEADER)
+        assert resp.status_code == 200
+        assert resp.content == fake_epub
+        assert resp.headers["Content-Type"] == "application/epub+zip"
+        assert "Murtagh.epub" in resp.headers["Content-Disposition"]
+
+    # Case B: Both Komga and native return HTML fallback -> Should 404 rather than serve HTML as epub
+    with patch.object(grimmory_client, "komga_request", new_callable=AsyncMock) as mock_komga, \
+         patch.object(grimmory_client, "get_client", return_value=mock_client), \
+         patch.object(grimmory_client, "get_native_token", new_callable=AsyncMock, return_value="dummy-token"):
+
+        mock_komga.return_value = httpx.Response(200, content=fake_html, headers={"Content-Type": "text/html"})
+        mock_client.get = AsyncMock(return_value=httpx.Response(200, content=fake_html, headers={"Content-Type": "text/html"}))
+
+        resp_fail = client.get("/api/v1/books/html-test-1/file", headers=AUTH_HEADER)
+        assert resp_fail.status_code == 404
+
+
+def test_get_current_user_populates_shared_libraries():
+    """Verify that /api/v2/users/me populates sharedLibrariesIds with all available libraries."""
+    fake_libraries = [
+        {"id": 14, "name": "Audiobook"},
+        {"id": 15, "name": "Book"},
+        {"id": 17, "name": "Comic"},
+    ]
+
+    with patch.object(grimmory_client, "get_native_token", new_callable=AsyncMock, return_value="fake-token"), \
+         patch.object(grimmory_client, "get_libraries", new_callable=AsyncMock, return_value=fake_libraries):
+
+        resp = client.get("/api/v2/users/me", headers=AUTH_HEADER)
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["sharedAllLibraries"] is True
+        assert "sharedLibrariesIds" in data
+        assert sorted(data["sharedLibrariesIds"]) == ["14", "15", "17"]
+
+
+def test_book_pagination_and_sorting_deterministic():
+    """Verify that multiple pages do not produce overlapping/duplicate books due to tie-breakers."""
+    # Create 10 books with identical numberSort = 1.0 in library 99
+    for i in range(10):
+        db.save_book({
+            "id": f"sort-book-{i:02d}",
+            "name": f"Book Title {i:02d}",
+            "libraryId": "99",
+            "metadata": {"numberSort": 1.0, "titleSort": f"Book Title {i:02d}"},
+            "media": {"pagesCount": 100}
+        })
+
+    with patch.object(grimmory_client, "get_user_library_ids", new_callable=AsyncMock, return_value={"99"}):
+        # Fetch page 0 with size 5
+        resp0 = client.get("/api/v1/books?library_id=99&page=0&size=5&sort=metadata.titleSort,asc", headers=AUTH_HEADER)
+        assert resp0.status_code == 200
+        p0_ids = [b["id"] for b in resp0.json()["content"]]
+        assert len(p0_ids) == 5
+
+        # Fetch page 1 with size 5
+        resp1 = client.get("/api/v1/books?library_id=99&page=1&size=5&sort=metadata.titleSort,asc", headers=AUTH_HEADER)
+        assert resp1.status_code == 200
+        p1_ids = [b["id"] for b in resp1.json()["content"]]
+        assert len(p1_ids) == 5
+
+        # No duplicate books between pages
+        assert set(p0_ids).isdisjoint(set(p1_ids))
+        assert p0_ids + p1_ids == [f"sort-book-{i:02d}" for i in range(10)]
+
+        # POST /api/v1/books/list also sorted deterministically
+        resp_post = client.post(
+            "/api/v1/books/list?page=0&size=5&sort=metadata.titleSort,desc",
+            json={"condition": {"allOf": [{"libraryId": {"operator": "is", "value": "99"}}]}},
+            headers=AUTH_HEADER
+        )
+        assert resp_post.status_code == 200
+        post_ids = [b["id"] for b in resp_post.json()["content"]]
+        assert post_ids == [f"sort-book-{i:02d}" for i in reversed(range(5, 10))]
+
+
 if __name__ == "__main__":
     pytest.main(["-v", __file__])
 

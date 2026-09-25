@@ -59,14 +59,19 @@ async def get_current_user(authorization: Optional[str] = Header(None)) -> Dict[
         sync_service.maybe_trigger_sync_on_login(user, pwd)
     except Exception:
         pass
-    # Ensure full Komga UserDto roles and permissions
     roles = data.get("roles", [])
     for standard_role in ["USER", "FILE_DOWNLOAD", "PAGE_STREAMING", "ADMIN"]:
         if standard_role not in roles:
             roles.append(standard_role)
     data["roles"] = roles
     data.setdefault("sharedAllLibraries", True)
-    data.setdefault("sharedLibrariesIds", [])
+
+    user_libs = await grimmory_client.get_user_library_ids(user, pwd)
+    if user_libs:
+        data["sharedLibrariesIds"] = sorted(list(user_libs))
+    else:
+        data.setdefault("sharedLibrariesIds", [])
+
     data.setdefault("labelsAllow", [])
     data.setdefault("labelsExclude", [])
     return data

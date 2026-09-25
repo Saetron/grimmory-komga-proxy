@@ -11,6 +11,69 @@ logger = logging.getLogger("grimmory-komga-bridge")
 
 router = APIRouter(prefix="/api/v1/books", tags=["Books"])
 
+
+def sort_book_dtos(books: List[Dict[str, Any]], sort: str = "") -> List[Dict[str, Any]]:
+    """Sort a list of book DTOs deterministically with id tie-breaker."""
+    if not books:
+        return books
+
+    sort_lower = (sort or "").lower()
+    reverse = "desc" in sort_lower
+
+    if "titlesort" in sort_lower or "name" in sort_lower or "title" in sort_lower:
+        books.sort(
+            key=lambda b: (
+                str(b.get("metadata", {}).get("titleSort") or b.get("name") or "").lower(),
+                float(b.get("metadata", {}).get("numberSort", 1.0)),
+                str(b.get("id", ""))
+            ),
+            reverse=reverse
+        )
+    elif "numbersort" in sort_lower or "number" in sort_lower:
+        books.sort(
+            key=lambda b: (
+                float(b.get("metadata", {}).get("numberSort", b.get("number", 1.0))),
+                str(b.get("metadata", {}).get("titleSort") or b.get("name") or "").lower(),
+                str(b.get("id", ""))
+            ),
+            reverse=reverse
+        )
+    elif "readdate" in sort_lower or "readprogress" in sort_lower:
+        books.sort(
+            key=lambda b: (
+                str((b.get("readProgress") or {}).get("readDate") or ""),
+                str(b.get("id", ""))
+            ),
+            reverse=reverse
+        )
+    elif "releasedate" in sort_lower:
+        books.sort(
+            key=lambda b: (
+                str(b.get("metadata", {}).get("releaseDate") or ""),
+                str(b.get("id", ""))
+            ),
+            reverse=reverse
+        )
+    elif any(k in sort_lower for k in ["createddate", "created", "lastmodified", "added"]):
+        books.sort(
+            key=lambda b: (
+                str(b.get("created") or b.get("lastModified") or ""),
+                str(b.get("id", ""))
+            ),
+            reverse=reverse
+        )
+    else:
+        # Default deterministic sort: titleSort ASC, numberSort ASC, id ASC
+        books.sort(
+            key=lambda b: (
+                str(b.get("metadata", {}).get("titleSort") or b.get("name") or "").lower(),
+                float(b.get("metadata", {}).get("numberSort", 1.0)),
+                str(b.get("id", ""))
+            ),
+            reverse=reverse
+        )
+    return books
+
 @router.get("")
 async def list_books(
     request: Request,
@@ -66,6 +129,8 @@ async def list_books(
             user_libs = await grimmory_client.get_user_library_ids(user, pwd)
             if user_libs is not None:
                 db_books = [b for b in db_books if str(b.get("libraryId") or b.get("library_id", "")) in user_libs]
+            if sort:
+                db_books = sort_book_dtos(db_books, sort)
             total = len(db_books)
             start = page * size
             paged_content = db_books[start:start + size]
@@ -114,6 +179,7 @@ async def list_books(
         user_libs = await grimmory_client.get_user_library_ids(user, pwd)
         if user_libs is not None:
             db_books = [b for b in db_books if str(b.get("libraryId") or b.get("library_id", "")) in user_libs]
+        db_books = sort_book_dtos(db_books, sort)
         total = len(db_books)
         start = page * size
         paged_content = db_books[start:start + size]
@@ -227,6 +293,9 @@ async def list_books_post(
             user_libs = await grimmory_client.get_user_library_ids(user, pwd)
             if user_libs is not None:
                 db_books = [b for b in db_books if str(b.get("libraryId") or b.get("library_id", "")) in user_libs]
+            effective_sort = sort or str(body.get("sort", ""))
+            if effective_sort:
+                db_books = sort_book_dtos(db_books, effective_sort)
             total = len(db_books)
             start = page * size
             paged_content = db_books[start:start + size]
@@ -281,6 +350,8 @@ async def list_books_post(
         user_libs = await grimmory_client.get_user_library_ids(user, pwd)
         if user_libs is not None:
             db_books = [b for b in db_books if str(b.get("libraryId") or b.get("library_id", "")) in user_libs]
+        effective_sort = sort or str(body.get("sort", ""))
+        db_books = sort_book_dtos(db_books, effective_sort)
         total = len(db_books)
         start = page * size
         paged_content = db_books[start:start + size]
@@ -521,6 +592,17 @@ async def get_book_page(
     user, pwd = grimmory_client.extract_credentials(authorization)
     params = dict(request.query_params)
 
+    def is_valid_page_image(resp: httpx.Response) -> bool:
+        if resp.status_code != 200 or len(resp.content) == 0:
+            return False
+        ct = resp.headers.get("Content-Type", "").lower()
+        if "text/html" in ct or "text/plain" in ct:
+            return False
+        prefix = resp.content[:100].lower()
+        if b"<html" in prefix or b"<!doctype html" in prefix:
+            return False
+        return True
+
     # 1. Try Grimmory native page image endpoints
     native_headers = await grimmory_client.get_native_headers(user, pwd)
     for path in [
@@ -533,11 +615,14 @@ async def get_book_page(
     ]:
         try:
             native_resp = await grimmory_client.client.get(path, headers=native_headers)
-            if native_resp.status_code == 200:
+            if is_valid_page_image(native_resp):
+                media_type = native_resp.headers.get("Content-Type") or "image/jpeg"
+                if "text/" in media_type:
+                    media_type = "image/jpeg"
                 return StreamingResponse(
                     content=iter([native_resp.content]),
                     status_code=200,
-                    media_type=native_resp.headers.get("Content-Type", "image/jpeg")
+                    media_type=media_type
                 )
         except Exception:
             pass
@@ -551,11 +636,14 @@ async def get_book_page(
             pwd,
             params=params
         )
-        if komga_resp.status_code == 200:
+        if is_valid_page_image(komga_resp):
+            media_type = komga_resp.headers.get("Content-Type") or "image/jpeg"
+            if "text/" in media_type:
+                media_type = "image/jpeg"
             return StreamingResponse(
                 content=iter([komga_resp.content]),
                 status_code=200,
-                media_type=komga_resp.headers.get("Content-Type", "image/jpeg")
+                media_type=media_type
             )
     except Exception:
         pass
@@ -589,39 +677,25 @@ async def download_book_file(
     safe_name = "".join(c for c in name if c.isalnum() or c in (" ", "-", "_", ".")).strip() or f"book-{book_id}"
     filename = safe_name if safe_name.lower().endswith(f".{ext}") else f"{safe_name}.{ext}"
 
-    # 1. Try Grimmory native endpoints first
-    native_headers = await grimmory_client.get_native_headers(user, pwd)
-    candidate_paths = [
-        f"/api/v1/app/books/{book_id}/file",
-        f"/api/v1/app/books/{book_id}/download",
-        f"/api/v1/books/{book_id}/file",
-        f"/api/v1/books/{book_id}/download",
-        f"/api/v1/books/{book_id}/files/primary",
-        f"/api/v1/app/books/{book_id}/files/primary",
-    ]
-    for path in candidate_paths:
-        try:
-            native_resp = await grimmory_client.client.get(path, headers=native_headers)
-            if native_resp.status_code == 200 and len(native_resp.content) > 0:
-                cd = native_resp.headers.get("Content-Disposition") or f'attachment; filename="{filename}"'
-                ct = native_resp.headers.get("Content-Type") or m_type
-                return StreamingResponse(
-                    iter([native_resp.content]),
-                    status_code=200,
-                    headers={
-                        "Content-Type": ct,
-                        "Content-Disposition": cd
-                    }
-                )
-        except Exception:
-            pass
+    def is_valid_file_response(resp: httpx.Response) -> bool:
+        if resp.status_code != 200 or len(resp.content) == 0:
+            return False
+        ct = resp.headers.get("Content-Type", "").lower()
+        if "text/html" in ct:
+            return False
+        prefix = resp.content[:200].lower()
+        if b"<html" in prefix or b"<!doctype html" in prefix:
+            return False
+        return True
 
-    # 2. Try Grimmory Komga layer fallback
+    # 1. Try Grimmory Komga layer first
     try:
         resp = await grimmory_client.komga_request("GET", f"/api/v1/books/{book_id}/file", user, pwd)
-        if resp.status_code == 200:
+        if is_valid_file_response(resp):
             cd = resp.headers.get("Content-Disposition") or f'attachment; filename="{filename}"'
             ct = resp.headers.get("Content-Type") or m_type
+            if "text/" in ct:
+                ct = m_type
             return StreamingResponse(
                 iter([resp.content]),
                 status_code=200,
@@ -632,6 +706,35 @@ async def download_book_file(
             )
     except Exception:
         pass
+
+    # 2. Try Grimmory native endpoints fallback
+    native_headers = await grimmory_client.get_native_headers(user, pwd)
+    candidate_paths = [
+        f"/api/v1/app/books/{book_id}/file",
+        f"/api/v1/books/{book_id}/file",
+        f"/api/v1/app/books/{book_id}/download",
+        f"/api/v1/books/{book_id}/download",
+        f"/api/v1/books/{book_id}/files/primary",
+        f"/api/v1/app/books/{book_id}/files/primary",
+    ]
+    for path in candidate_paths:
+        try:
+            native_resp = await grimmory_client.client.get(path, headers=native_headers)
+            if is_valid_file_response(native_resp):
+                cd = native_resp.headers.get("Content-Disposition") or f'attachment; filename="{filename}"'
+                ct = native_resp.headers.get("Content-Type") or m_type
+                if "text/" in ct:
+                    ct = m_type
+                return StreamingResponse(
+                    iter([native_resp.content]),
+                    status_code=200,
+                    headers={
+                        "Content-Type": ct,
+                        "Content-Disposition": cd
+                    }
+                )
+        except Exception:
+            pass
 
     raise HTTPException(status_code=404, detail="Failed to download book file")
 
