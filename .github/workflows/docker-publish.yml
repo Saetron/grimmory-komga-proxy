@@ -65,7 +65,7 @@ jobs:
         id: meta
         uses: docker/metadata-action@v5
         with:
-          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          images: ${{ env.REGISTRY }}/saetron/grimmory-komga-proxy
           tags: |
             type=raw,value=latest,enable={{is_default_branch}}
             type=ref,event=branch
@@ -84,12 +84,3 @@ jobs:
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
-      - name: Prune old container versions
-        if: github.event_name != 'pull_request'
-        uses: actions/delete-package-versions@v5
-        with:
-          package-name: 'grimmory-komga-proxy'
-          package-type: 'container'
-          min-versions-to-keep: 3
-          delete-only-untagged-versions: 'false'
-        continue-on-error: true
