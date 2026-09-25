@@ -450,6 +450,31 @@ async def get_book_thumbnail(
         )
 
     user, pwd = grimmory_client.extract_credentials(authorization)
+    native_headers = await grimmory_client.get_native_headers(user, pwd)
+
+    # 1. Try Grimmory native book covers/thumbnails
+    for path in [
+        f"/api/v1/app/books/{book_id}/cover",
+        f"/api/v1/app/books/{book_id}/thumbnail",
+        f"/api/v1/books/{book_id}/cover",
+        f"/api/v1/books/{book_id}/thumbnail",
+    ]:
+        try:
+            resp = await grimmory_client.client.get(path, headers=native_headers)
+            c_type = resp.headers.get("Content-Type", "")
+            if resp.status_code == 200 and len(resp.content) > 0 and c_type.startswith("image/"):
+                thumbnail_cache[cache_key] = (resp.content, c_type)
+                return Response(
+                    content=resp.content,
+                    status_code=200,
+                    headers={
+                        "Content-Type": c_type,
+                        "Cache-Control": "public, max-age=604800, immutable"
+                    }
+                )
+        except Exception:
+            pass
+
     try:
         resp = await grimmory_client.komga_request("GET", f"/api/v1/books/{book_id}/thumbnail", user, pwd)
         if resp.status_code == 200:
@@ -495,7 +520,29 @@ async def get_book_page(
 ) -> StreamingResponse:
     user, pwd = grimmory_client.extract_credentials(authorization)
     params = dict(request.query_params)
-    
+
+    # 1. Try Grimmory native page image endpoints
+    native_headers = await grimmory_client.get_native_headers(user, pwd)
+    for path in [
+        f"/api/v1/cbx/{book_id}/page/{page_number}",
+        f"/api/v1/cbx/{book_id}/pages/{page_number}",
+        f"/api/v1/media/book/{book_id}/cbx/pages/{page_number}",
+        f"/api/v1/pdf/{book_id}/page/{page_number}",
+        f"/api/v1/pdf/{book_id}/pages/{page_number}",
+        f"/api/v1/app/books/{book_id}/pages/{page_number}"
+    ]:
+        try:
+            native_resp = await grimmory_client.client.get(path, headers=native_headers)
+            if native_resp.status_code == 200:
+                return StreamingResponse(
+                    content=iter([native_resp.content]),
+                    status_code=200,
+                    media_type=native_resp.headers.get("Content-Type", "image/jpeg")
+                )
+        except Exception:
+            pass
+
+    # 2. Fallback to Komga endpoint
     try:
         komga_resp = await grimmory_client.komga_request(
             "GET",
@@ -512,24 +559,6 @@ async def get_book_page(
             )
     except Exception:
         pass
-
-    # Fallback to Grimmory native page image endpoints
-    native_headers = await grimmory_client.get_native_headers(user, pwd)
-    for path in [
-        f"/api/v1/media/book/{book_id}/cbx/pages/{page_number}",
-        f"/api/v1/cbx/{book_id}/pages/{page_number}",
-        f"/api/v1/pdf/{book_id}/pages/{page_number}"
-    ]:
-        try:
-            native_resp = await grimmory_client.client.get(path, headers=native_headers)
-            if native_resp.status_code == 200:
-                return StreamingResponse(
-                    content=iter([native_resp.content]),
-                    status_code=200,
-                    media_type=native_resp.headers.get("Content-Type", "image/jpeg")
-                )
-        except Exception:
-            pass
 
     raise HTTPException(status_code=404, detail="Page not found")
 
@@ -560,21 +589,7 @@ async def download_book_file(
     safe_name = "".join(c for c in name if c.isalnum() or c in (" ", "-", "_", ".")).strip() or f"book-{book_id}"
     filename = safe_name if safe_name.lower().endswith(f".{ext}") else f"{safe_name}.{ext}"
 
-    # 1. Try Grimmory Komga layer
-    resp = await grimmory_client.komga_request("GET", f"/api/v1/books/{book_id}/file", user, pwd)
-    if resp.status_code == 200:
-        cd = resp.headers.get("Content-Disposition") or f'attachment; filename="{filename}"'
-        ct = resp.headers.get("Content-Type") or m_type
-        return StreamingResponse(
-            iter([resp.content]),
-            status_code=200,
-            headers={
-                "Content-Type": ct,
-                "Content-Disposition": cd
-            }
-        )
-
-    # 2. Try Grimmory native endpoints
+    # 1. Try Grimmory native endpoints first
     native_headers = await grimmory_client.get_native_headers(user, pwd)
     candidate_paths = [
         f"/api/v1/app/books/{book_id}/file",
@@ -601,7 +616,24 @@ async def download_book_file(
         except Exception:
             pass
 
-    raise HTTPException(status_code=resp.status_code if resp.status_code != 200 else 404, detail="Failed to download book file")
+    # 2. Try Grimmory Komga layer fallback
+    try:
+        resp = await grimmory_client.komga_request("GET", f"/api/v1/books/{book_id}/file", user, pwd)
+        if resp.status_code == 200:
+            cd = resp.headers.get("Content-Disposition") or f'attachment; filename="{filename}"'
+            ct = resp.headers.get("Content-Type") or m_type
+            return StreamingResponse(
+                iter([resp.content]),
+                status_code=200,
+                headers={
+                    "Content-Type": ct,
+                    "Content-Disposition": cd
+                }
+            )
+    except Exception:
+        pass
+
+    raise HTTPException(status_code=404, detail="Failed to download book file")
 
 
 # Support both /read-progress and /progression (Komga & Komic variants)

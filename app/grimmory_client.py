@@ -286,6 +286,31 @@ class GrimmoryClient:
             headers=req_headers
         )
 
+    async def get_libraries(self, user: str, pwd: str) -> List[Dict[str, Any]]:
+        """Fetch libraries via Grimmory native API or fallback."""
+        native_headers = await self.get_native_headers(user, pwd)
+        for path in ["/api/v1/app/libraries", "/api/v1/libraries"]:
+            try:
+                resp = await self.client.get(path, headers=native_headers)
+                if resp.status_code == 200:
+                    data = resp.json()
+                    if isinstance(data, list):
+                        return data
+                    elif isinstance(data, dict) and "content" in data:
+                        return data["content"]
+            except Exception:
+                pass
+        # Fallback to Komga endpoint only if native failed
+        try:
+            resp = await self.komga_request("GET", "/api/v1/libraries", user, pwd)
+            if resp.status_code == 200:
+                data = resp.json()
+                if isinstance(data, list):
+                    return data
+        except Exception:
+            pass
+        return []
+
     async def get_user_library_ids(self, user: str, pwd: str) -> Optional[Set[str]]:
         """Fetch the set of library IDs that the given user has access to."""
         cache_key = f"{user}:{pwd}"
@@ -293,13 +318,11 @@ class GrimmoryClient:
             return self.user_libraries_cache[cache_key]
 
         try:
-            resp = await self.komga_request("GET", "/api/v1/libraries", user, pwd)
-            if resp.status_code == 200:
-                libs = resp.json()
-                if isinstance(libs, list):
-                    lib_ids = {str(lib.get("id")) for lib in libs if lib.get("id")}
-                    self.user_libraries_cache[cache_key] = lib_ids
-                    return lib_ids
+            libs = await self.get_libraries(user, pwd)
+            if libs and isinstance(libs, list):
+                lib_ids = {str(lib.get("id")) for lib in libs if lib.get("id")}
+                self.user_libraries_cache[cache_key] = lib_ids
+                return lib_ids
         except Exception:
             pass
 

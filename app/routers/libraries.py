@@ -46,16 +46,20 @@ def ensure_library_dto(lib: Dict[str, Any]) -> Dict[str, Any]:
 @router.get("", response_model=List[Dict[str, Any]])
 async def list_libraries(authorization: Optional[str] = Header(None)) -> List[Dict[str, Any]]:
     user, pwd = grimmory_client.extract_credentials(authorization)
-    resp = await grimmory_client.komga_request("GET", "/api/v1/libraries", user, pwd)
-    if resp.status_code != 200:
-        raise HTTPException(status_code=resp.status_code, detail="Failed to fetch libraries")
-    libraries = resp.json()
+    libraries = await grimmory_client.get_libraries(user, pwd)
+    if not libraries:
+        # Check if auth valid
+        user_libs = await grimmory_client.get_user_library_ids(user, pwd)
+        if user_libs is None and user:
+            raise HTTPException(status_code=401, detail="Unauthorized")
     return [ensure_library_dto(lib) for lib in libraries]
 
 @router.get("/{library_id}", response_model=Dict[str, Any])
 async def get_library(library_id: str, authorization: Optional[str] = Header(None)) -> Dict[str, Any]:
     user, pwd = grimmory_client.extract_credentials(authorization)
-    resp = await grimmory_client.komga_request("GET", f"/api/v1/libraries/{library_id}", user, pwd)
-    if resp.status_code != 200:
-        raise HTTPException(status_code=resp.status_code, detail="Library not found")
-    return ensure_library_dto(resp.json())
+    libraries = await grimmory_client.get_libraries(user, pwd)
+    for lib in libraries:
+        if str(lib.get("id")) == str(library_id):
+            return ensure_library_dto(lib)
+    raise HTTPException(status_code=404, detail="Library not found")
+

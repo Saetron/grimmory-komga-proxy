@@ -2374,8 +2374,60 @@ def test_komic_search_structure():
         assert books_data["content"][0]["name"] == "Neko Chapter 1"
 
 
+def test_series_read_progress_endpoints():
+    """Verify POST and DELETE /api/v1/series/{series_id}/read-progress mark books appropriately."""
+    db.save_series({"id": "prog-series-1", "libraryId": "14", "name": "Progression Series"})
+    db.save_book({"id": "prog-b-1", "seriesId": "prog-series-1", "libraryId": "14", "name": "Prog Vol 1", "media": {"pagesCount": 100}})
+    db.save_book({"id": "prog-b-2", "seriesId": "prog-series-1", "libraryId": "14", "name": "Prog Vol 2", "media": {"pagesCount": 150}})
+
+    with patch.object(grimmory_client, "update_read_progress", new_callable=AsyncMock, return_value=True) as mock_up, \
+         patch.object(grimmory_client, "reset_read_progress", new_callable=AsyncMock, return_value=True) as mock_reset:
+
+        # 1. Mark series read
+        resp_mark = client.post(
+            "/api/v1/series/prog-series-1/read-progress",
+            json={"completed": True},
+            headers=AUTH_HEADER
+        )
+        assert resp_mark.status_code == 204
+        assert mock_up.call_count == 2
+
+        # 2. Mark series unread
+        resp_del = client.delete(
+            "/api/v1/series/prog-series-1/read-progress",
+            headers=AUTH_HEADER
+        )
+        assert resp_del.status_code == 204
+        assert mock_reset.call_count == 2
+
+
+def test_debug_logs_endpoints():
+    """Verify GET and DELETE /api/v1/debug/logs capture and clear logs."""
+    # Send a request to generate a log entry
+    client.get("/api/v1/libraries", headers=AUTH_HEADER)
+
+    resp_logs = client.get("/api/v1/debug/logs?limit=5")
+    assert resp_logs.status_code == 200
+    data = resp_logs.json()
+    assert "total" in data
+    assert "logs" in data
+    assert len(data["logs"]) > 0
+    last_log = data["logs"][-1]
+    assert "method" in last_log
+    assert "url" in last_log
+
+    # Clear logs
+    resp_clear = client.delete("/api/v1/debug/logs")
+    assert resp_clear.status_code == 200
+    assert resp_clear.json()["status"] == "cleared"
+
+    resp_empty = client.get("/api/v1/debug/logs")
+    assert resp_empty.json()["total"] == 0
+
+
 if __name__ == "__main__":
     pytest.main(["-v", __file__])
+
 
 
 

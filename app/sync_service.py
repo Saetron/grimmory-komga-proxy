@@ -61,21 +61,17 @@ class SyncService:
 
         try:
             # 2. Verify authentication with Grimmory first
-            auth_check = await grimmory_client.komga_request("GET", "/api/v1/libraries", user, pwd)
-            if auth_check.status_code == 401:
+            libs = await grimmory_client.get_libraries(user, pwd)
+            user_libs = await grimmory_client.get_user_library_ids(user, pwd)
+            if user_libs is None and user:
                 logger.error(
-                    f"[BackgroundSync] Authentication failed (HTTP 401 Unauthorized) connecting to Grimmory with user '{user}'. "
+                    f"[BackgroundSync] Authentication failed connecting to Grimmory with user '{user}'. "
                     f"Please verify GRIMMORY_USERNAME and GRIMMORY_PASSWORD (or USER_MAPPING) match a valid Grimmory account."
                 )
                 stats["status"] = "unauthorized"
                 stats["error"] = f"HTTP 401 Unauthorized for user '{user}'"
                 self.last_sync_stats = stats
                 return stats
-            elif auth_check.status_code >= 400:
-                logger.warning(
-                    f"[BackgroundSync] Grimmory returned HTTP {auth_check.status_code} while checking libraries. "
-                    f"Sync may be partial or Grimmory may be temporarily unavailable."
-                )
 
             # 3. Sync all series from Grimmory (Komga + custom disambiguated)
             all_series = await grimmory_client.get_all_series(user, pwd)

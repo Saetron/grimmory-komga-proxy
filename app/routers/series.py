@@ -417,10 +417,46 @@ async def get_series_thumbnail(
             books = await grimmory_client.get_series_books_custom(series_id, user, pwd)
             if books:
                 first_b_id = str(books[0]["id"])
+                b_cache_key = f"b:{first_b_id}"
+                if b_cache_key in thumbnail_cache:
+                    cached_content, cached_type = thumbnail_cache[b_cache_key]
+                    thumbnail_cache[cache_key] = (cached_content, cached_type)
+                    return Response(
+                        content=cached_content,
+                        status_code=200,
+                        headers={
+                            "Content-Type": cached_type,
+                            "Cache-Control": "public, max-age=604800, immutable"
+                        }
+                    )
+                # Try native cover first
+                native_headers = await grimmory_client.get_native_headers(user, pwd)
+                for path in [
+                    f"/api/v1/app/books/{first_b_id}/cover",
+                    f"/api/v1/app/books/{first_b_id}/thumbnail",
+                ]:
+                    try:
+                        b_resp = await grimmory_client.client.get(path, headers=native_headers)
+                        c_type = b_resp.headers.get("Content-Type", "")
+                        if b_resp.status_code == 200 and len(b_resp.content) > 0 and c_type.startswith("image/"):
+                            thumbnail_cache[cache_key] = (b_resp.content, c_type)
+                            thumbnail_cache[b_cache_key] = (b_resp.content, c_type)
+                            return Response(
+                                content=b_resp.content,
+                                status_code=200,
+                                headers={
+                                    "Content-Type": c_type,
+                                    "Cache-Control": "public, max-age=604800, immutable"
+                                }
+                            )
+                    except Exception:
+                        pass
+
                 resp = await grimmory_client.komga_request("GET", f"/api/v1/books/{first_b_id}/thumbnail", user, pwd)
                 if resp.status_code == 200:
                     c_type = resp.headers.get("Content-Type", "image/jpeg")
                     thumbnail_cache[cache_key] = (resp.content, c_type)
+                    thumbnail_cache[b_cache_key] = (resp.content, c_type)
                     return Response(
                         content=resp.content,
                         status_code=200,
@@ -429,6 +465,23 @@ async def get_series_thumbnail(
                             "Cache-Control": "public, max-age=604800, immutable"
                         }
                     )
+
+        # Check if first book's thumbnail is available for standard series
+        s_books = db.get_books_by_series(series_id)
+        if s_books:
+            first_b_id = str(s_books[0]["id"])
+            b_cache_key = f"b:{first_b_id}"
+            if b_cache_key in thumbnail_cache:
+                cached_content, cached_type = thumbnail_cache[b_cache_key]
+                thumbnail_cache[cache_key] = (cached_content, cached_type)
+                return Response(
+                    content=cached_content,
+                    status_code=200,
+                    headers={
+                        "Content-Type": cached_type,
+                        "Cache-Control": "public, max-age=604800, immutable"
+                    }
+                )
 
         resp = await grimmory_client.komga_request("GET", f"/api/v1/series/{series_id}/thumbnail", user, pwd)
         if resp.status_code == 200:
@@ -453,4 +506,44 @@ async def get_series_thumbnail(
     except Exception as e:
         logger.error(f"[Thumbnail] Error fetching thumbnail for series {series_id}: {e}")
         return Response(status_code=404, content=b"", media_type="image/jpeg")
+
+
+@router.post("/{series_id}/read-progress", status_code=status.HTTP_204_NO_CONTENT)
+@router.patch("/{series_id}/read-progress", status_code=status.HTTP_204_NO_CONTENT)
+async def update_series_read_progress(
+    series_id: str,
+    request: Request,
+    authorization: Optional[str] = Header(None)
+) -> Response:
+    user, pwd = grimmory_client.extract_credentials(authorization)
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    completed = body.get("completed", True)
+    books = db.get_books_by_series(series_id)
+    for b in books:
+        b_id = str(b.get("id"))
+        if b_id:
+            if completed:
+                p_count = (b.get("media") or {}).get("pagesCount", 1) or 1
+                await grimmory_client.update_read_progress(b_id, page=p_count, completed=True, user=user, pwd=pwd)
+            else:
+                await grimmory_client.reset_read_progress(b_id, user=user, pwd=pwd)
+    return Response(status_code=status.HTTP_204_NO_CONTENT)
+
+
+@router.delete("/{series_id}/read-progress", status_code=status.HTTP_204_NO_CONTENT)
+async def delete_series_read_progress(
+    series_id: str,
+    authorization: Optional[str] = Header(None)
+) -> Response:
+    user, pwd = grimmory_client.extract_credentials(authorization)
+    books = db.get_books_by_series(series_id)
+    for b in books:
+        b_id = str(b.get("id"))
+        if b_id:
+            await grimmory_client.reset_read_progress(b_id, user=user, pwd=pwd)
+    return Response(status_code=status.HTTP_204_NO_CONTENT)
+
 
