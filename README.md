@@ -1,25 +1,22 @@
 # grimmory-komga-proxy
 
-> High-performance, lightweight bridge enabling Komga clients (like Komic, Komelia, Mihon/Tachiyomi) to seamlessly browse, search, and read books from Grimmory with instant caching and bidirectional progress synchronization!
+> High-performance, lightweight bridge enabling Komga clients (like Komic, Komelia, Mihon/Tachiyomi) to seamlessly browse, search, and read books from Grimmory with instant caching, dynamic multi-library switching, and bidirectional progress synchronization!
 
 ---
 
 ## Why is this Bridge needed?
 
-While Grimmory includes an experimental Komga emulation layer under `/komga/api/*`, connecting third-party Komga apps directly currently encounters critical blockers:
-1. **Empty Pages Bug**: Grimmory's `/komga/api/v1/books/{id}/pages` returns an empty array `[]` and `pagesCount: 0`. As a result, readers report that the book has 0 pages and cannot open it.
-2. **Missing / Broken Endpoints**:
-   - `GET /api/v1/books/ondeck` (Continue Reading on the home screen) returns `501 Not Implemented`.
-   - `GET /api/v1/books/latest`, `/series/latest`, `/series/new`, and `/series/updated` return `500 Server Error` or freeze.
-   - `POST /api/v1/series/list` and `POST /api/v1/books/list` (used by Komic and Komelia to browse libraries and execute search queries) return `501 Not Implemented`.
-   - `GET /api/v1/series/alphabetical-groups` returns `400 Bad Request`.
-3. **No Reading Progress Sync**: Grimmory's Komga layer returns `404 Not Found` for `PATCH /api/v1/books/{id}/read-progress`.
-4. **URL Path Structure**: Komga clients query standard paths (`/api/v1/*` and `/api/v2/*`) at root, while Grimmory hosts its emulation under `/komga/api/*` and reserves `/api/*` for internal web UI JWT cookies.
+Grimmory is a modern self-hosted book server, but connecting third-party Komga apps directly encounters critical challenges:
+1. **Deprecated / Incomplete `/komga` Emulation**: Grimmory's experimental `/komga` layer is deprecated and often disabled or missing essential endpoints.
+2. **Native API Translation**: This bridge translates Komga client requests directly into Grimmory's stable, native REST API (`/api/v1/*`), eliminating dependency on any upstream Komga emulation layer.
+3. **Swift / Komic Compatibility**: Komic is built with strict Swift `Codable` models. Grimmory uses numeric integer IDs for libraries, which causes Swift readers to fail decoding library lists. The bridge automatically normalizes all entities to 100% compliant Komga DTOs.
+4. **Empty Pages Bug & Reading Progress**: Readers often fail to open books due to missing page dimensions or unsupported reading progress endpoints. This bridge computes page aspect ratios and synchronizes user reading progress bi-directionally.
 
 ---
 
 ## Features
 
+- 🏛️ **Dynamic Multi-Library Support**: Automatically pulls all libraries and names directly from Grimmory (`/api/v1/libraries`), enabling seamless library switching in Komic and other Komga clients.
 - 📄 **Accurate Pages & Aspect Ratios**: Queries Grimmory's internal `/api/v1/cbx/{id}/page-dimensions` and synthesizes compliant Komga `PageDto` objects so all pages load with correct aspect ratios.
 - ⚡ **Instant Persistent Caching**: Uses a lightweight embedded SQLite database (`bridge.db`) with background reconciliation so 2,000+ series and 10,000+ books load instantly in sub-second time.
 - 🖼️ **Disk-Based Thumbnail Cache**: Caches cover thumbnails directly to persistent storage (`/app/data/thumbnails`) with strict cache headers (`max-age=604800, immutable`), saving client and server RAM.
