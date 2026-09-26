@@ -2538,6 +2538,21 @@ def test_download_book_content_disposition_and_url_format():
         assert resp_head.status_code == 200
 
 
+def test_ensure_book_dto_none_library_and_url():
+    """Verify that books with None libraryId or url are normalized cleanly."""
+    from app.dto_utils import ensure_book_dto
+    book = {
+        "id": "2668",
+        "name": "[Oshi no Ko] Spica the First Star",
+        "libraryId": None,
+        "url": None,
+        "media": {"mediaType": "application/epub+zip"}
+    }
+    ensure_book_dto(book)
+    assert book["libraryId"] == "1"
+    assert book["url"] == "/books/1/[Oshi no Ko] Spica the First Star.epub"
+
+
 if __name__ == "__main__":
     pytest.main(["-v", __file__])
 

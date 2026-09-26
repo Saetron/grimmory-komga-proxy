@@ -365,8 +365,10 @@ class Database:
     # --- Books Operations ---
     def _extract_book_fields(self, b: Dict[str, Any]) -> tuple:
         b_id = str(b.get("id"))
-        s_id = str(b.get("seriesId", ""))
-        lib_id = str(b.get("libraryId", ""))
+        s_raw = b.get("seriesId")
+        s_id = str(s_raw).strip() if s_raw and str(s_raw).strip() not in ("", "null", "None") else ""
+        lib_raw = b.get("libraryId")
+        lib_id = str(lib_raw).strip() if lib_raw and str(lib_raw).strip() not in ("", "null", "None") else ""
         name = str(b.get("name") or b.get("metadata", {}).get("title") or "")
         try:
             num_sort = float(b.get("metadata", {}).get("numberSort", b.get("number", 1.0)))

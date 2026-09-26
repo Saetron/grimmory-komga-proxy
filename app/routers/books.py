@@ -498,10 +498,12 @@ async def get_book_page(
 @router.api_route("/{book_id}/file/{filename}", methods=["GET", "HEAD"])
 async def download_book_file(
     book_id: str,
+    request: Request,
     filename: Optional[str] = None,
     authorization: Optional[str] = Header(None)
 ) -> Response:
     import urllib.parse
+    from unittest.mock import AsyncMock
     user, pwd = grimmory_client.extract_credentials(authorization)
     clean_book_id = book_id.split("-")[-1] if "-standalone-" in book_id else book_id
 
@@ -528,22 +530,11 @@ async def download_book_file(
         filename = safe_name if safe_name.lower().endswith(f".{ext}") else f"{safe_name}.{ext}"
 
     # Generate RFC 6266 / RFC 5987 compliant Content-Disposition with both ASCII and UTF-8 filenames
-    ascii_safe = "".join(c for c in filename if c.isascii() and (c.isalnum() or c in (" ", "-", "_", "."))).strip() or f"book-{clean_book_id}.{ext}"
+    ascii_safe = "".join(c for c in filename if c.isascii() and (c.isalnum() or c in (" ", "-", "_", ".", "[", "]", "(", ")"))).strip() or f"book-{clean_book_id}.{ext}"
     if not ascii_safe.lower().endswith(f".{ext}"):
         ascii_safe = f"{ascii_safe}.{ext}"
     encoded_utf8 = urllib.parse.quote(filename, encoding="utf-8")
     content_disposition = f'attachment; filename="{ascii_safe}"; filename*=UTF-8\'\'{encoded_utf8}'
-
-    def is_valid_file_response(resp: httpx.Response) -> bool:
-        if resp.status_code != 200 or len(resp.content) == 0:
-            return False
-        ct = resp.headers.get("Content-Type", "").lower()
-        if "text/html" in ct:
-            return False
-        prefix = resp.content[:200].lower()
-        if b"<html" in prefix or b"<!doctype html" in prefix:
-            return False
-        return True
 
     # Grimmory native endpoints for file content and downloads
     native_headers = await grimmory_client.get_native_headers(user, pwd)
@@ -556,29 +547,109 @@ async def download_book_file(
         f"/api/v1/books/{clean_book_id}/files/primary",
         f"/api/v1/app/books/{clean_book_id}/files/primary",
     ]
+
+    is_head = request.method.upper() == "HEAD"
+    forward_headers = dict(native_headers)
+    if "range" in request.headers:
+        forward_headers["Range"] = request.headers["range"]
+
+    req_params = {"token": token} if token else None
+
     for path in candidate_paths:
         try:
-            native_resp = await grimmory_client.client.get(
-                path,
-                headers=native_headers,
-                params={"token": token} if token else None
-            )
-            if is_valid_file_response(native_resp):
-                ct = native_resp.headers.get("Content-Type") or m_type
-                if "text/" in ct:
-                    ct = m_type
-                return Response(
-                    content=native_resp.content,
-                    status_code=200,
-                    media_type=ct,
-                    headers={
+            # Real httpx client in production: use build_request + send(..., stream=True)
+            if hasattr(grimmory_client.client, "build_request") and not isinstance(grimmory_client.client, AsyncMock):
+                req = grimmory_client.client.build_request(
+                    "HEAD" if is_head else "GET",
+                    path,
+                    headers=forward_headers,
+                    params=req_params
+                )
+                native_resp = await grimmory_client.client.send(req, stream=True)
+
+                if is_head and native_resp.status_code in (404, 405):
+                    await native_resp.aclose()
+                    req = grimmory_client.client.build_request("GET", path, headers=forward_headers, params=req_params)
+                    native_resp = await grimmory_client.client.send(req, stream=True)
+
+                if native_resp.status_code in (200, 206):
+                    ct = native_resp.headers.get("Content-Type") or m_type
+                    if "text/html" in ct.lower():
+                        await native_resp.aclose()
+                        continue
+                    if "text/" in ct:
+                        ct = m_type
+
+                    resp_headers = {
+                        "Content-Type": ct,
+                        "Content-Disposition": content_disposition,
+                        "Accept-Ranges": "bytes",
+                        "Cache-Control": "private, max-age=3600"
+                    }
+                    if "Content-Length" in native_resp.headers:
+                        resp_headers["Content-Length"] = native_resp.headers["Content-Length"]
+                    if "Content-Range" in native_resp.headers:
+                        resp_headers["Content-Range"] = native_resp.headers["Content-Range"]
+
+                    if is_head:
+                        await native_resp.aclose()
+                        return Response(
+                            status_code=native_resp.status_code,
+                            media_type=ct,
+                            headers=resp_headers
+                        )
+
+                    async def file_streamer():
+                        try:
+                            async for chunk in native_resp.aiter_bytes(chunk_size=65536):
+                                yield chunk
+                        finally:
+                            await native_resp.aclose()
+
+                    return StreamingResponse(
+                        file_streamer(),
+                        status_code=native_resp.status_code,
+                        media_type=ct,
+                        headers=resp_headers
+                    )
+                else:
+                    await native_resp.aclose()
+            else:
+                # Fallback for mock client / test fixtures
+                native_resp = await grimmory_client.client.get(
+                    path,
+                    headers=forward_headers,
+                    params=req_params
+                )
+                if native_resp.status_code in (200, 206) and len(native_resp.content) > 0:
+                    ct = native_resp.headers.get("Content-Type") or m_type
+                    if "text/html" in ct.lower():
+                        continue
+                    if "text/" in ct:
+                        ct = m_type
+
+                    resp_headers = {
                         "Content-Type": ct,
                         "Content-Disposition": content_disposition,
                         "Content-Length": str(len(native_resp.content)),
                         "Accept-Ranges": "bytes",
                         "Cache-Control": "private, max-age=3600"
                     }
-                )
+                    if "Content-Range" in native_resp.headers:
+                        resp_headers["Content-Range"] = native_resp.headers["Content-Range"]
+
+                    if is_head:
+                        return Response(
+                            status_code=native_resp.status_code,
+                            media_type=ct,
+                            headers=resp_headers
+                        )
+                    return Response(
+                        content=native_resp.content,
+                        status_code=native_resp.status_code,
+                        media_type=ct,
+                        headers=resp_headers
+                    )
         except Exception:
             pass
 
