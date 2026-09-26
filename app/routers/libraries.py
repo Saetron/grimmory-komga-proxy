@@ -59,7 +59,22 @@ def ensure_library_dto(lib: Dict[str, Any]) -> Dict[str, Any]:
 @router.get("", response_model=List[Dict[str, Any]])
 async def list_libraries(authorization: Optional[str] = Header(None)) -> List[Dict[str, Any]]:
     user, pwd = grimmory_client.extract_credentials(authorization)
+    if not user:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Unauthorized",
+            headers={"WWW-Authenticate": "Basic realm=\"Komga\""}
+        )
+    token = await grimmory_client.get_native_token(user, pwd)
+    if not token:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid credentials",
+            headers={"WWW-Authenticate": "Basic realm=\"Komga\""}
+        )
+
     libraries = await grimmory_client.get_libraries(user, pwd)
+    user_libs = await grimmory_client.get_user_library_ids(user, pwd)
 
     if not libraries:
         db_libs = db.get_all_libraries()
@@ -68,12 +83,32 @@ async def list_libraries(authorization: Optional[str] = Header(None)) -> List[Di
         else:
             libraries = [{"id": "1", "name": "Default"}]
 
+    if user_libs is not None:
+        libraries = [lib for lib in libraries if str(lib.get("id")) in user_libs]
+
     return [ensure_library_dto(lib) for lib in libraries]
 
 @router.get("/{library_id}", response_model=Dict[str, Any])
 async def get_library(library_id: str, authorization: Optional[str] = Header(None)) -> Dict[str, Any]:
     user, pwd = grimmory_client.extract_credentials(authorization)
+    if not user:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Unauthorized",
+            headers={"WWW-Authenticate": "Basic realm=\"Komga\""}
+        )
+    token = await grimmory_client.get_native_token(user, pwd)
+    if not token:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid credentials",
+            headers={"WWW-Authenticate": "Basic realm=\"Komga\""}
+        )
+
     target_id = str(library_id)
+    user_libs = await grimmory_client.get_user_library_ids(user, pwd)
+    if user_libs is not None and target_id not in user_libs:
+        raise HTTPException(status_code=404, detail="Library not found")
 
     libraries = await grimmory_client.get_libraries(user, pwd)
     if not libraries:

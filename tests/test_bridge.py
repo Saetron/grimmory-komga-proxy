@@ -2723,6 +2723,60 @@ async def test_dedicated_sync_credentials_isolation():
         settings.DEFAULT_PASSWORD = old_def_p
 
 
+def test_unauthorized_logins_and_library_restriction_gating():
+    """Verify unauthorized logins throw 401 and restricted library access sets sharedAllLibraries=False."""
+    # 1. Unauthenticated requests to /api/v1/libraries throw 401
+    resp_no_auth = client.get("/api/v1/libraries")
+    assert resp_no_auth.status_code == 401
+
+    # 2. Invalid credentials throw 401
+    invalid_auth = {"Authorization": "Basic " + base64.b64encode(b"wronguser:wrongpass").decode()}
+    resp_invalid = client.get("/api/v1/libraries", headers=invalid_auth)
+    assert resp_invalid.status_code == 401
+
+    # 3. Restricted library gating
+    auth_restricted = {"Authorization": "Basic " + base64.b64encode(b"restricted:pass").decode()}
+    token_cache["restricted:pass"] = "restricted-jwt-token"
+
+    # Database has 3 libraries: Lib 10, Lib 20, Lib 30
+    db.save_libraries_batch([
+        {"id": "10", "name": "Manga"},
+        {"id": "20", "name": "Comics"},
+        {"id": "30", "name": "Books"},
+    ])
+
+    # Restricted user ONLY has access to Lib 10
+    async def mock_get_libraries(user, pwd):
+        if user == "restricted":
+            return [{"id": "10", "name": "Manga"}]
+        return [{"id": "10", "name": "Manga"}, {"id": "20", "name": "Comics"}, {"id": "30", "name": "Books"}]
+
+    with patch.object(grimmory_client, "get_libraries", side_effect=mock_get_libraries), \
+         patch.object(grimmory_client, "get_native_token", new_callable=AsyncMock, return_value="restricted-jwt-token"):
+
+        # GET /api/v2/users/me: sharedAllLibraries MUST be False, sharedLibrariesIds must only be ["10"]
+        resp_me = client.get("/api/v2/users/me", headers=auth_restricted)
+        assert resp_me.status_code == 200
+        data_me = resp_me.json()
+        assert data_me["sharedAllLibraries"] is False
+        assert data_me["sharedLibrariesIds"] == ["10"]
+
+        # GET /api/v1/libraries: returns ONLY library 10
+        resp_libs = client.get("/api/v1/libraries", headers=auth_restricted)
+        assert resp_libs.status_code == 200
+        libs = resp_libs.json()
+        assert len(libs) == 1
+        assert libs[0]["id"] == "10"
+
+        # GET /api/v1/libraries/10: 200
+        resp_lib10 = client.get("/api/v1/libraries/10", headers=auth_restricted)
+        assert resp_lib10.status_code == 200
+
+        # GET /api/v1/libraries/20: 404 (restricted user cannot see library 20)
+        resp_lib20 = client.get("/api/v1/libraries/20", headers=auth_restricted)
+        assert resp_lib20.status_code == 404
+
+
 if __name__ == "__main__":
     pytest.main(["-v", __file__])
 

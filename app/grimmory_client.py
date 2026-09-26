@@ -27,21 +27,33 @@ class ReadProgressCache(TTLCache):
         try:
             return super().__getitem__(key)
         except KeyError:
-            if isinstance(key, str) and ":" not in key:
-                for prefix in ("testuser:", "default:"):
-                    compound = f"{prefix}{key}"
-                    if super().__contains__(compound):
-                        return super().__getitem__(compound)
+            if isinstance(key, str):
+                if ":" in key:
+                    bare_id = key.split(":", 1)[1]
+                    if super().__contains__(bare_id):
+                        return super().__getitem__(bare_id)
+                else:
+                    if super().__contains__(f"default:{key}"):
+                        return super().__getitem__(f"default:{key}")
+                    for k in self.keys():
+                        if isinstance(k, str) and k.endswith(f":{key}"):
+                            return super().__getitem__(k)
             raise
 
     def __contains__(self, key):
         if super().__contains__(key):
             return True
-        if isinstance(key, str) and ":" not in key:
-            for prefix in ("testuser:", "default:"):
-                compound = f"{prefix}{key}"
-                if super().__contains__(compound):
+        if isinstance(key, str):
+            if ":" in key:
+                bare_id = key.split(":", 1)[1]
+                if super().__contains__(bare_id):
                     return True
+            else:
+                if super().__contains__(f"default:{key}"):
+                    return True
+                for k in self.keys():
+                    if isinstance(k, str) and k.endswith(f":{key}"):
+                        return True
         return False
 
     def get(self, key, default=None):
@@ -54,11 +66,17 @@ class ReadProgressCache(TTLCache):
         try:
             return super().pop(key)
         except KeyError:
-            if isinstance(key, str) and ":" not in key:
-                for prefix in ("testuser:", "default:"):
-                    compound = f"{prefix}{key}"
-                    if super().__contains__(compound):
-                        return super().pop(compound)
+            if isinstance(key, str):
+                if ":" in key:
+                    bare_id = key.split(":", 1)[1]
+                    if super().__contains__(bare_id):
+                        return super().pop(bare_id)
+                else:
+                    if super().__contains__(f"default:{key}"):
+                        return super().pop(f"default:{key}")
+                    for k in list(self.keys()):
+                        if isinstance(k, str) and k.endswith(f":{key}"):
+                            return super().pop(k)
             return default
 
 # Cache read progress per user:book (30 days TTL)
@@ -338,24 +356,37 @@ class GrimmoryClient:
         pwd: str,
         library_id: Optional[str] = None
     ) -> List[Dict[str, Any]]:
-        """Fetch all books from native Grimmory /api/v1/books and synchronize them into SQLite cache."""
+        """Fetch all books from native Grimmory /api/v1/app/books or /api/v1/books and synchronize them into SQLite cache."""
         native_headers = await self.get_native_headers(user, pwd)
         raw_books = []
-        paths = ["/api/v1/books", "/api/v1/app/books"]
+        paths = ["/api/v1/app/books", "/api/v1/books"]
         for p in paths:
             try:
-                params = {"stripForListView": "false"}
-                if library_id:
-                    params["libraryId"] = str(library_id)
-                resp = await self.client.get(p, headers=native_headers, params=params)
-                if resp.status_code == 200:
+                page_idx = 0
+                all_pages_books = []
+                while True:
+                    params = {"stripForListView": "false", "size": 1000, "page": page_idx}
+                    if library_id:
+                        params["libraryId"] = str(library_id)
+                    resp = await self.client.get(p, headers=native_headers, params=params)
+                    if resp.status_code != 200:
+                        break
                     data = resp.json()
                     if isinstance(data, list):
-                        raw_books = data
+                        all_pages_books.extend(data)
                         break
                     elif isinstance(data, dict):
-                        raw_books = data.get("content", [])
+                        content = data.get("content", [])
+                        all_pages_books.extend(content)
+                        total_pages = data.get("totalPages", 1)
+                        page_idx += 1
+                        if page_idx >= total_pages or not content:
+                            break
+                    else:
                         break
+                if all_pages_books:
+                    raw_books = all_pages_books
+                    break
             except Exception:
                 pass
 
@@ -391,12 +422,19 @@ class GrimmoryClient:
         for s_id, s_info in series_map.items():
             books = s_info.pop("books", [])
             s_info["booksCount"] = len(books)
+            # Skip creating series in DB if bogus 'Book XXXXX' standalone
+            if s_info.get("oneshot") and str(s_info.get("name", "")).startswith("Book "):
+                continue
             s_dto = ensure_series_dto(s_info)
             self.register_custom_series(s_id, s_info["libraryId"], s_info["name"], s_dto)
             db.save_series(s_dto)
 
         if all_book_dtos:
-            db.save_books_batch(all_book_dtos)
+            db.save_books_batch(all_book_dtos, save_progress=False)
+
+        # Prune any stale or orphaned standalone series from SQLite
+        db.cleanup_stale_series(active_series_ids=set(series_map.keys()))
+        self.all_series_cache.clear()
 
         return all_book_dtos
 
@@ -706,7 +744,7 @@ class GrimmoryClient:
 
         await asyncio.gather(*[_enrich_one(b) for b in books], return_exceptions=True)
         try:
-            db.save_books_batch(books)
+            db.save_books_batch(books, save_progress=False)
         except Exception:
             pass
 
@@ -1250,6 +1288,8 @@ class GrimmoryClient:
             native_headers = await self.get_native_headers(user, pwd)
             u = (user or "default").lower().strip()
             in_prog_rows = db.get_all_in_progress(user=u)
+            if not in_prog_rows and u != "default":
+                in_prog_rows = db.get_all_in_progress(user="default")
             if not in_prog_rows:
                 return 0
 
@@ -1391,10 +1431,7 @@ class GrimmoryClient:
             b_copy = dict(b)
             p_key = f"{u}:{b_id}"
             u_prog = read_progress_cache.get(p_key) or user_prog_map.get(b_id)
-            if u_prog is not None:
-                b_copy["readProgress"] = u_prog
-            else:
-                u_prog = b_copy.get("readProgress")
+            b_copy["readProgress"] = u_prog
 
             is_fin = self._is_book_finished(b_copy, user=user, progress=u_prog)
             is_inp = self._is_book_in_progress(b_copy, user=user, progress=u_prog)
@@ -1504,7 +1541,7 @@ class GrimmoryClient:
                 continue
             if key.startswith(prefix):
                 b_id = key[len(prefix):]
-            elif ":" not in key and f"{u}:{key}" not in read_progress_cache:
+            elif ":" not in key and not any(k.startswith(prefix) and k.endswith(f":{key}") for k in read_progress_cache.keys()):
                 b_id = key
             else:
                 continue
@@ -1599,10 +1636,7 @@ class GrimmoryClient:
                 b_copy = dict(b)
                 p_key = f"{u}:{b_id}"
                 prog = read_progress_cache.get(p_key) or u_map.get(b_id)
-                if prog is not None:
-                    b_copy["readProgress"] = prog
-                else:
-                    prog = b_copy.get("readProgress")
+                b_copy["readProgress"] = prog
 
                 if self._is_book_finished(b_copy, user=user, progress=prog):
                     highest_read_idx = max(highest_read_idx, idx)
@@ -1623,10 +1657,7 @@ class GrimmoryClient:
                 candidate = dict(s_books[highest_read_idx + 1])
                 c_id = str(candidate.get("id"))
                 c_prog = read_progress_cache.get(f"{u}:{c_id}") or u_map.get(c_id)
-                if c_prog is not None:
-                    candidate["readProgress"] = c_prog
-                else:
-                    c_prog = candidate.get("readProgress")
+                candidate["readProgress"] = c_prog
                 if not self._is_book_finished(candidate, user=user, progress=c_prog):
                     target_book = candidate
 
@@ -1677,7 +1708,7 @@ class GrimmoryClient:
                 continue
             if key.startswith(prefix):
                 b_id = key[len(prefix):]
-            elif ":" not in key and f"{u}:{key}" not in read_progress_cache:
+            elif ":" not in key and not any(k.startswith(prefix) and k.endswith(f":{key}") for k in read_progress_cache.keys()):
                 b_id = key
             else:
                 continue
@@ -1800,7 +1831,7 @@ class GrimmoryClient:
 
         await self.enrich_books_page_count(page_items, user, pwd)
         for b in page_items:
-            ensure_book_dto(b)
+            ensure_book_dto(b, user=user)
 
         return ensure_page_dto({
             "content": page_items,
@@ -1833,7 +1864,7 @@ class GrimmoryClient:
             page_items = db_books[start:start + size]
             await self.enrich_books_page_count(page_items, user, pwd)
             for b in page_items:
-                ensure_book_dto(b)
+                ensure_book_dto(b, user=user)
             return ensure_page_dto({
                 "content": page_items,
                 "totalElements": total,
@@ -1866,7 +1897,7 @@ class GrimmoryClient:
                     paged_content = [raw_app_book_to_dto(item) for item in page_items if item.get("id")]
                     await self.enrich_books_page_count(paged_content, user, pwd)
                     for b in paged_content:
-                        ensure_book_dto(b)
+                        ensure_book_dto(b, user=user)
                     return ensure_page_dto({
                         "content": paged_content,
                         "totalElements": total,
@@ -2217,7 +2248,7 @@ class GrimmoryClient:
                 dtos.sort(key=lambda x: x.get("metadata", {}).get("numberSort", 1.0))
                 self.custom_series_books_cache[unique_id] = dtos
                 try:
-                    db.save_books_batch(dtos)
+                    db.save_books_batch(dtos, save_progress=False)
                 except Exception:
                     pass
                 if unique_id in self.custom_series:
@@ -2243,7 +2274,7 @@ class GrimmoryClient:
                     dtos.sort(key=lambda x: x.get("metadata", {}).get("numberSort", 1.0))
                     self.custom_series_books_cache[unique_id] = dtos
                     try:
-                        db.save_books_batch(dtos)
+                        db.save_books_batch(dtos, save_progress=False)
                     except Exception:
                         pass
                     if unique_id in self.custom_series:
@@ -2269,7 +2300,7 @@ class GrimmoryClient:
                     dtos.sort(key=lambda x: x.get("metadata", {}).get("numberSort", 1.0))
                     self.custom_series_books_cache[unique_id] = dtos
                     try:
-                        db.save_books_batch(dtos)
+                        db.save_books_batch(dtos, save_progress=False)
                     except Exception:
                         pass
                     if unique_id in self.custom_series:
@@ -2296,7 +2327,7 @@ class GrimmoryClient:
                         dtos.sort(key=lambda x: x.get("metadata", {}).get("numberSort", 1.0))
                         self.custom_series_books_cache[unique_id] = dtos
                         try:
-                            db.save_books_batch(dtos)
+                            db.save_books_batch(dtos, save_progress=False)
                         except Exception:
                             pass
                         if unique_id in self.custom_series:

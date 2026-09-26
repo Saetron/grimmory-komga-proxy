@@ -87,6 +87,7 @@ class SyncService:
                 return stats
 
             # 3. Sync all series from Grimmory (Komga + custom disambiguated)
+            await grimmory_client.fetch_and_cache_native_books(user, pwd)
             all_series = await grimmory_client.get_all_series(user, pwd)
             stats["seriesCount"] = len(all_series)
             if all_series:
@@ -117,7 +118,7 @@ class SyncService:
                             await grimmory_client.enrich_books_page_count(series_books, user, pwd)
                             for b in series_books:
                                 ensure_book_dto(b)
-                            db.save_books_batch(series_books)
+                            db.save_books_batch(series_books, save_progress=False)
 
                         async with lock:
                             completed_series_count += 1

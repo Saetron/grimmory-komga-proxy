@@ -311,13 +311,24 @@ def ensure_book_dto(book: Dict[str, Any], user: Optional[str] = None) -> Dict[st
         try:
             from app.grimmory_client import read_progress_cache
             from app.db import db
+            import time
             u = str(user).lower().strip()
             p_key = f"{u}:{b_id}"
-            prog = read_progress_cache.get(p_key) or (read_progress_cache.get(b_id) if ":" not in b_id and u in ("default", "testuser") else None) or db.get_read_progress(u, b_id)
+            prog = read_progress_cache.get(p_key) or db.get_read_progress(u, b_id)
             if prog is not None:
                 book["readProgress"] = prog
+            elif book.get("readProgress") is not None:
+                p = book["readProgress"]
+                read_progress_cache[p_key] = p
+                if isinstance(p, dict):
+                    page = p.get("page", 1)
+                    comp = p.get("completed", False)
+                    r_date = p.get("readDate") or time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+                    db.save_read_progress(u, b_id, page, comp, r_date, p)
+            else:
+                book["readProgress"] = None
         except Exception:
-            pass
+            book["readProgress"] = None
     elif "readProgress" not in book:
         book["readProgress"] = None
 
@@ -331,14 +342,64 @@ def ensure_book_dto(book: Dict[str, Any], user: Optional[str] = None) -> Dict[st
 
 
 def raw_app_book_to_dto(raw: Dict[str, Any], series_id_override: Optional[str] = None) -> Dict[str, Any]:
-    """Convert Grimmory native /api/v1/app/books/* object into a compliant Komga BookDto."""
-    b_id = str(raw["id"])
-    raw_lib = raw.get("libraryId")
-    lib_id = str(raw_lib).strip() if raw_lib and str(raw_lib).strip() not in ("", "null", "None") else "1"
-    title = str(raw.get("title") or raw.get("name") or f"Book {b_id}").strip()
+    """Convert Grimmory native /api/v1/app/books/* or /api/v1/books/* object into a compliant Komga BookDto."""
+    import re
+    import os
 
-    raw_series = raw.get("seriesName")
-    is_series_missing = (not raw_series) or not str(raw_series).strip() or str(raw_series).strip().lower() in ("unknown series", "unknown")
+    b_id = str(raw["id"])
+    raw_lib = raw.get("libraryId") or raw.get("library_id") or (raw.get("library", {}).get("id") if isinstance(raw.get("library"), dict) else None)
+    lib_id = str(raw_lib).strip() if raw_lib and str(raw_lib).strip() not in ("", "null", "None") else "1"
+
+    raw_meta = raw.get("metadata") if isinstance(raw.get("metadata"), dict) else {}
+
+    # 1. Comprehensive Title extraction
+    raw_title = raw.get("title") or raw.get("name") or raw_meta.get("title") or raw_meta.get("name")
+    if not raw_title or str(raw_title).strip().lower() in ("null", "none", ""):
+        file_name = raw.get("fileName") or raw.get("filename") or raw.get("file_name") or raw.get("path")
+        if file_name:
+            base = os.path.splitext(os.path.basename(str(file_name)))[0].strip()
+            if base:
+                raw_title = base
+    title = str(raw_title or f"Book {b_id}").strip()
+
+    # 2. Comprehensive Series name extraction
+    raw_series = (
+        raw.get("seriesName") or
+        raw.get("seriesTitle") or
+        (raw.get("series") if isinstance(raw.get("series"), str) else raw.get("series", {}).get("name") if isinstance(raw.get("series"), dict) else None) or
+        raw_meta.get("seriesName") or
+        raw_meta.get("seriesTitle") or
+        (raw_meta.get("series") if isinstance(raw_meta.get("series"), str) else raw_meta.get("series", {}).get("name") if isinstance(raw_meta.get("series"), dict) else None) or
+        raw.get("series_name") or
+        raw.get("series_title")
+    )
+
+    is_series_missing = (not raw_series) or not str(raw_series).strip() or str(raw_series).strip().lower() in ("unknown series", "unknown", "none", "null")
+
+    # If series is missing, check parent folder from path/filePath
+    if is_series_missing:
+        raw_path = raw.get("path") or raw.get("filePath") or raw.get("parentPath") or raw.get("folder")
+        if raw_path:
+            parent_dir = os.path.basename(os.path.dirname(str(raw_path))).strip()
+            if parent_dir and parent_dir.lower() not in ("", "books", "library", "manga", "comics", "downloads", "media", "root"):
+                raw_series = parent_dir
+                is_series_missing = False
+
+    # If still missing, check if title contains a series and volume pattern e.g. "Series Name Vol. 1" or "Series Name #02"
+    extracted_num = None
+    if is_series_missing and title and not title.startswith("Book "):
+        m = re.match(r"^(.*?)(?:\s+(?:[Vv]ol(?:\.|\s*)|[Vv]olume|[Cc]h(?:\.|\s*)|#)\s*(\d+(?:\.\d+)?|\d+)|(?:\s+-\s*|\s+)(\d{1,4}))(?:\s*\(.*?\))?$", title)
+        if m:
+            candidate_series = m.group(1).strip(" -_#")
+            candidate_vol = m.group(2) or m.group(3)
+            if candidate_series and len(candidate_series) > 1 and candidate_series.lower() not in ("vol", "volume", "chapter", "book"):
+                raw_series = candidate_series
+                is_series_missing = False
+                if candidate_vol:
+                    try:
+                        extracted_num = float(candidate_vol)
+                    except Exception:
+                        pass
 
     if not is_series_missing:
         series_name = str(raw_series).strip()
@@ -355,8 +416,22 @@ def raw_app_book_to_dto(raw: Dict[str, Any], series_id_override: Optional[str] =
         series_id = compute_unique_series_id(lib_id, series_name)
     else:
         series_id = f"{lib_id}-{series_name.lower().replace(' ', '-')}"
-    num = raw.get("seriesNumber", 1.0)
-    added_on = raw.get("addedOn") or "2026-09-23T00:00:00Z"
+
+    raw_num = (
+        raw.get("seriesNumber") or
+        raw.get("number") or
+        raw_meta.get("seriesNumber") or
+        raw_meta.get("number") or
+        raw_meta.get("numberSort") or
+        extracted_num or
+        1.0
+    )
+    try:
+        num = float(raw_num)
+    except Exception:
+        num = 1.0
+
+    added_on = raw.get("addedOn") or raw.get("created") or raw.get("createdAt") or "2026-09-23T00:00:00Z"
 
     file_type = raw.get("primaryFileType")
     media_type = "application/x-cbz" if file_type == "CBX" else "application/pdf" if file_type == "PDF" else "application/epub+zip"
@@ -480,8 +555,9 @@ def raw_app_book_to_dto(raw: Dict[str, Any], series_id_override: Optional[str] =
                 "oneshot": is_standalone
             }
             grimmory_client.register_custom_series(series_id, lib_id, series_name, s_dto)
-            from app.db import db
-            db.save_series(s_dto)
+            if not (is_standalone and series_name.startswith("Book ")):
+                from app.db import db
+                db.save_series(s_dto)
     except Exception:
         pass
 

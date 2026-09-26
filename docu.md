@@ -56,17 +56,26 @@ The proxy completely bypasses `/komga` and communicates exclusively with Grimmor
 
 ## 2. Authentication & Multi-User Model
 
-### Basic Auth to JWT Bearer Translation
-Komga clients authenticate via standard HTTP `Authorization: Basic <base64(user:pass)>`.
-1. The proxy decodes the Basic credentials.
-2. If mapped credentials exist in `USER_MAPPINGS`, the proxy resolves them.
-3. The proxy queries Grimmory's `/api/v1/auth/login` to obtain a JWT Bearer token (`accessToken`).
-4. Tokens are cached in-memory with automatic expiration and re-login on any `401 Unauthorized`.
+### Dedicated Sync User vs. Connecting Users
+The bridge operates on a two-tier user model designed to keep shared library metadata fast and reliable while strictly isolating user permissions and reading states:
 
-### User Permissions & Isolation
-- User details (`GET /api/v1/users/me` and `GET /api/v2/users/me`) populate `sharedAllLibraries: true` and all accessible `sharedLibrariesIds` as string arrays.
-- Reading progress is strictly segregated in the SQLite database and in-memory caches using the authenticated username as a namespace (e.g. `username:bookId`).
-- Client requests only use their explicit Basic Auth credentials. Background sync credentials are never used for client sessions or unauthenticated requests.
+1. **Background Sync User (`SYNC_USERNAME` / `SYNC_PASSWORD`)**:
+   - Background sync runs with dedicated administrator/sync credentials configured in environment variables.
+   - Its sole purpose is to periodically pull the full library catalog (libraries, series, books, page counts) from Grimmory and index it into SQLite (`bridge.db`).
+   - The shared `books` and `series` tables store pure metadata: all user-specific progress attributes (`readProgress`, `cbxProgress`, `pdfProgress`, `epubProgress`, `koreaderProgress`, `readStatus`, `dateFinished`) are explicitly stripped before insertion.
+   - Sync credentials are never used for client sessions or unauthenticated requests.
+
+2. **Connecting Client Users (e.g. Komic, Komelia)**:
+   - Every client request must provide valid HTTP Basic Auth credentials (`Authorization: Basic <base64(user:pass)>`).
+   - **Strict 401 Unauthorized**: Unauthenticated requests or invalid credentials immediately throw `HTTP 401 Unauthorized` (`WWW-Authenticate: Basic realm="Komga"`).
+   - Upon authentication, the bridge queries Grimmory to retrieve the connecting user's specific library permissions and live reading progress.
+   - Users are strictly gated to their allowed libraries and their own reading progress.
+
+### User Permissions & Library Gating
+- When a user logs in, `GET /api/v1/users/me` and `GET /api/v2/users/me` return their authorized profile:
+  - If a user has restricted library access (access to a subset of libraries), `sharedAllLibraries` is set to `false` and `sharedLibrariesIds` lists only the IDs of their permitted libraries.
+  - This prevents reader apps like Komic from displaying unauthorized libraries in the library selector.
+  - Endpoints (`/api/v1/libraries`, `/api/v1/libraries/{id}`, `/api/v1/series`, `/api/v1/books`, `/api/v1/books/ondeck`) enforce library permissions, rejecting access to unpermitted libraries with `404 Not Found`.
 
 ---
 
@@ -77,33 +86,27 @@ Komic and other native iOS apps are written in Swift using `Codable` structs:
 - **Type Mismatch Problem**: Grimmory returns library IDs as integers (`{"id": 14, "name": "Manga"}`). Swift's `JSONDecoder` throws a `typeMismatch` error if `let id: String` receives an integer, which previously broke the entire library listing and hid the library selector in Komic.
 - **Normalization**: The proxy coerces all IDs to strings (`"14"`) and provides all 29 fields of Komga's `LibraryDto` with accurate boolean and enum defaults (`scanInterval="EVERY_6H"`, `seriesCover="FIRST"`, `unavailable=false`).
 
-### Dynamic Discovery & Fallback
-1. The proxy queries Grimmory's native `/api/v1/libraries`.
+### Dynamic Discovery & Access Filtering
+1. The proxy queries Grimmory's native `/api/v1/libraries` with the authenticated user's credentials.
 2. Libraries are saved into the `libraries` table in SQLite.
-3. If upstream libraries are unavailable or empty, the proxy discovers distinct `library_id` values from cached books and series, ensuring the library switcher in Komic is always visible and functional.
+3. `/api/v1/libraries` filters the returned list strictly by the user's accessible library IDs (`user_libs`).
+4. If a user requests a specific library (`GET /api/v1/libraries/{id}`) that they are not permitted to view, the bridge returns `404 Not Found`.
 
 ---
 
 ## 4. Series & Book Management
 
 ### Persistent Caching & Background Sync
-- **Dedicated Sync Account (`SYNC_USERNAME` / `SYNC_PASSWORD`)**: The background sync service uses its own dedicated credentials (typically an administrator account with access to all libraries). These credentials are used strictly and exclusively by the background sync service to build and validate the SQLite metadata cache (`bridge.db`), and are completely isolated from client API calls and client reading progress.
+- **Dedicated Sync Account**: The background sync service uses `SYNC_USERNAME` and `SYNC_PASSWORD` to populate `bridge.db`.
 - **Background Sync Schedule**: Every 30 minutes (configurable via `SYNC_INTERVAL_MINUTES`), the proxy queries Grimmory for updated books, page counts, and series and reconciles them in SQLite.
 - **Sub-Second Response**: Complex queries (`GET /api/v1/series`, `POST /api/v1/series/list`, `GET /api/v1/books`, `POST /api/v1/books/list`) query indexed SQLite tables, eliminating latency.
 
-### Full-Text Search & Complex Filter Conditions
-Clients like Komic send search and filter queries as POST requests with nested condition structures:
-```json
-{
-  "condition": {
-    "allOf": [
-      { "libraryId": { "operator": "is", "value": "14" } },
-      { "fullTextSearch": { "operator": "is", "value": "Spica" } }
-    ]
-  }
-}
-```
-The proxy's query parser recursively unwraps nested conditions (`allOf`, `anyOf`, `noneOf`), extracts library IDs and search terms, and maps them to parameterized SQL `LIKE` queries across title, series name, and author fields.
+### Series Naming & Book Disambiguation (Preventing "Book XXXXX" Fallback)
+- **Problem**: When querying raw Grimmory endpoints (`/api/v1/books`), book titles and series names are often nested under `metadata` dictionaries or encoded in directory paths, rather than present as top-level fields. Previously, missing top-level names caused books to fall back to `Book {id}`, creating thousands of standalone series named `Book XXXXX` with 1 book each.
+- **Solution**:
+  1. The bridge prioritizes Grimmory's rich `/api/v1/app/books` endpoint over `/api/v1/books`.
+  2. `raw_app_book_to_dto` checks nested `metadata.title`, `metadata.seriesName`, parent directory names, and regex title patterns (`Series Name Vol. 1`) before falling back.
+  3. Automatic SQLite migration scripts prune corrupt `Book XXXXX` series upon startup and re-link books to their proper series.
 
 ### Standalone Books & One-Shots
 Books in Grimmory that do not belong to an official series are automatically wrapped in a synthetic series (`{lib_id}-standalone-{book_id}`) with `oneshot: true`. This allows comic and novel readers to access standalone items directly without encountering broken series relationships.

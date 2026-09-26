@@ -39,20 +39,27 @@ async def get_current_user(authorization: Optional[str] = Header(None)) -> Dict[
         )
 
     from app.db import db
-    libraries = await grimmory_client.get_libraries(user, pwd)
-    if libraries:
-        shared_ids = sorted([str(l["id"]) for l in libraries if l.get("id")])
-    else:
-        all_ids = db.get_all_library_ids()
-        shared_ids = sorted(list(all_ids)) if all_ids else ["1"]
+    all_libs = db.get_all_libraries()
+    all_ids = {str(l["id"]) for l in all_libs if l.get("id")}
 
+    user_lib_ids = await grimmory_client.get_user_library_ids(user, pwd)
+    if user_lib_ids is not None:
+        shared_ids = sorted(list(user_lib_ids))
+    else:
+        libraries = await grimmory_client.get_libraries(user, pwd)
+        if libraries:
+            shared_ids = sorted([str(l["id"]) for l in libraries if l.get("id")])
+        else:
+            shared_ids = sorted(list(all_ids)) if all_ids else ["1"]
+
+    shared_all = bool(not all_ids or set(shared_ids) >= all_ids)
     roles = ["ROLE_ADMIN", "ROLE_FILE_DOWNLOAD", "ROLE_PAGE_STREAMING", "USER", "ADMIN", "FILE_DOWNLOAD", "PAGE_STREAMING"]
 
     data = {
         "id": user,
         "email": f"{user}@grimmory.local" if "@" not in user else user,
         "roles": roles,
-        "sharedAllLibraries": True,
+        "sharedAllLibraries": shared_all,
         "sharedLibrariesIds": shared_ids,
         "labelsAllow": [],
         "labelsExclude": [],
