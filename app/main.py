@@ -1,6 +1,9 @@
 import logging
 import asyncio
+import re
 import time
+import collections
+from datetime import datetime
 from fastapi import FastAPI, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
 from contextlib import asynccontextmanager
@@ -45,9 +48,6 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-import collections
-from datetime import datetime
-
 recent_debug_logs = collections.deque(maxlen=300)
 
 @app.middleware("http")
@@ -65,14 +65,28 @@ async def log_requests(request: Request, call_next):
             if len(body_bytes) < 65536:
                 body_str = body_bytes.decode("utf-8", errors="replace")
                 if "password" in body_str.lower():
-                    import re
                     body_str = re.sub(r'("password"\s*:\s*)"[^"]*"', r'\1"[REDACTED]"', body_str, flags=re.IGNORECASE)
-            # Recreate receive stream
             async def receive():
                 return {"type": "http.request", "body": body_bytes}
             request = Request(request.scope, receive=receive)
         except Exception:
             pass
+
+    def _append_log(status_code: int, duration_ms: float, error: str = None):
+        if not path.startswith("/api/v1/debug"):
+            entry = {
+                "time": datetime.utcnow().isoformat() + "Z",
+                "method": method,
+                "url": full_url,
+                "path": path,
+                "status": status_code,
+                "durationMs": duration_ms,
+                "userAgent": request.headers.get("user-agent", ""),
+                "body": body_str
+            }
+            if error:
+                entry["error"] = error
+            recent_debug_logs.append(entry)
 
     try:
         response = await call_next(request)
@@ -81,34 +95,12 @@ async def log_requests(request: Request, call_next):
         if body_str:
             log_msg += f" | Body: {body_str[:300]}"
         logger.info(log_msg)
-
-        if not path.startswith("/api/v1/debug"):
-            recent_debug_logs.append({
-                "time": datetime.utcnow().isoformat() + "Z",
-                "method": method,
-                "url": full_url,
-                "path": path,
-                "status": response.status_code,
-                "durationMs": duration_ms,
-                "userAgent": request.headers.get("user-agent", ""),
-                "body": body_str
-            })
+        _append_log(response.status_code, duration_ms)
         return response
     except Exception as e:
         duration_ms = round((time.time() - start_time) * 1000, 1)
         logger.error(f"{method} {full_url} -> EXCEPTION: {e} ({duration_ms}ms)", exc_info=True)
-        if not path.startswith("/api/v1/debug"):
-            recent_debug_logs.append({
-                "time": datetime.utcnow().isoformat() + "Z",
-                "method": method,
-                "url": full_url,
-                "path": path,
-                "status": 500,
-                "durationMs": duration_ms,
-                "userAgent": request.headers.get("user-agent", ""),
-                "body": body_str,
-                "error": str(e)
-            })
+        _append_log(500, duration_ms, error=str(e))
         raise
 
 # Include API Routers

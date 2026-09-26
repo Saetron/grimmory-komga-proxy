@@ -10,25 +10,48 @@ logger = logging.getLogger("grimmory-komga-bridge")
 
 router = APIRouter(prefix="/api/v1/series", tags=["Series"])
 
-@router.get("")
-async def list_series(
-    request: Request,
-    authorization: Optional[str] = Header(None)
+
+def _sort_series(series_list: List[Dict[str, Any]], sort: str) -> List[Dict[str, Any]]:
+    """Sort series list by the given sort parameter."""
+    sort_lower = sort.lower()
+    if "titlesort" in sort_lower or "name" in sort_lower:
+        reverse = "desc" in sort_lower
+        series_list.sort(key=lambda s: str(s.get("metadata", {}).get("titleSort") or s.get("name", "")).lower(), reverse=reverse)
+    elif "created" in sort_lower or "added" in sort_lower:
+        reverse = "desc" in sort_lower
+        series_list.sort(key=lambda s: str(s.get("created") or s.get("lastModified") or ""), reverse=reverse)
+    elif "bookscount" in sort_lower:
+        reverse = "desc" in sort_lower
+        series_list.sort(key=lambda s: int(s.get("booksCount", 0)), reverse=reverse)
+    return series_list
+
+
+async def _paginate_and_enrich_series(
+    series_list: List[Dict[str, Any]], user: str, page: int, size: int
 ) -> Dict[str, Any]:
-    user, pwd = grimmory_client.extract_credentials(authorization)
-    params = dict(request.query_params)
-    page = int(params.get("page", 0))
-    size = int(params.get("size", 20))
+    """Paginate and enrich series DTOs with disambiguation and read counts."""
+    total = len(series_list)
+    start = page * size
+    paged_content = series_list[start:start + size]
+    u = (user or "default").lower().strip()
+    u_map = db.get_all_read_progress_map(u)
+    for s in paged_content:
+        disambiguate_series_dto(s)
+        ensure_series_dto(s, user=user, progress_map=u_map)
+    return ensure_page_dto({
+        "content": paged_content,
+        "totalElements": total,
+        "number": page,
+        "size": size
+    }, default_page=page, default_size=size)
 
-    # Normalize libraryId to library_id for Grimmory compatibility
-    if "libraryId" in params:
-        params["library_id"] = params.pop("libraryId")
-    library_id = params.get("library_id")
-    if library_id in ("", "null", "None"):
-        library_id = None
-    sort = params.get("sort", "")
 
-    search_query = params.get("search") or params.get("searchTerm") or params.get("q") or params.get("query")
+async def _list_series_common(
+    user: str, pwd: str, page: int, size: int,
+    library_id: Optional[str], sort: str,
+    search_query: Optional[str]
+) -> Dict[str, Any]:
+    """Shared logic for GET and POST series listing."""
     if search_query:
         return await grimmory_client.search_series(search_query, user, pwd, page=page, size=size, library_id=library_id)
 
@@ -41,54 +64,35 @@ async def list_series(
         user_libs = await grimmory_client.get_user_library_ids(user, pwd)
         if user_libs is not None:
             cached_series = [s for s in cached_series if str(s.get("libraryId") or s.get("library_id", "")) in user_libs]
-
-        sort_lower = sort.lower()
-        if "titlesort" in sort_lower or "name" in sort_lower:
-            reverse = "desc" in sort_lower
-            cached_series.sort(key=lambda s: str(s.get("metadata", {}).get("titleSort") or s.get("name", "")).lower(), reverse=reverse)
-        elif "created" in sort_lower or "added" in sort_lower:
-            reverse = "desc" in sort_lower
-            cached_series.sort(key=lambda s: str(s.get("created") or s.get("lastModified") or ""), reverse=reverse)
-        elif "bookscount" in sort_lower:
-            reverse = "desc" in sort_lower
-            cached_series.sort(key=lambda s: int(s.get("booksCount", 0)), reverse=reverse)
-
-        total = len(cached_series)
-        start = page * size
-        paged_content = cached_series[start:start + size]
-        u = (user or "default").lower().strip()
-        u_map = db.get_all_read_progress_map(u)
-        for s in paged_content:
-            disambiguate_series_dto(s)
-            ensure_series_dto(s, user=user, progress_map=u_map)
-        return ensure_page_dto({
-            "content": paged_content,
-            "totalElements": total,
-            "number": page,
-            "size": size
-        }, default_page=page, default_size=size)
+        if sort:
+            _sort_series(cached_series, sort)
+        return await _paginate_and_enrich_series(cached_series, user, page, size)
 
     all_s = await grimmory_client.get_all_series(user, pwd, library_id=library_id)
     if all_s:
         user_libs = await grimmory_client.get_user_library_ids(user, pwd)
         if user_libs is not None:
             all_s = [s for s in all_s if str(s.get("libraryId") or s.get("library_id", "")) in user_libs]
-        total = len(all_s)
-        start = page * size
-        paged_content = all_s[start:start + size]
-        u = (user or "default").lower().strip()
-        u_map = db.get_all_read_progress_map(u)
-        for s in paged_content:
-            disambiguate_series_dto(s)
-            ensure_series_dto(s, user=user, progress_map=u_map)
-        return ensure_page_dto({
-            "content": paged_content,
-            "totalElements": total,
-            "number": page,
-            "size": size
-        }, default_page=page, default_size=size)
+        return await _paginate_and_enrich_series(all_s, user, page, size)
 
     return ensure_page_dto({"content": []}, default_page=page, default_size=size)
+
+
+@router.get("")
+async def list_series(
+    request: Request,
+    authorization: Optional[str] = Header(None)
+) -> Dict[str, Any]:
+    user, pwd = grimmory_client.extract_credentials(authorization)
+    params = dict(request.query_params)
+    page = int(params.get("page", 0))
+    size = int(params.get("size", 20))
+    library_id = params.get("library_id") or params.get("libraryId")
+    if library_id in ("", "null", "None"):
+        library_id = None
+    sort = params.get("sort", "")
+    search_query = params.get("search") or params.get("searchTerm") or params.get("q") or params.get("query")
+    return await _list_series_common(user, pwd, page, size, library_id, sort, search_query)
 
 
 @router.post("/list")
@@ -105,101 +109,34 @@ async def list_series_post(
     page = int(params.get("page", 0))
     size = int(params.get("size", 20))
     sort = params.get("sort", "")
-    body = {}
-
-    # Normalize libraryId in query
-    if "libraryId" in params:
-        params["library_id"] = params.pop("libraryId")
 
     filters = {}
     try:
         raw_body = await request.json()
-        if isinstance(raw_body, dict):
-            body = raw_body
+        body = raw_body if isinstance(raw_body, dict) else {}
         filters = extract_search_filters(body)
-        if "library_ids" in filters:
-            if not filters["library_ids"]:
-                params.pop("library_id", None)
-            elif len(filters["library_ids"]) == 1:
-                params["library_id"] = filters["library_ids"][0]
-            else:
-                params["library_id"] = ",".join(filters["library_ids"])
-        elif "library_id" in filters:
-            params["library_id"] = filters["library_id"]
-        if "search" in filters:
-            params["search"] = filters["search"]
+        if not sort and "sort" in body:
+            sort = str(body["sort"])
     except Exception:
         pass
 
-    library_id = params.get("library_id")
+    # Resolve library_id from filters or query params
+    library_id = None
+    if "library_ids" in filters:
+        if filters["library_ids"]:
+            library_id = filters["library_ids"][0] if len(filters["library_ids"]) == 1 else ",".join(filters["library_ids"])
+    elif "library_id" in filters:
+        library_id = filters["library_id"]
+    if not library_id:
+        library_id = params.get("library_id") or params.get("libraryId")
     if library_id in ("", "null", "None"):
         library_id = None
-    sort_val = sort
-    if not sort_val and "sort" in body:
-        sort_val = str(body["sort"])
 
-    search_query = params.get("search") or params.get("searchTerm") or params.get("q") or params.get("query") or filters.get("search")
-    if search_query:
-        return await grimmory_client.search_series(search_query, user, pwd, page=page, size=size, library_id=library_id)
-
-    if any(k in sort_val.lower() for k in ["lastmodified", "created", "updated"]):
-        return await grimmory_client.get_updated_series(user, pwd, page=page, size=size, library_id=library_id)
-
-    # Check SQLite DB first for instant snappy response
-    cached_series = db.get_all_series(library_id=library_id)
-    if cached_series:
-        user_libs = await grimmory_client.get_user_library_ids(user, pwd)
-        if user_libs is not None:
-            cached_series = [s for s in cached_series if str(s.get("libraryId") or s.get("library_id", "")) in user_libs]
-
-        sort_lower = sort_val.lower()
-        if "titlesort" in sort_lower or "name" in sort_lower:
-            reverse = "desc" in sort_lower
-            cached_series.sort(key=lambda s: str(s.get("metadata", {}).get("titleSort") or s.get("name", "")).lower(), reverse=reverse)
-        elif "created" in sort_lower or "added" in sort_lower:
-            reverse = "desc" in sort_lower
-            cached_series.sort(key=lambda s: str(s.get("created") or s.get("lastModified") or ""), reverse=reverse)
-        elif "bookscount" in sort_lower:
-            reverse = "desc" in sort_lower
-            cached_series.sort(key=lambda s: int(s.get("booksCount", 0)), reverse=reverse)
-
-        total = len(cached_series)
-        start = page * size
-        paged_content = cached_series[start:start + size]
-        u = (user or "default").lower().strip()
-        u_map = db.get_all_read_progress_map(u)
-        for s in paged_content:
-            disambiguate_series_dto(s)
-            ensure_series_dto(s, user=user, progress_map=u_map)
-        return ensure_page_dto({
-            "content": paged_content,
-            "totalElements": total,
-            "number": page,
-            "size": size
-        }, default_page=page, default_size=size)
-
-    all_s = await grimmory_client.get_all_series(user, pwd, library_id=library_id)
-    if all_s:
-        user_libs = await grimmory_client.get_user_library_ids(user, pwd)
-        if user_libs is not None:
-            all_s = [s for s in all_s if str(s.get("libraryId") or s.get("library_id", "")) in user_libs]
-        total = len(all_s)
-        start = page * size
-        paged_content = all_s[start:start + size]
-        u = (user or "default").lower().strip()
-        u_map = db.get_all_read_progress_map(u)
-        for s in paged_content:
-            disambiguate_series_dto(s)
-            ensure_series_dto(s, user=user, progress_map=u_map)
-        return ensure_page_dto({
-            "content": paged_content,
-            "totalElements": total,
-            "number": page,
-            "size": size
-        }, default_page=page, default_size=size)
-
-    return ensure_page_dto({"content": []}, default_page=page, default_size=size)
-
+    search_query = (
+        params.get("search") or params.get("searchTerm") or params.get("q") or
+        params.get("query") or filters.get("search")
+    )
+    return await _list_series_common(user, pwd, page, size, library_id, sort, search_query)
 
 
 @router.get("/latest")
@@ -365,6 +302,8 @@ async def get_series_books(
 
     # Check SQLite DB first for instant snappy response
     db_books = db.get_books_by_series(series_id)
+    if not db_books:
+        db_books = await grimmory_client.get_series_books_custom(series_id, user, pwd)
     if db_books:
         user_libs = await grimmory_client.get_user_library_ids(user, pwd)
         if user_libs is not None:
@@ -372,24 +311,6 @@ async def get_series_books(
         total = len(db_books)
         start = page * size
         paged_content = db_books[start:start + size]
-        await grimmory_client.enrich_books_page_count(paged_content, user, pwd)
-        for b in paged_content:
-            ensure_book_dto(b)
-        return ensure_page_dto({
-            "content": paged_content,
-            "totalElements": total,
-            "number": page,
-            "size": size
-        }, default_page=page, default_size=size)
-
-    books = await grimmory_client.get_series_books_custom(series_id, user, pwd)
-    if books:
-        user_libs = await grimmory_client.get_user_library_ids(user, pwd)
-        if user_libs is not None:
-            books = [b for b in books if str(b.get("libraryId") or b.get("library_id", "")) in user_libs]
-        total = len(books)
-        start = page * size
-        paged_content = books[start:start + size]
         await grimmory_client.enrich_books_page_count(paged_content, user, pwd)
         for b in paged_content:
             ensure_book_dto(b)
@@ -538,5 +459,3 @@ async def delete_series_read_progress(
         if b_id:
             await grimmory_client.reset_read_progress(b_id, user=user, pwd=pwd)
     return Response(status_code=status.HTTP_204_NO_CONTENT)
-
-

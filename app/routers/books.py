@@ -74,6 +74,56 @@ def sort_book_dtos(books: List[Dict[str, Any]], sort: str = "") -> List[Dict[str
         )
     return books
 
+
+async def _enrich_and_paginate_books(
+    books: List[Dict[str, Any]], user: str, pwd: str,
+    page: int, size: int, sort: str = ""
+) -> Dict[str, Any]:
+    """Sort, paginate, enrich page counts, and ensure book DTOs."""
+    if sort:
+        books = sort_book_dtos(books, sort)
+    total = len(books)
+    start = page * size
+    paged_content = books[start:start + size]
+    await grimmory_client.enrich_books_page_count(paged_content, user, pwd)
+    for b in paged_content:
+        ensure_book_dto(b)
+    return ensure_page_dto({
+        "content": paged_content,
+        "totalElements": total,
+        "number": page,
+        "size": size
+    }, default_page=page, default_size=size)
+
+
+async def _get_series_books(
+    series_id: str, user: str, pwd: str,
+    page: int, size: int, sort: str = "",
+    library_id: Optional[str] = None
+) -> Dict[str, Any]:
+    """Fetch books for a series (standalone, custom, or normal) with enrichment."""
+    if "-standalone-" in series_id:
+        b_id = series_id.split("-standalone-")[-1]
+        book = await grimmory_client.get_book_dto(b_id, user, pwd)
+        content = [ensure_book_dto(book)] if book else []
+        return ensure_page_dto({"content": content}, default_page=page, default_size=size)
+
+    if "-u-" in series_id:
+        books = await grimmory_client.get_series_books_custom(series_id, user, pwd)
+        return await _enrich_and_paginate_books(books, user, pwd, page, size)
+
+    # Check SQLite DB first
+    db_books = db.get_books_by_series(series_id)
+    if not db_books:
+        db_books = await grimmory_client.get_series_books_custom(series_id, user, pwd)
+    if db_books:
+        user_libs = await grimmory_client.get_user_library_ids(user, pwd)
+        if user_libs is not None:
+            db_books = [b for b in db_books if str(b.get("libraryId") or b.get("library_id", "")) in user_libs]
+        return await _enrich_and_paginate_books(db_books, user, pwd, page, size, sort)
+
+    return ensure_page_dto({"content": []}, default_page=page, default_size=size)
+
 @router.get("")
 async def list_books(
     request: Request,
@@ -102,60 +152,7 @@ async def list_books(
             return await grimmory_client.get_books_by_read_status(
                 statuses, user, pwd, page=page, size=size, series_id=series_id, library_id=library_id, sort=sort
             )
-
-        if "-standalone-" in series_id:
-            b_id = series_id.split("-standalone-")[-1]
-            book = await grimmory_client.get_book_dto(b_id, user, pwd)
-            content = [ensure_book_dto(book)] if book else []
-            return ensure_page_dto({"content": content}, default_page=page, default_size=size)
-
-        if "-u-" in series_id:
-            books = await grimmory_client.get_series_books_custom(series_id, user, pwd)
-            start = page * size
-            paged_content = books[start:start + size]
-            await grimmory_client.enrich_books_page_count(paged_content, user, pwd)
-            for b in paged_content:
-                ensure_book_dto(b)
-            return ensure_page_dto({
-                "content": paged_content,
-                "totalElements": len(books),
-                "number": page,
-                "size": size
-            }, default_page=page, default_size=size)
-
-        # Check SQLite DB first!
-        db_books = db.get_books_by_series(series_id)
-        if db_books:
-            user_libs = await grimmory_client.get_user_library_ids(user, pwd)
-            if user_libs is not None:
-                db_books = [b for b in db_books if str(b.get("libraryId") or b.get("library_id", "")) in user_libs]
-            if sort:
-                db_books = sort_book_dtos(db_books, sort)
-            total = len(db_books)
-            start = page * size
-            paged_content = db_books[start:start + size]
-            await grimmory_client.enrich_books_page_count(paged_content, user, pwd)
-            for b in paged_content:
-                ensure_book_dto(b)
-            return ensure_page_dto({
-                "content": paged_content,
-                "totalElements": total,
-                "number": page,
-                "size": size
-            }, default_page=page, default_size=size)
-
-        books = await grimmory_client.get_series_books_custom(series_id, user, pwd)
-        start = page * size
-        paged_content = books[start:start + size]
-        await grimmory_client.enrich_books_page_count(paged_content, user, pwd)
-        for b in paged_content:
-            ensure_book_dto(b)
-        return ensure_page_dto({
-            "content": paged_content,
-            "totalElements": len(books),
-            "number": page,
-            "size": size
-        }, default_page=page, default_size=size)
+        return await _get_series_books(series_id, user, pwd, page, size, sort, library_id)
 
     search_query = params.get("search") or params.get("searchTerm") or params.get("q") or params.get("query")
     if search_query:
@@ -182,19 +179,7 @@ async def list_books(
         user_libs = await grimmory_client.get_user_library_ids(user, pwd)
         if user_libs is not None:
             db_books = [b for b in db_books if str(b.get("libraryId") or b.get("library_id", "")) in user_libs]
-        db_books = sort_book_dtos(db_books, sort)
-        total = len(db_books)
-        start = page * size
-        paged_content = db_books[start:start + size]
-        await grimmory_client.enrich_books_page_count(paged_content, user, pwd)
-        for b in paged_content:
-            ensure_book_dto(b)
-        return ensure_page_dto({
-            "content": paged_content,
-            "totalElements": total,
-            "number": page,
-            "size": size
-        }, default_page=page, default_size=size)
+        return await _enrich_and_paginate_books(db_books, user, pwd, page, size, sort)
 
     return ensure_page_dto({"content": []}, default_page=page, default_size=size)
 
@@ -261,61 +246,8 @@ async def list_books_post(
             return await grimmory_client.get_books_by_read_status(
                 statuses, user, pwd, page=page, size=size, series_id=series_id, library_id=library_id, sort=sort
             )
-
-        if "-standalone-" in series_id:
-            b_id = series_id.split("-standalone-")[-1]
-            book = await grimmory_client.get_book_dto(b_id, user, pwd)
-            content = [ensure_book_dto(book)] if book else []
-            return ensure_page_dto({"content": content}, default_page=page, default_size=size)
-
-        if "-u-" in series_id:
-            books = await grimmory_client.get_series_books_custom(series_id, user, pwd)
-            start = page * size
-            paged_content = books[start:start + size]
-            await grimmory_client.enrich_books_page_count(paged_content, user, pwd)
-            for b in paged_content:
-                ensure_book_dto(b)
-            return ensure_page_dto({
-                "content": paged_content,
-                "totalElements": len(books),
-                "number": page,
-                "size": size
-            }, default_page=page, default_size=size)
-
-        # Check SQLite DB first!
-        db_books = db.get_books_by_series(series_id)
-        if db_books:
-            user_libs = await grimmory_client.get_user_library_ids(user, pwd)
-            if user_libs is not None:
-                db_books = [b for b in db_books if str(b.get("libraryId") or b.get("library_id", "")) in user_libs]
-            effective_sort = sort or str(body.get("sort", ""))
-            if effective_sort:
-                db_books = sort_book_dtos(db_books, effective_sort)
-            total = len(db_books)
-            start = page * size
-            paged_content = db_books[start:start + size]
-            await grimmory_client.enrich_books_page_count(paged_content, user, pwd)
-            for b in paged_content:
-                ensure_book_dto(b)
-            return ensure_page_dto({
-                "content": paged_content,
-                "totalElements": total,
-                "number": page,
-                "size": size
-            }, default_page=page, default_size=size)
-
-        books = await grimmory_client.get_series_books_custom(series_id, user, pwd)
-        start = page * size
-        paged_content = books[start:start + size]
-        await grimmory_client.enrich_books_page_count(paged_content, user, pwd)
-        for b in paged_content:
-            ensure_book_dto(b)
-        return ensure_page_dto({
-            "content": paged_content,
-            "totalElements": len(books),
-            "number": page,
-            "size": size
-        }, default_page=page, default_size=size)
+        effective_sort = sort or str(body.get("sort", ""))
+        return await _get_series_books(series_id, user, pwd, page, size, effective_sort, library_id)
 
 
     # 2. Check if filtering by read status
@@ -346,19 +278,7 @@ async def list_books_post(
         if user_libs is not None:
             db_books = [b for b in db_books if str(b.get("libraryId") or b.get("library_id", "")) in user_libs]
         effective_sort = sort or str(body.get("sort", ""))
-        db_books = sort_book_dtos(db_books, effective_sort)
-        total = len(db_books)
-        start = page * size
-        paged_content = db_books[start:start + size]
-        await grimmory_client.enrich_books_page_count(paged_content, user, pwd)
-        for b in paged_content:
-            ensure_book_dto(b)
-        return ensure_page_dto({
-            "content": paged_content,
-            "totalElements": total,
-            "number": page,
-            "size": size
-        }, default_page=page, default_size=size)
+        return await _enrich_and_paginate_books(db_books, user, pwd, page, size, effective_sort)
 
     return ensure_page_dto({"content": []}, default_page=page, default_size=size)
 
@@ -679,9 +599,7 @@ async def update_read_progress(
     page = body.get("page", 1)
     completed = body.get("completed", False)
 
-    success = await grimmory_client.update_read_progress(book_id, page, completed, user, pwd)
-    if success:
-        return Response(status_code=status.HTTP_204_NO_CONTENT)
+    await grimmory_client.update_read_progress(book_id, page, completed, user, pwd)
     return Response(status_code=status.HTTP_204_NO_CONTENT)
 
 

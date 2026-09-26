@@ -132,12 +132,77 @@ class Database:
                 CREATE INDEX IF NOT EXISTS idx_read_progress_completed ON read_progress (user, completed);
             """)
 
+    # --- Private Helpers ---
+    def _normalize_library_ids(self, library_id: Optional[Union[str, List[str], Set[str]]]) -> Optional[List[str]]:
+        """Normalize library_id input to a list of ID strings, or None for no filter."""
+        if library_id is None:
+            return None
+        if isinstance(library_id, str):
+            if "," in library_id:
+                ids = [x.strip() for x in library_id.split(",") if x.strip()]
+                return ids if ids else None
+            stripped = library_id.strip()
+            return [stripped] if stripped else None
+        if isinstance(library_id, (list, set, tuple)):
+            ids = [str(x) for x in library_id if str(x).strip()]
+            return ids if ids else None
+        return None
+
+    def _parse_dto_rows(self, rows) -> List[Dict[str, Any]]:
+        """Parse dto_json from database rows, skipping invalid entries."""
+        result = []
+        for r in rows:
+            try:
+                result.append(json.loads(r["dto_json"]))
+            except Exception:
+                pass
+        return result
+
+    def _query_with_library_filter(
+        self,
+        conn: sqlite3.Connection,
+        base_query: str,
+        lib_ids: Optional[List[str]],
+        extra_where: str = "",
+        extra_params: Optional[list] = None,
+        order_by: str = ""
+    ) -> list:
+        """Execute a query with optional library_id filtering."""
+        params = []
+        where_parts = []
+
+        if lib_ids:
+            if len(lib_ids) == 1:
+                where_parts.append("library_id = ?")
+                params.append(lib_ids[0])
+            else:
+                placeholders = ",".join("?" * len(lib_ids))
+                where_parts.append(f"library_id IN ({placeholders})")
+                params.extend(lib_ids)
+
+        if extra_where:
+            where_parts.append(extra_where)
+            if extra_params:
+                params.extend(extra_params)
+
+        query = base_query
+        if where_parts:
+            query += " WHERE " + " AND ".join(where_parts)
+        if order_by:
+            query += f" ORDER BY {order_by}"
+
+        return conn.execute(query, params).fetchall()
+
     # --- Series Operations ---
+    def _extract_series_fields(self, s: Dict[str, Any]) -> tuple:
+        s_id = str(s.get("id"))
+        lib_id = str(s.get("libraryId", ""))
+        name = str(s.get("name") or s.get("metadata", {}).get("title") or "")
+        books_count = int(s.get("booksCount", 0))
+        return s_id, lib_id, name, books_count
+
     def save_series(self, series_dto: Dict[str, Any]):
-        s_id = str(series_dto.get("id"))
-        lib_id = str(series_dto.get("libraryId", ""))
-        name = str(series_dto.get("name") or series_dto.get("metadata", {}).get("title") or "")
-        books_count = int(series_dto.get("booksCount", 0))
+        s_id, lib_id, name, books_count = self._extract_series_fields(series_dto)
         now = time.time()
         with self._get_connection() as conn:
             conn.execute(
@@ -149,10 +214,7 @@ class Database:
         now = time.time()
         rows = []
         for s in series_list:
-            s_id = str(s.get("id"))
-            lib_id = str(s.get("libraryId", ""))
-            name = str(s.get("name") or s.get("metadata", {}).get("title") or "")
-            books_count = int(s.get("booksCount", 0))
+            s_id, lib_id, name, books_count = self._extract_series_fields(s)
             rows.append((s_id, lib_id, name, books_count, json.dumps(s), now))
         with self._get_connection() as conn:
             conn.executemany(
@@ -171,82 +233,48 @@ class Database:
         return None
 
     def get_all_series(self, library_id: Optional[Union[str, List[str], Set[str]]] = None) -> List[Dict[str, Any]]:
+        lib_ids = self._normalize_library_ids(library_id)
         with self._get_connection() as conn:
-            if isinstance(library_id, str) and "," in library_id:
-                library_id = [x.strip() for x in library_id.split(",") if x.strip()]
-
-            if isinstance(library_id, (list, set, tuple)):
-                lib_list = [str(x) for x in library_id if str(x).strip()]
-                if not lib_list:
-                    rows = conn.execute("SELECT dto_json FROM series ORDER BY name ASC, id ASC").fetchall()
-                elif len(lib_list) == 1:
-                    rows = conn.execute("SELECT dto_json FROM series WHERE library_id = ? ORDER BY name ASC, id ASC", (lib_list[0],)).fetchall()
-                else:
-                    placeholders = ",".join("?" * len(lib_list))
-                    rows = conn.execute(f"SELECT dto_json FROM series WHERE library_id IN ({placeholders}) ORDER BY name ASC, id ASC", lib_list).fetchall()
-            elif library_id:
-                rows = conn.execute("SELECT dto_json FROM series WHERE library_id = ? ORDER BY name ASC, id ASC", (str(library_id),)).fetchall()
-            else:
-                rows = conn.execute("SELECT dto_json FROM series ORDER BY name ASC, id ASC").fetchall()
-            result = []
-            for r in rows:
-                try:
-                    result.append(json.loads(r["dto_json"]))
-                except Exception:
-                    pass
-            return result
+            rows = self._query_with_library_filter(
+                conn, "SELECT dto_json FROM series", lib_ids,
+                order_by="name ASC, id ASC"
+            )
+            return self._parse_dto_rows(rows)
 
     def search_series(self, query: str, library_id: Optional[Union[str, List[str], Set[str]]] = None) -> List[Dict[str, Any]]:
         term = f"%{query.strip()}%"
+        lib_ids = self._normalize_library_ids(library_id)
         with self._get_connection() as conn:
-            if isinstance(library_id, str) and "," in library_id:
-                library_id = [x.strip() for x in library_id.split(",") if x.strip()]
-
-            if isinstance(library_id, (list, set, tuple)):
-                lib_list = [str(x) for x in library_id if str(x).strip()]
-                if not lib_list:
-                    rows = conn.execute("SELECT dto_json FROM series WHERE (name LIKE ? OR dto_json LIKE ?) ORDER BY name ASC, id ASC", (term, term)).fetchall()
-                elif len(lib_list) == 1:
-                    rows = conn.execute("SELECT dto_json FROM series WHERE library_id = ? AND (name LIKE ? OR dto_json LIKE ?) ORDER BY name ASC, id ASC", (lib_list[0], term, term)).fetchall()
-                else:
-                    placeholders = ",".join("?" * len(lib_list))
-                    rows = conn.execute(f"SELECT dto_json FROM series WHERE library_id IN ({placeholders}) AND (name LIKE ? OR dto_json LIKE ?) ORDER BY name ASC, id ASC", lib_list + [term, term]).fetchall()
-            elif library_id:
-                rows = conn.execute(
-                    "SELECT dto_json FROM series WHERE library_id = ? AND (name LIKE ? OR dto_json LIKE ?) ORDER BY name ASC, id ASC",
-                    (str(library_id), term, term)
-                ).fetchall()
-            else:
-                rows = conn.execute(
-                    "SELECT dto_json FROM series WHERE (name LIKE ? OR dto_json LIKE ?) ORDER BY name ASC, id ASC",
-                    (term, term)
-                ).fetchall()
-            result = []
-            for r in rows:
-                try:
-                    result.append(json.loads(r["dto_json"]))
-                except Exception:
-                    pass
-            return result
+            rows = self._query_with_library_filter(
+                conn, "SELECT dto_json FROM series", lib_ids,
+                extra_where="(name LIKE ? OR dto_json LIKE ?)",
+                extra_params=[term, term],
+                order_by="name ASC, id ASC"
+            )
+            return self._parse_dto_rows(rows)
 
     # --- Books Operations ---
-    def save_book(self, book_dto: Dict[str, Any]):
-        b_id = str(book_dto.get("id"))
-        s_id = str(book_dto.get("seriesId", ""))
-        lib_id = str(book_dto.get("libraryId", ""))
-        name = str(book_dto.get("name") or book_dto.get("metadata", {}).get("title") or "")
+    def _extract_book_fields(self, b: Dict[str, Any]) -> tuple:
+        b_id = str(b.get("id"))
+        s_id = str(b.get("seriesId", ""))
+        lib_id = str(b.get("libraryId", ""))
+        name = str(b.get("name") or b.get("metadata", {}).get("title") or "")
         try:
-            num_sort = float(book_dto.get("metadata", {}).get("numberSort", book_dto.get("number", 1.0)))
+            num_sort = float(b.get("metadata", {}).get("numberSort", b.get("number", 1.0)))
         except Exception:
             num_sort = 1.0
-        pages_count = int(book_dto.get("media", {}).get("pagesCount", 1))
+        pages_count = int(b.get("media", {}).get("pagesCount", 1))
+        return b_id, s_id, lib_id, name, num_sort, pages_count
+
+    def save_book(self, book_dto: Dict[str, Any]):
+        b_id, s_id, lib_id, name, num_sort, pages_count = self._extract_book_fields(book_dto)
         now = time.time()
         prog = book_dto.get("readProgress")
         if isinstance(prog, dict):
-            page = prog.get("page", 1)
-            completed = prog.get("completed", False)
-            read_date = prog.get("readDate", "")
-            self.save_read_progress("default", b_id, page, completed, read_date, prog)
+            self.save_read_progress(
+                "default", b_id, prog.get("page", 1),
+                prog.get("completed", False), prog.get("readDate", ""), prog
+            )
 
         b_clean = dict(book_dto)
         b_clean.pop("readProgress", None)
@@ -260,21 +288,13 @@ class Database:
         now = time.time()
         rows = []
         for b in books_list:
-            b_id = str(b.get("id"))
-            s_id = str(b.get("seriesId", ""))
-            lib_id = str(b.get("libraryId", ""))
-            name = str(b.get("name") or b.get("metadata", {}).get("title") or "")
-            try:
-                num_sort = float(b.get("metadata", {}).get("numberSort", b.get("number", 1.0)))
-            except Exception:
-                num_sort = 1.0
-            pages_count = int(b.get("media", {}).get("pagesCount", 1))
+            b_id, s_id, lib_id, name, num_sort, pages_count = self._extract_book_fields(b)
             prog = b.get("readProgress")
             if isinstance(prog, dict):
-                page = prog.get("page", 1)
-                completed = prog.get("completed", False)
-                read_date = prog.get("readDate", "")
-                self.save_read_progress("default", b_id, page, completed, read_date, prog)
+                self.save_read_progress(
+                    "default", b_id, prog.get("page", 1),
+                    prog.get("completed", False), prog.get("readDate", ""), prog
+                )
             b_clean = dict(b)
             b_clean.pop("readProgress", None)
             rows.append((b_id, s_id, lib_id, name, num_sort, pages_count, json.dumps(b_clean), now))
@@ -294,7 +314,8 @@ class Database:
                     pass
         return None
 
-    def get_previous_book(self, book_id: str) -> Optional[Dict[str, Any]]:
+    def _get_adjacent_book(self, book_id: str, direction: str) -> Optional[Dict[str, Any]]:
+        """Get the previous or next book in the same series by number_sort."""
         current = self.get_book(book_id)
         if not current:
             return None
@@ -305,11 +326,14 @@ class Database:
             num_sort = float(current.get("metadata", {}).get("numberSort", current.get("number", 1.0)))
         except Exception:
             num_sort = 1.0
+
+        if direction == "previous":
+            query = "SELECT dto_json FROM books WHERE series_id = ? AND number_sort < ? ORDER BY number_sort DESC, id DESC LIMIT 1"
+        else:
+            query = "SELECT dto_json FROM books WHERE series_id = ? AND number_sort > ? ORDER BY number_sort ASC, id ASC LIMIT 1"
+
         with self._get_connection() as conn:
-            row = conn.execute(
-                "SELECT dto_json FROM books WHERE series_id = ? AND number_sort < ? ORDER BY number_sort DESC, id DESC LIMIT 1",
-                (str(series_id), num_sort)
-            ).fetchone()
+            row = conn.execute(query, (str(series_id), num_sort)).fetchone()
             if row:
                 try:
                     return json.loads(row["dto_json"])
@@ -317,28 +341,11 @@ class Database:
                     pass
         return None
 
+    def get_previous_book(self, book_id: str) -> Optional[Dict[str, Any]]:
+        return self._get_adjacent_book(book_id, "previous")
+
     def get_next_book(self, book_id: str) -> Optional[Dict[str, Any]]:
-        current = self.get_book(book_id)
-        if not current:
-            return None
-        series_id = current.get("seriesId")
-        if not series_id:
-            return None
-        try:
-            num_sort = float(current.get("metadata", {}).get("numberSort", current.get("number", 1.0)))
-        except Exception:
-            num_sort = 1.0
-        with self._get_connection() as conn:
-            row = conn.execute(
-                "SELECT dto_json FROM books WHERE series_id = ? AND number_sort > ? ORDER BY number_sort ASC, id ASC LIMIT 1",
-                (str(series_id), num_sort)
-            ).fetchone()
-            if row:
-                try:
-                    return json.loads(row["dto_json"])
-                except Exception:
-                    pass
-        return None
+        return self._get_adjacent_book(book_id, "next")
 
     def get_books_by_series(self, series_id: str) -> List[Dict[str, Any]]:
         with self._get_connection() as conn:
@@ -346,42 +353,16 @@ class Database:
                 "SELECT dto_json FROM books WHERE series_id = ? ORDER BY number_sort ASC, name ASC, id ASC",
                 (str(series_id),)
             ).fetchall()
-            result = []
-            for r in rows:
-                try:
-                    result.append(json.loads(r["dto_json"]))
-                except Exception:
-                    pass
-            return result
+            return self._parse_dto_rows(rows)
 
     def get_all_books(self, library_id: Optional[Union[str, List[str], Set[str]]] = None) -> List[Dict[str, Any]]:
+        lib_ids = self._normalize_library_ids(library_id)
         with self._get_connection() as conn:
-            if isinstance(library_id, str) and "," in library_id:
-                library_id = [x.strip() for x in library_id.split(",") if x.strip()]
-
-            if isinstance(library_id, (list, set, tuple)):
-                lib_list = [str(x) for x in library_id if str(x).strip()]
-                if not lib_list:
-                    rows = conn.execute("SELECT dto_json FROM books ORDER BY number_sort ASC, name ASC, id ASC").fetchall()
-                elif len(lib_list) == 1:
-                    rows = conn.execute("SELECT dto_json FROM books WHERE library_id = ? ORDER BY number_sort ASC, name ASC, id ASC", (lib_list[0],)).fetchall()
-                else:
-                    placeholders = ",".join("?" * len(lib_list))
-                    rows = conn.execute(f"SELECT dto_json FROM books WHERE library_id IN ({placeholders}) ORDER BY number_sort ASC, name ASC, id ASC", lib_list).fetchall()
-            elif library_id:
-                rows = conn.execute(
-                    "SELECT dto_json FROM books WHERE library_id = ? ORDER BY number_sort ASC, name ASC, id ASC",
-                    (str(library_id),)
-                ).fetchall()
-            else:
-                rows = conn.execute("SELECT dto_json FROM books ORDER BY number_sort ASC, name ASC, id ASC").fetchall()
-            result = []
-            for r in rows:
-                try:
-                    result.append(json.loads(r["dto_json"]))
-                except Exception:
-                    pass
-            return result
+            rows = self._query_with_library_filter(
+                conn, "SELECT dto_json FROM books", lib_ids,
+                order_by="number_sort ASC, name ASC, id ASC"
+            )
+            return self._parse_dto_rows(rows)
 
     def get_latest_books(self, library_id: Optional[str] = None, limit: int = 100) -> List[Dict[str, Any]]:
         with self._get_connection() as conn:
@@ -395,46 +376,19 @@ class Database:
                     "SELECT dto_json FROM books ORDER BY updated_at DESC, id DESC LIMIT ?",
                     (limit,)
                 ).fetchall()
-            result = []
-            for r in rows:
-                try:
-                    result.append(json.loads(r["dto_json"]))
-                except Exception:
-                    pass
-            return result
+            return self._parse_dto_rows(rows)
 
     def search_books(self, query: str, library_id: Optional[Union[str, List[str], Set[str]]] = None) -> List[Dict[str, Any]]:
         term = f"%{query.strip()}%"
+        lib_ids = self._normalize_library_ids(library_id)
         with self._get_connection() as conn:
-            if isinstance(library_id, str) and "," in library_id:
-                library_id = [x.strip() for x in library_id.split(",") if x.strip()]
-
-            if isinstance(library_id, (list, set, tuple)):
-                lib_list = [str(x) for x in library_id if str(x).strip()]
-                if not lib_list:
-                    rows = conn.execute("SELECT dto_json FROM books WHERE (name LIKE ? OR dto_json LIKE ?) ORDER BY name ASC, id ASC", (term, term)).fetchall()
-                elif len(lib_list) == 1:
-                    rows = conn.execute("SELECT dto_json FROM books WHERE library_id = ? AND (name LIKE ? OR dto_json LIKE ?) ORDER BY name ASC, id ASC", (lib_list[0], term, term)).fetchall()
-                else:
-                    placeholders = ",".join("?" * len(lib_list))
-                    rows = conn.execute(f"SELECT dto_json FROM books WHERE library_id IN ({placeholders}) AND (name LIKE ? OR dto_json LIKE ?) ORDER BY name ASC, id ASC", lib_list + [term, term]).fetchall()
-            elif library_id:
-                rows = conn.execute(
-                    "SELECT dto_json FROM books WHERE library_id = ? AND (name LIKE ? OR dto_json LIKE ?) ORDER BY name ASC, id ASC",
-                    (str(library_id), term, term)
-                ).fetchall()
-            else:
-                rows = conn.execute(
-                    "SELECT dto_json FROM books WHERE (name LIKE ? OR dto_json LIKE ?) ORDER BY name ASC, id ASC",
-                    (term, term)
-                ).fetchall()
-            result = []
-            for r in rows:
-                try:
-                    result.append(json.loads(r["dto_json"]))
-                except Exception:
-                    pass
-            return result
+            rows = self._query_with_library_filter(
+                conn, "SELECT dto_json FROM books", lib_ids,
+                extra_where="(name LIKE ? OR dto_json LIKE ?)",
+                extra_params=[term, term],
+                order_by="name ASC, id ASC"
+            )
+            return self._parse_dto_rows(rows)
 
     def get_books_with_release_date(self, library_id: Optional[str] = None) -> List[Dict[str, Any]]:
         with self._get_connection() as conn:
@@ -483,25 +437,8 @@ class Database:
         return None
 
     # --- Read Progress Operations ---
-    def save_read_progress(self, *args, **kwargs):
-        """Save read progress. Supports:
-        save_read_progress(user, book_id, page, completed, read_date, dto)
-        save_read_progress(book_id, page, completed, read_date, dto)  # default user
-        """
+    def save_read_progress(self, user: str, book_id: str, page: int, completed: bool, read_date: str, dto: Dict[str, Any]):
         now = time.time()
-        if len(args) == 6:
-            user, book_id, page, completed, read_date, dto = args
-        elif len(args) == 5:
-            user = kwargs.get("user", "default")
-            book_id, page, completed, read_date, dto = args
-        else:
-            user = kwargs.get("user", "default")
-            book_id = kwargs.get("book_id")
-            page = kwargs.get("page", 1)
-            completed = kwargs.get("completed", False)
-            read_date = kwargs.get("read_date", "")
-            dto = kwargs.get("dto", {})
-
         u = str(user or "default").lower().strip()
         comp_val = 1 if completed else 0
         with self._get_connection() as conn:
@@ -510,29 +447,18 @@ class Database:
                 (u, str(book_id), page, comp_val, read_date, json.dumps(dto), now)
             )
 
-    def get_read_progress(self, arg1: str, arg2: Optional[str] = None) -> Optional[Dict[str, Any]]:
-        """Get read progress. Supports:
-        get_read_progress(user, book_id)
-        get_read_progress(book_id)  # checks default user, or any user
-        """
+    def get_read_progress(self, user: str, book_id: str) -> Optional[Dict[str, Any]]:
+        """Get read progress for a specific user and book, falling back to 'default' user."""
         with self._get_connection() as conn:
-            if arg2 is not None:
-                user = str(arg1 or "default").lower().strip()
-                book_id = str(arg2)
+            u = str(user or "default").lower().strip()
+            row = conn.execute(
+                "SELECT dto_json FROM read_progress WHERE user = ? AND book_id = ?",
+                (u, str(book_id))
+            ).fetchone()
+            if not row and u != "default":
                 row = conn.execute(
-                    "SELECT dto_json FROM read_progress WHERE user = ? AND book_id = ?",
-                    (user, book_id)
-                ).fetchone()
-                if not row and user != "default":
-                    row = conn.execute(
-                        "SELECT dto_json FROM read_progress WHERE user = 'default' AND book_id = ?",
-                        (book_id,)
-                    ).fetchone()
-            else:
-                book_id = str(arg1)
-                row = conn.execute(
-                    "SELECT dto_json FROM read_progress WHERE book_id = ? ORDER BY updated_at DESC",
-                    (book_id,)
+                    "SELECT dto_json FROM read_progress WHERE user = 'default' AND book_id = ?",
+                    (str(book_id),)
                 ).fetchone()
             if row:
                 try:
@@ -592,17 +518,10 @@ class Database:
                         pass
                 return result
 
-    def delete_read_progress(self, arg1: str, arg2: Optional[str] = None):
-        """Supports delete_read_progress(user, book_id) or delete_read_progress(book_id)."""
-        if arg2 is not None:
-            user = str(arg1 or "default").lower().strip()
-            book_id = str(arg2)
-            with self._get_connection() as conn:
-                conn.execute("DELETE FROM read_progress WHERE user = ? AND book_id = ?", (user, book_id))
-        else:
-            book_id = str(arg1)
-            with self._get_connection() as conn:
-                conn.execute("DELETE FROM read_progress WHERE book_id = ?", (book_id,))
+    def delete_read_progress(self, user: str, book_id: str):
+        u = str(user or "default").lower().strip()
+        with self._get_connection() as conn:
+            conn.execute("DELETE FROM read_progress WHERE user = ? AND book_id = ?", (u, str(book_id)))
 
     def get_active_series_ids(self, user: Optional[str] = None) -> List[str]:
         with self._get_connection() as conn:

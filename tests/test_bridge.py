@@ -91,7 +91,7 @@ def test_series_post_list_translation_mock():
 
 def test_series_special_endpoints_mock():
     mock_komga_resp = httpx.Response(200, json={"content": [{"id": "s-1", "name": "Series 1"}]})
-    with patch.object(grimmory_client, "komga_request", new_callable=AsyncMock) as mock_req:
+    with patch.object(grimmory_client, "native_request", new_callable=AsyncMock) as mock_req:
         mock_req.return_value = mock_komga_resp
         for ep in ["/api/v1/series/latest", "/api/v1/series/new", "/api/v1/series/updated"]:
             resp = client.get(ep, headers=AUTH_HEADER)
@@ -130,7 +130,7 @@ def test_book_detail_and_pages_mock():
     mock_client.get = AsyncMock(side_effect=mock_get)
 
     with patch.object(grimmory_client, "get_client", return_value=mock_client), \
-         patch.object(grimmory_client, "komga_request", new_callable=AsyncMock) as mock_komga, \
+         patch.object(grimmory_client, "native_request", new_callable=AsyncMock) as mock_komga, \
          patch.object(grimmory_client, "get_native_token", new_callable=AsyncMock, return_value="dummy-token"):
         
         mock_komga.return_value = httpx.Response(200, json=book_raw)
@@ -250,7 +250,7 @@ def test_book_manifest_mock():
     mock_client.get = AsyncMock(side_effect=mock_get)
 
     with patch.object(grimmory_client, "get_client", return_value=mock_client), \
-         patch.object(grimmory_client, "komga_request", new_callable=AsyncMock) as mock_komga, \
+         patch.object(grimmory_client, "native_request", new_callable=AsyncMock) as mock_komga, \
          patch.object(grimmory_client, "get_native_token", new_callable=AsyncMock, return_value="dummy-token"):
         mock_komga.return_value = httpx.Response(200, json=book_raw)
         resp = client.get("/api/v1/books/book-100/manifest/divina", headers=AUTH_HEADER)
@@ -549,7 +549,7 @@ def test_disambiguated_series_integration_mock():
     mock_client = AsyncMock()
     mock_client.get = AsyncMock(side_effect=mock_app_get)
 
-    with patch.object(grimmory_client, "komga_request", new_callable=AsyncMock) as mock_komga, \
+    with patch.object(grimmory_client, "native_request", new_callable=AsyncMock) as mock_komga, \
          patch.object(grimmory_client, "get_client", return_value=mock_client), \
          patch.object(grimmory_client, "get_native_token", new_callable=AsyncMock, return_value="dummy-token"):
 
@@ -856,7 +856,7 @@ def test_japanese_series_collision_disambiguation_and_navigation():
         {"id": 201, "title": "COMICエウロパ Vol.1", "seriesName": "COMICエウロパ", "seriesNumber": 1.0, "libraryId": 25}
     ]
 
-    async def mock_komga_request(method, path, user, pwd, **kwargs):
+    async def mock_native_request(method, path, user, pwd, **kwargs):
         if path.startswith("/api/v1/series"):
             import copy
             return httpx.Response(200, json=copy.deepcopy(mock_series_list))
@@ -887,7 +887,7 @@ def test_japanese_series_collision_disambiguation_and_navigation():
     mock_client = AsyncMock()
     mock_client.get = AsyncMock(side_effect=mock_native_get)
 
-    with patch.object(grimmory_client, "komga_request", side_effect=mock_komga_request), \
+    with patch.object(grimmory_client, "native_request", side_effect=mock_native_request), \
          patch.object(grimmory_client, "get_client", return_value=mock_client), \
          patch.object(grimmory_client, "get_native_token", new_callable=AsyncMock, return_value="dummy-token"):
 
@@ -1134,7 +1134,7 @@ def test_recently_updated_series_chronological_ordering():
     mock_client = AsyncMock()
     mock_client.get = AsyncMock(side_effect=mock_native_get)
 
-    with patch.object(grimmory_client, "komga_request", new_callable=AsyncMock) as mock_komga, \
+    with patch.object(grimmory_client, "native_request", new_callable=AsyncMock) as mock_komga, \
          patch.object(grimmory_client, "get_client", return_value=mock_client), \
          patch.object(grimmory_client, "get_native_token", new_callable=AsyncMock, return_value="dummy-token"):
 
@@ -1185,7 +1185,7 @@ def test_series_search_filtering():
     db.save_series_batch(mock_series_data["content"])
     grimmory_client.all_series_cache.clear()
 
-    with patch.object(grimmory_client, "komga_request", new_callable=AsyncMock) as mock_komga:
+    with patch.object(grimmory_client, "native_request", new_callable=AsyncMock) as mock_komga:
         mock_komga.return_value = httpx.Response(200, json=mock_series_data)
 
         # 1. GET /api/v1/series?search=Neko (case-insensitive)
@@ -1260,53 +1260,43 @@ def test_books_search_filtering():
 
 def test_read_progress_persistence_and_ondeck():
     """Verify that read progress persists across cache reload and appears in On Deck on startup."""
-    import tempfile
-    import os
-    from app.grimmory_client import read_progress_cache, save_progress_cache, load_progress_cache
+    from app.grimmory_client import read_progress_cache, load_progress_cache
 
-    with tempfile.NamedTemporaryFile(suffix=".json", delete=False) as f:
-        temp_progress_file = f.name
+    # 1. Populate progress via db.save_read_progress (the real persistence mechanism)
+    progress_dto = {"page": 25, "completed": False, "readDate": "2026-09-24T10:00:00Z"}
+    db.save_read_progress("default", "777", 25, False, "2026-09-24T10:00:00Z", progress_dto)
 
-    try:
-        with patch("app.grimmory_client.PROGRESS_FILE", temp_progress_file):
-            # 1. Populate progress and save
-            read_progress_cache["777"] = {"page": 25, "completed": False, "readDate": "2026-09-24T10:00:00Z"}
-            save_progress_cache()
+    # 2. Clear in-memory cache and reload from SQLite
+    read_progress_cache.clear()
+    assert "777" not in read_progress_cache
+    load_progress_cache()
+    assert "777" in read_progress_cache
+    assert read_progress_cache["777"]["page"] == 25
+    assert read_progress_cache["777"]["completed"] is False
 
-            # 2. Clear in-memory cache and reload from disk
-            read_progress_cache.clear()
-            assert "777" not in read_progress_cache
-            load_progress_cache()
-            assert "777" in read_progress_cache
-            assert read_progress_cache["777"]["page"] == 25
-            assert read_progress_cache["777"]["completed"] is False
+    # 3. Simulate bridge startup query for On Deck
+    mock_client = AsyncMock()
+    mock_client.get = AsyncMock(return_value=httpx.Response(200, json=[]))
 
-            # 3. Simulate bridge startup query for On Deck
-            mock_client = AsyncMock()
-            mock_client.get = AsyncMock(return_value=httpx.Response(200, json=[]))
+    async def mock_get_book(b_id, user, pwd):
+        return {
+            "id": str(b_id),
+            "name": f"Book {b_id}",
+            "libraryId": "14",
+            "media": {"pagesCount": 100}
+        }
 
-            async def mock_get_book(b_id, user, pwd):
-                return {
-                    "id": str(b_id),
-                    "name": f"Book {b_id}",
-                    "libraryId": "14",
-                    "media": {"pagesCount": 100}
-                }
+    with patch.object(grimmory_client, "get_client", return_value=mock_client), \
+         patch.object(grimmory_client, "get_book_dto", side_effect=mock_get_book), \
+         patch.object(grimmory_client, "get_native_token", new_callable=AsyncMock, return_value="dummy-token"):
 
-            with patch.object(grimmory_client, "get_client", return_value=mock_client), \
-                 patch.object(grimmory_client, "get_book_dto", side_effect=mock_get_book), \
-                 patch.object(grimmory_client, "get_native_token", new_callable=AsyncMock, return_value="dummy-token"):
-
-                resp = client.get("/api/v1/books/ondeck", headers=AUTH_HEADER)
-                assert resp.status_code == 200
-                content = resp.json()["content"]
-                assert any(b["id"] == "777" for b in content)
-                b777 = next(b for b in content if b["id"] == "777")
-                assert b777["readProgress"]["page"] == 25
-                assert b777["readProgress"]["completed"] is False
-    finally:
-        if os.path.exists(temp_progress_file):
-            os.remove(temp_progress_file)
+        resp = client.get("/api/v1/books/ondeck", headers=AUTH_HEADER)
+        assert resp.status_code == 200
+        content = resp.json()["content"]
+        assert any(b["id"] == "777" for b in content)
+        b777 = next(b for b in content if b["id"] == "777")
+        assert b777["readProgress"]["page"] == 25
+        assert b777["readProgress"]["completed"] is False
 
 
 def test_sqlite_db_cache_and_persistence():
@@ -1356,8 +1346,8 @@ def test_sqlite_db_cache_and_persistence():
         "completed": False,
         "readDate": "2026-09-24T10:00:00Z"
     }
-    db.save_read_progress("b-1", 20, False, "2026-09-24T10:00:00Z", prog_dto)
-    read_p = db.get_read_progress("b-1")
+    db.save_read_progress("default", "b-1", 20, False, "2026-09-24T10:00:00Z", prog_dto)
+    read_p = db.get_read_progress("default", "b-1")
     assert read_p is not None
     assert read_p["page"] == 20
     assert read_p["completed"] is False
@@ -1366,8 +1356,8 @@ def test_sqlite_db_cache_and_persistence():
     assert any(b_id == "b-1" for b_id, _ in in_prog)
 
     # Test delete progress
-    db.delete_read_progress("b-1")
-    assert db.get_read_progress("b-1") is None
+    db.delete_read_progress("default", "b-1")
+    assert db.get_read_progress("default", "b-1") is None
 
 
 @pytest.mark.anyio
@@ -1484,7 +1474,7 @@ async def test_sync_service_full_sync():
         assert cached_books[1]["id"] == "sync-b-2"
 
         # Verify read progress is stored in SQLite DB
-        prog = db.get_read_progress("sync-b-1")
+        prog = db.get_read_progress("testuser", "sync-b-1")
         assert prog is not None
         assert prog["page"] == 5
 
@@ -1752,7 +1742,7 @@ def test_book_file_download_with_fallback_and_proper_extensions():
     mock_client = AsyncMock()
     mock_client.get = AsyncMock(side_effect=mock_native_get)
 
-    with patch.object(grimmory_client, "komga_request", new_callable=AsyncMock) as mock_komga, \
+    with patch.object(grimmory_client, "native_request", new_callable=AsyncMock) as mock_komga, \
          patch.object(grimmory_client, "get_client", return_value=mock_client), \
          patch.object(grimmory_client, "get_native_token", new_callable=AsyncMock, return_value="dummy-token"):
 
@@ -1831,7 +1821,7 @@ async def test_sync_service_unauthorized_detected():
     async def mock_komga_401(method, path, user, pwd, **kwargs):
         return httpx.Response(401, json={"message": "Unauthorized"})
 
-    with patch.object(grimmory_client, "komga_request", side_effect=mock_komga_401):
+    with patch.object(grimmory_client, "native_request", side_effect=mock_komga_401):
         stats = await sync_service.run_full_sync("wronguser", "wrongpass")
         assert stats["status"] == "unauthorized"
         assert "401" in stats["error"]
@@ -1882,7 +1872,7 @@ def test_snappy_performance_zero_network_when_cached():
     mock_client = AsyncMock()
     mock_client.get = AsyncMock(side_effect=RuntimeError("Client GET should NOT occur when data is cached in SQLite!"))
 
-    with patch.object(grimmory_client, "komga_request", side_effect=mock_komga), \
+    with patch.object(grimmory_client, "native_request", side_effect=mock_komga), \
          patch.object(grimmory_client, "get_client", return_value=mock_client), \
          patch.object(grimmory_client, "get_user_library_ids", new_callable=AsyncMock, return_value={"lib-snappy"}):
 
@@ -1976,9 +1966,9 @@ async def test_continue_reading_and_ondeck_never_show_finished_books():
 
     # Save to SQLite
     db.save_books_batch([book_finished, book_manga_1, book_manga_2, book_manga_3])
-    db.save_read_progress("1001", 50, True, "2026-09-24T12:00:00Z", book_finished["readProgress"])
-    db.save_read_progress("2001", 100, True, "2026-09-24T11:00:00Z", book_manga_1["readProgress"])
-    db.save_read_progress("2002", 15, False, "2026-09-24T13:00:00Z", book_manga_2["readProgress"])
+    db.save_read_progress("default", "1001", 50, True, "2026-09-24T12:00:00Z", book_finished["readProgress"])
+    db.save_read_progress("default", "2001", 100, True, "2026-09-24T11:00:00Z", book_manga_1["readProgress"])
+    db.save_read_progress("default", "2002", 15, False, "2026-09-24T13:00:00Z", book_manga_2["readProgress"])
     read_progress_cache["1001"] = book_finished["readProgress"]
     read_progress_cache["2001"] = book_manga_1["readProgress"]
     read_progress_cache["2002"] = book_manga_2["readProgress"]
@@ -2018,7 +2008,7 @@ async def test_reconcile_read_progress_heals_stale_cache():
 
     # Simulate stale record in DB where completed = 0, but Grimmory has readStatus = READ
     stale_dto = {"page": 1, "completed": False, "readDate": "2026-09-24T09:00:00Z"}
-    db.save_read_progress("stale-101", 1, False, "2026-09-24T09:00:00Z", stale_dto)
+    db.save_read_progress("default", "stale-101", 1, False, "2026-09-24T09:00:00Z", stale_dto)
     read_progress_cache["stale-101"] = stale_dto
 
     # Grimmory returns readStatus: 'READ'
@@ -2036,7 +2026,7 @@ async def test_reconcile_read_progress_heals_stale_cache():
         await grimmory_client.reconcile_read_progress("test_user", "test_pwd")
 
         # After reconciliation, DB must have completed = 1!
-        cached_p = db.get_read_progress("stale-101")
+        cached_p = db.get_read_progress("default", "stale-101")
         assert cached_p is not None
         assert cached_p["completed"] is True
         assert read_progress_cache["stale-101"]["completed"] is True
@@ -2248,7 +2238,7 @@ def test_homepage_endpoints():
     db.save_series({"id": "hp-s1", "libraryId": "14", "name": "Homepage Series 1"})
     db.save_book({"id": "hp-b1", "seriesId": "hp-s1", "libraryId": "14", "name": "Book 1", "number": 1})
 
-    with patch.object(grimmory_client, "komga_request", new_callable=AsyncMock) as mock_komga, \
+    with patch.object(grimmory_client, "native_request", new_callable=AsyncMock) as mock_komga, \
          patch.object(grimmory_client, "get_user_library_ids", new_callable=AsyncMock, return_value={"14", "15", "16"}):
         mock_komga.return_value = httpx.Response(200, json={"content": []})
 
@@ -2388,7 +2378,7 @@ def test_download_book_file_prioritizes_komga_and_rejects_html():
     mock_client = AsyncMock()
     mock_client.get = AsyncMock(side_effect=mock_native_get)
 
-    with patch.object(grimmory_client, "komga_request", new_callable=AsyncMock) as mock_komga, \
+    with patch.object(grimmory_client, "native_request", new_callable=AsyncMock) as mock_komga, \
          patch.object(grimmory_client, "get_client", return_value=mock_client), \
          patch.object(grimmory_client, "get_native_token", new_callable=AsyncMock, return_value="dummy-token"):
 
@@ -2402,7 +2392,7 @@ def test_download_book_file_prioritizes_komga_and_rejects_html():
         assert "Murtagh.epub" in resp.headers["Content-Disposition"]
 
     # Case B: Both Komga and native return HTML fallback -> Should 404 rather than serve HTML as epub
-    with patch.object(grimmory_client, "komga_request", new_callable=AsyncMock) as mock_komga, \
+    with patch.object(grimmory_client, "native_request", new_callable=AsyncMock) as mock_komga, \
          patch.object(grimmory_client, "get_client", return_value=mock_client), \
          patch.object(grimmory_client, "get_native_token", new_callable=AsyncMock, return_value="dummy-token"):
 

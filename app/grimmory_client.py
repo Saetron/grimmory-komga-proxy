@@ -1,6 +1,5 @@
 import os
 import json
-import tempfile
 import base64
 import time
 import httpx
@@ -14,8 +13,6 @@ import asyncio
 import logging
 
 logger = logging.getLogger("grimmory-komga-bridge")
-
-PROGRESS_FILE = os.getenv("PROGRESS_FILE", os.path.join(tempfile.gettempdir(), "grimmory_progress_cache.json"))
 
 # In-memory caches:
 # Cache JWT tokens for native Grimmory API (1 hour TTL)
@@ -148,27 +145,11 @@ thumbnail_cache: DiskThumbnailCache = DiskThumbnailCache()
 active_sessions: Dict[str, Dict[str, Any]] = {}
 
 def load_progress_cache():
+    """Load read progress from persistent SQLite database into in-memory cache."""
     try:
-        # Load from persistent SQLite database first
         for k, v in db.get_all_read_progress_map().items():
             if isinstance(v, dict):
                 read_progress_cache[k] = v
-        # Backward compatibility with PROGRESS_FILE if present
-        if os.path.exists(PROGRESS_FILE):
-            with open(PROGRESS_FILE, "r", encoding="utf-8") as f:
-                data = json.load(f)
-                if isinstance(data, dict):
-                    for k, v in data.items():
-                        if isinstance(v, dict):
-                            read_progress_cache[k] = v
-    except Exception:
-        pass
-
-def save_progress_cache():
-    try:
-        data = {k: v for k, v in read_progress_cache.items() if isinstance(v, dict)}
-        with open(PROGRESS_FILE, "w", encoding="utf-8") as f:
-            json.dump(data, f)
     except Exception:
         pass
 
@@ -263,28 +244,6 @@ class GrimmoryClient:
             return {"Authorization": f"Bearer {token}"}
         return self.get_basic_auth_header(user, pwd)
 
-    async def komga_request(
-        self,
-        method: str,
-        path: str,
-        user: str,
-        pwd: str,
-        params: Optional[Dict[str, Any]] = None,
-        json_data: Optional[Any] = None,
-        headers: Optional[Dict[str, str]] = None
-    ) -> httpx.Response:
-        """Deprecated: Grimmory's /komga endpoint is disabled. Forward to native_request."""
-        clean_path = path[6:] if path.startswith("/komga") else path
-        return await self.native_request(
-            method=method,
-            path=clean_path,
-            user=user,
-            pwd=pwd,
-            params=params,
-            json_data=json_data,
-            headers=headers
-        )
-
     async def get_libraries(self, user: str, pwd: str) -> List[Dict[str, Any]]:
         """Fetch libraries via Grimmory native API."""
         native_headers = await self.get_native_headers(user, pwd)
@@ -327,23 +286,21 @@ class GrimmoryClient:
             return str(library_id) in user_libs
         return True
 
-    async def user_can_access_book(self, book_dto: Dict[str, Any], user: str, pwd: str) -> bool:
-        """Verify whether user has access to the book's library."""
-        if not book_dto or not isinstance(book_dto, dict):
+    async def user_can_access_item(self, dto: Dict[str, Any], user: str, pwd: str) -> bool:
+        """Verify whether user has access to the item's library."""
+        if not dto or not isinstance(dto, dict):
             return False
-        lib_id = str(book_dto.get("libraryId") or book_dto.get("library_id") or "")
+        lib_id = str(dto.get("libraryId") or dto.get("library_id") or "")
         if not lib_id:
             return True
         return await self.user_can_access_library(lib_id, user, pwd)
 
+    # Aliases for backward compatibility
+    async def user_can_access_book(self, book_dto: Dict[str, Any], user: str, pwd: str) -> bool:
+        return await self.user_can_access_item(book_dto, user, pwd)
+
     async def user_can_access_series(self, series_dto: Dict[str, Any], user: str, pwd: str) -> bool:
-        """Verify whether user has access to the series' library."""
-        if not series_dto or not isinstance(series_dto, dict):
-            return False
-        lib_id = str(series_dto.get("libraryId") or series_dto.get("library_id") or "")
-        if not lib_id:
-            return True
-        return await self.user_can_access_library(lib_id, user, pwd)
+        return await self.user_can_access_item(series_dto, user, pwd)
 
     async def native_request(
         self,
@@ -923,7 +880,6 @@ class GrimmoryClient:
                 read_progress_cache[p_key] = progress_dto
                 if u == "default":
                     read_progress_cache[book_id] = progress_dto
-                save_progress_cache()
                 try:
                     db.save_read_progress(u, book_id, page, completed, date_finished or now_iso, progress_dto)
                 except Exception:
@@ -1001,7 +957,6 @@ class GrimmoryClient:
         read_progress_cache[p_key] = progress_dto
         if u == "default":
             read_progress_cache[book_id] = progress_dto
-        save_progress_cache()
         try:
             db.save_read_progress(u, book_id, page, is_completed, date_finished or now_iso, progress_dto)
         except Exception:
@@ -1104,7 +1059,6 @@ class GrimmoryClient:
         read_progress_cache.pop(p_key, None)
         if u == "default":
             read_progress_cache.pop(book_id, None)
-        save_progress_cache()
         try:
             db.delete_read_progress(u, book_id)
         except Exception:
@@ -1408,7 +1362,6 @@ class GrimmoryClient:
                         pass
 
             await asyncio.gather(*[_reconcile_one(b_id) for b_id, _ in in_prog_rows], return_exceptions=True)
-            save_progress_cache()
             active_now = len(db.get_all_in_progress(user=u))
             logger.info(f"[Reconcile] Read progress reconciled with Grimmory for user '{u}': {active_now} active in-progress books.")
             return active_now

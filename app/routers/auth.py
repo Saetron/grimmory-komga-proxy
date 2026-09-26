@@ -60,16 +60,11 @@ async def get_current_user(authorization: Optional[str] = Header(None)) -> Dict[
         if standard_role not in roles:
             roles.append(standard_role)
     data["roles"] = roles
-    data.setdefault("sharedAllLibraries", True)
 
     user_libs = await grimmory_client.get_user_library_ids(user, pwd)
     if user_libs:
         data["sharedLibrariesIds"] = sorted(list(user_libs))
-    else:
-        data.setdefault("sharedLibrariesIds", [])
 
-    data.setdefault("labelsAllow", [])
-    data.setdefault("labelsExclude", [])
     return data
 
 @router.get("/api/v1/login/set-cookie")
