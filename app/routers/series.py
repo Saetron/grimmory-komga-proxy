@@ -282,7 +282,7 @@ async def get_series_books(
     if "-standalone-" in series_id:
         b_id = series_id.split("-standalone-")[-1]
         book = await grimmory_client.get_book_dto(b_id, user, pwd)
-        content = [ensure_book_dto(book)] if book else []
+        content = [ensure_book_dto(book, user=user)] if book else []
         return ensure_page_dto({"content": content}, default_page=page, default_size=size)
 
     # Handle custom disambiguated series
@@ -292,7 +292,7 @@ async def get_series_books(
         paged_content = books[start:start + size]
         await grimmory_client.enrich_books_page_count(paged_content, user, pwd)
         for b in paged_content:
-            ensure_book_dto(b)
+            ensure_book_dto(b, user=user)
         return ensure_page_dto({
             "content": paged_content,
             "totalElements": len(books),
@@ -313,7 +313,7 @@ async def get_series_books(
         paged_content = db_books[start:start + size]
         await grimmory_client.enrich_books_page_count(paged_content, user, pwd)
         for b in paged_content:
-            ensure_book_dto(b)
+            ensure_book_dto(b, user=user)
         return ensure_page_dto({
             "content": paged_content,
             "totalElements": total,

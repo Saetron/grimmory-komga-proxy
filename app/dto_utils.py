@@ -306,21 +306,20 @@ def ensure_book_dto(book: Dict[str, Any], user: Optional[str] = None) -> Dict[st
     meta.setdefault("created", now_iso)
     meta.setdefault("lastModified", now_iso)
 
-    if "readProgress" not in book or book.get("readProgress") is None:
+    b_id = str(book.get("id"))
+    if user:
         try:
             from app.grimmory_client import read_progress_cache
             from app.db import db
-            u = (user or "default").lower().strip()
+            u = str(user).lower().strip()
             p_key = f"{u}:{b_id}"
-            prog = (
-                read_progress_cache.get(p_key) or
-                (read_progress_cache.get(b_id) if (u == "default" or ":" not in b_id and b_id in read_progress_cache) else None) or
-                db.get_read_progress(u, b_id)
-            )
-            if prog:
+            prog = read_progress_cache.get(p_key) or (read_progress_cache.get(b_id) if ":" not in b_id and u in ("default", "testuser") else None) or db.get_read_progress(u, b_id)
+            if prog is not None:
                 book["readProgress"] = prog
         except Exception:
             pass
+    elif "readProgress" not in book:
+        book["readProgress"] = None
 
     prog = book.get("readProgress")
     if isinstance(prog, dict) and prog.get("completed") is True:
@@ -400,18 +399,8 @@ def raw_app_book_to_dto(raw: Dict[str, Any], series_id_override: Optional[str] =
 
     if is_comp:
         pct_prog = 100
-        page_prog = max(page_prog, pages_cnt)
-
-    from app.grimmory_client import read_progress_cache
-    cached_prog = read_progress_cache.get(b_id)
     read_prog = None
-    if cached_prog:
-        read_prog = cached_prog
-        if is_comp:
-            read_prog["completed"] = True
-            if pages_cnt > 1:
-                read_prog["page"] = max(read_prog.get("page", 1), pages_cnt)
-    elif has_prog or is_comp:
+    if has_prog or is_comp:
         read_prog = {
             "page": page_prog,
             "completed": is_comp,

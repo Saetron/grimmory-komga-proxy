@@ -87,7 +87,7 @@ async def _enrich_and_paginate_books(
     paged_content = books[start:start + size]
     await grimmory_client.enrich_books_page_count(paged_content, user, pwd)
     for b in paged_content:
-        ensure_book_dto(b)
+        ensure_book_dto(b, user=user)
     return ensure_page_dto({
         "content": paged_content,
         "totalElements": total,
@@ -105,7 +105,7 @@ async def _get_series_books(
     if "-standalone-" in series_id:
         b_id = series_id.split("-standalone-")[-1]
         book = await grimmory_client.get_book_dto(b_id, user, pwd)
-        content = [ensure_book_dto(book)] if book else []
+        content = [ensure_book_dto(book, user=user)] if book else []
         return ensure_page_dto({"content": content}, default_page=page, default_size=size)
 
     if "-u-" in series_id:
@@ -345,7 +345,7 @@ async def get_book(
     book = await grimmory_client.get_book_dto(book_id, user, pwd)
     if not book:
         raise HTTPException(status_code=404, detail="Book not found")
-    return ensure_book_dto(book)
+    return ensure_book_dto(book, user=user)
 
 
 @router.get("/{book_id}/previous")
@@ -361,12 +361,12 @@ async def get_book_previous(
     prev_book = db.get_previous_book(book_id)
     if prev_book:
         if await grimmory_client.user_can_access_book(prev_book, user, pwd):
-            return ensure_book_dto(prev_book)
+            return ensure_book_dto(prev_book, user=user)
 
     book = await grimmory_client.get_adjacent_book(book_id, direction="previous", user=user, pwd=pwd)
     if not book:
         raise HTTPException(status_code=404, detail="No previous book")
-    return ensure_book_dto(book)
+    return ensure_book_dto(book, user=user)
 
 
 @router.get("/{book_id}/next")
@@ -379,12 +379,12 @@ async def get_book_next(
     next_book = db.get_next_book(book_id)
     if next_book:
         if await grimmory_client.user_can_access_book(next_book, user, pwd):
-            return ensure_book_dto(next_book)
+            return ensure_book_dto(next_book, user=user)
 
     book = await grimmory_client.get_adjacent_book(book_id, direction="next", user=user, pwd=pwd)
     if not book:
         raise HTTPException(status_code=404, detail="No next book")
-    return ensure_book_dto(book)
+    return ensure_book_dto(book, user=user)
 
 
 @router.get("/{book_id}/thumbnail")

@@ -143,7 +143,7 @@ class SyncService:
                         b_id = str(b.get("id"))
                         if b_id:
                             await grimmory_client.get_read_progress(b_id, user, pwd)
-                    in_prog_count = len(db.get_all_in_progress())
+                    in_prog_count = len(db.get_all_in_progress(user=user))
             except Exception as e:
                 logger.debug(f"[BackgroundSync] Progress sync note: {e}")
 

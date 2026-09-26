@@ -61,17 +61,12 @@ async def list_libraries(authorization: Optional[str] = Header(None)) -> List[Di
     user, pwd = grimmory_client.extract_credentials(authorization)
     libraries = await grimmory_client.get_libraries(user, pwd)
 
-    # Merge with SQLite libraries (cached or auto-discovered from books and series)
-    db_libs = db.get_all_libraries()
-    existing_ids = {str(l.get("id")) for l in libraries if l.get("id")}
-    for dl in db_libs:
-        dl_id = str(dl.get("id"))
-        if dl_id and dl_id not in existing_ids:
-            libraries.append(dl)
-            existing_ids.add(dl_id)
-
     if not libraries:
-        libraries = [{"id": "1", "name": "Default"}]
+        db_libs = db.get_all_libraries()
+        if db_libs:
+            libraries = db_libs
+        else:
+            libraries = [{"id": "1", "name": "Default"}]
 
     return [ensure_library_dto(lib) for lib in libraries]
 
@@ -81,17 +76,13 @@ async def get_library(library_id: str, authorization: Optional[str] = Header(Non
     target_id = str(library_id)
 
     libraries = await grimmory_client.get_libraries(user, pwd)
+    if not libraries:
+        db_libs = db.get_all_libraries()
+        libraries = db_libs or [{"id": "1", "name": "Default"}]
+
     for lib in libraries:
         if str(lib.get("id")) == target_id:
             return ensure_library_dto(lib)
-
-    db_lib = db.get_library(target_id)
-    if db_lib:
-        return ensure_library_dto(db_lib)
-
-    if target_id in db.get_all_library_ids():
-        name = settings.CUSTOM_LIBRARY_NAMES.get(target_id, f"Library {target_id}")
-        return ensure_library_dto({"id": target_id, "name": name})
 
     raise HTTPException(status_code=404, detail="Library not found")
 

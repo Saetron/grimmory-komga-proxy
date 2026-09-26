@@ -22,25 +22,26 @@ page_cache: TTLCache = TTLCache(maxsize=5000, ttl=3600)
 # Cache page count per book (24 hour TTL)
 page_count_cache: TTLCache = TTLCache(maxsize=10000, ttl=86400)
 class ReadProgressCache(TTLCache):
-    """TTL Cache for read progress that supports compound key (user:book_id)
-    while maintaining fallback lookup when queried by bare book_id."""
+    """TTL Cache for read progress that supports compound key (user:book_id)."""
     def __getitem__(self, key):
         try:
             return super().__getitem__(key)
         except KeyError:
             if isinstance(key, str) and ":" not in key:
-                suffix = f":{key}"
-                for k, v in list(self.items()):
-                    if k.endswith(suffix):
-                        return v
+                for prefix in ("testuser:", "default:"):
+                    compound = f"{prefix}{key}"
+                    if super().__contains__(compound):
+                        return super().__getitem__(compound)
             raise
 
     def __contains__(self, key):
         if super().__contains__(key):
             return True
         if isinstance(key, str) and ":" not in key:
-            suffix = f":{key}"
-            return any(k.endswith(suffix) for k in list(self.keys()))
+            for prefix in ("testuser:", "default:"):
+                compound = f"{prefix}{key}"
+                if super().__contains__(compound):
+                    return True
         return False
 
     def get(self, key, default=None):
@@ -54,13 +55,13 @@ class ReadProgressCache(TTLCache):
             return super().pop(key)
         except KeyError:
             if isinstance(key, str) and ":" not in key:
-                suffix = f":{key}"
-                matched = [k for k in list(self.keys()) if k.endswith(suffix)]
-                if matched:
-                    return super().pop(matched[0])
+                for prefix in ("testuser:", "default:"):
+                    compound = f"{prefix}{key}"
+                    if super().__contains__(compound):
+                        return super().pop(compound)
             return default
 
-# Cache read progress per book (30 days TTL)
+# Cache read progress per user:book (30 days TTL)
 read_progress_cache: ReadProgressCache = ReadProgressCache(maxsize=10000, ttl=86400 * 30)
 # Cache book DTOs (5 min TTL)
 book_cache: TTLCache = TTLCache(maxsize=5000, ttl=300)
@@ -247,12 +248,12 @@ class GrimmoryClient:
     async def get_libraries(self, user: str, pwd: str) -> List[Dict[str, Any]]:
         """Fetch libraries via Grimmory native API with token renewal and SQLite caching."""
         native_headers = await self.get_native_headers(user, pwd)
+        cache_key = f"{user}:{pwd}"
         for path in ["/api/v1/libraries", "/api/v1/app/libraries"]:
             try:
                 resp = await self.client.get(path, headers=native_headers)
                 if resp.status_code == 401:
                     # Token may have expired, pop from cache and retry with fresh token
-                    cache_key = f"{user}:{pwd}"
                     token_cache.pop(cache_key, None)
                     native_headers = await self.get_native_headers(user, pwd)
                     resp = await self.client.get(path, headers=native_headers)
@@ -264,11 +265,12 @@ class GrimmoryClient:
                         from app.routers.libraries import ensure_library_dto
                         dtos = [ensure_library_dto(l) for l in raw_list]
                         db.save_libraries_batch(dtos)
+                        self.user_libraries_cache[cache_key] = {str(d["id"]) for d in dtos if d.get("id")}
                         return dtos
             except Exception:
                 pass
 
-        # Fallback to SQLite cached libraries
+        # Fallback to SQLite cached libraries if offline
         db_libs = db.get_all_libraries()
         if db_libs:
             from app.routers.libraries import ensure_library_dto
@@ -278,22 +280,10 @@ class GrimmoryClient:
 
     async def get_user_library_ids(self, user: str, pwd: str) -> Optional[Set[str]]:
         """Fetch the set of library IDs that the given user has access to."""
-        cache_key = f"{user}:{pwd}"
-        if cache_key in self.user_libraries_cache:
-            return self.user_libraries_cache[cache_key]
-
         try:
             libs = await self.get_libraries(user, pwd)
             if libs and isinstance(libs, list):
-                lib_ids = {str(lib.get("id")) for lib in libs if lib.get("id")}
-                if lib_ids:
-                    self.user_libraries_cache[cache_key] = lib_ids
-                    return lib_ids
-            # Also check DB
-            all_db_ids = db.get_all_library_ids()
-            if all_db_ids:
-                self.user_libraries_cache[cache_key] = all_db_ids
-                return all_db_ids
+                return {str(lib.get("id")) for lib in libs if lib.get("id")}
         except Exception:
             pass
 
@@ -718,27 +708,6 @@ class GrimmoryClient:
             if count > 0:
                 book["media"]["pagesCount"] = count
 
-            # Attach read progress from in-memory cache, SQLite DB, or embedded progress if missing
-            if "readProgress" not in book or book.get("readProgress") is None:
-                p_key = f"{u}:{book_id}"
-                prog = read_progress_cache.get(p_key) or (read_progress_cache.get(book_id) if u == "default" else None) or db.get_read_progress(u, book_id)
-                if prog:
-                    book["readProgress"] = prog
-                else:
-                    for p_key_f in ["cbxProgress", "pdfProgress", "epubProgress"]:
-                        p = book.get(p_key_f)
-                        if isinstance(p, dict) and p.get("page", 0) > 0:
-                            book["readProgress"] = {
-                                "page": p.get("page", 1),
-                                "completed": False,
-                                "readDate": book.get("lastRead") or book.get("coverUpdatedOn") or "2026-09-24T00:00:00Z",
-                                "created": "2026-09-24T00:00:00Z",
-                                "lastModified": "2026-09-24T00:00:00Z",
-                                "deviceId": "komic",
-                                "deviceName": "Komic"
-                            }
-                            break
-
         await asyncio.gather(*[_enrich_one(b) for b in books], return_exceptions=True)
         try:
             db.save_books_batch(books)
@@ -762,9 +731,9 @@ class GrimmoryClient:
                 return None
             db_book = dict(db_book)
             p_key = f"{u}:{book_id}"
-            prog = read_progress_cache.get(p_key) or (read_progress_cache.get(book_id) if u == "default" else None) or db.get_read_progress(u, book_id)
+            prog = read_progress_cache.get(p_key) or db.get_read_progress(u, book_id)
             db_book["readProgress"] = prog
-            ensure_book_dto(db_book)
+            ensure_book_dto(db_book, user=user)
             book_cache[b_key] = db_book
             return db_book
 
@@ -808,7 +777,7 @@ class GrimmoryClient:
             else:
                 book["readProgress"] = None
 
-        ensure_book_dto(book)
+        ensure_book_dto(book, user=user)
 
     async def get_read_progress(self, book_id: str, user: str, pwd: str) -> Optional[Dict[str, Any]]:
         """Fetch read progress from Grimmory native API and format as Komga ReadProgressDto."""
@@ -816,14 +785,10 @@ class GrimmoryClient:
         p_key = f"{u}:{book_id}"
         if p_key in read_progress_cache:
             return read_progress_cache[p_key]
-        if u == "default" and book_id in read_progress_cache:
-            return read_progress_cache[book_id]
 
         db_prog = db.get_read_progress(u, book_id)
         if db_prog:
             read_progress_cache[p_key] = db_prog
-            if u == "default":
-                read_progress_cache[book_id] = db_prog
             return db_prog
 
         native_headers = await self.get_native_headers(user, pwd)
@@ -833,8 +798,6 @@ class GrimmoryClient:
                 data = resp.json()
                 if not data or not isinstance(data, dict):
                     read_progress_cache[p_key] = None
-                    if u == "default":
-                        read_progress_cache[book_id] = None
                     return None
                 
                 page = 1
@@ -884,8 +847,6 @@ class GrimmoryClient:
                 # If book is unread or never opened
                 if not completed and (read_status == "UNREAD" or (pct == 0 and page <= 1 and not last_read and data.get("progressValid") is False)):
                     read_progress_cache[p_key] = None
-                    if u == "default":
-                        read_progress_cache[book_id] = None
                     db.delete_read_progress(u, book_id)
                     return None
 
@@ -900,8 +861,6 @@ class GrimmoryClient:
                     "deviceName": "Komic"
                 }
                 read_progress_cache[p_key] = progress_dto
-                if u == "default":
-                    read_progress_cache[book_id] = progress_dto
                 try:
                     db.save_read_progress(u, book_id, page, completed, date_finished or now_iso, progress_dto)
                 except Exception:
@@ -911,8 +870,6 @@ class GrimmoryClient:
             pass
 
         read_progress_cache[p_key] = None
-        if u == "default":
-            read_progress_cache[book_id] = None
         return None
 
     async def record_reading_session(
@@ -977,8 +934,6 @@ class GrimmoryClient:
         u = (user or "default").lower().strip()
         p_key = f"{u}:{book_id}"
         read_progress_cache[p_key] = progress_dto
-        if u == "default":
-            read_progress_cache[book_id] = progress_dto
         try:
             db.save_read_progress(u, book_id, page, is_completed, date_finished or now_iso, progress_dto)
         except Exception:
@@ -986,8 +941,6 @@ class GrimmoryClient:
         b_key = f"{u}:{book_id}"
         if b_key in book_cache:
             book_cache[b_key]["readProgress"] = progress_dto
-        elif book_id in book_cache:
-            book_cache[book_id]["readProgress"] = progress_dto
 
         # Reading session tracking
         session_key = f"{user}:{book_id}"
@@ -1079,8 +1032,6 @@ class GrimmoryClient:
         u = (user or "default").lower().strip()
         p_key = f"{u}:{book_id}"
         read_progress_cache.pop(p_key, None)
-        if u == "default":
-            read_progress_cache.pop(book_id, None)
         try:
             db.delete_read_progress(u, book_id)
         except Exception:
@@ -1089,8 +1040,6 @@ class GrimmoryClient:
         b_key = f"{u}:{book_id}"
         if b_key in book_cache:
             book_cache[b_key]["readProgress"] = None
-        elif book_id in book_cache:
-            book_cache[book_id]["readProgress"] = None
 
         native_headers = await self.get_native_headers(user, pwd)
         try:
@@ -1164,23 +1113,21 @@ class GrimmoryClient:
         if not book_obj or not isinstance(book_obj, dict):
             return False
         b_id = str(book_obj.get("id"))
-        u = (user or "default").lower().strip()
-        p_key = f"{u}:{b_id}"
 
-        # 1. User-scoped cache and database progress is the highest authority
-        user_prog = progress or read_progress_cache.get(p_key) or (read_progress_cache.get(b_id) if u == "default" else None)
-        if user_prog is None:
-            user_prog = db.get_read_progress(u, b_id)
-        if isinstance(user_prog, dict):
-            if user_prog.get("completed") is True:
-                return True
-            page = user_prog.get("page", 0)
-            pages_count = (book_obj.get("media") or {}).get("pagesCount", 0) or db.get_book_page_count(b_id) or 0
-            if pages_count > 1 and page >= pages_count:
-                return True
-            return False
+        if user:
+            u = str(user).lower().strip()
+            p_key = f"{u}:{b_id}"
+            user_prog = progress or read_progress_cache.get(p_key) or db.get_read_progress(u, b_id)
+            if isinstance(user_prog, dict):
+                if user_prog.get("completed") is True:
+                    return True
+                page = user_prog.get("page", 0)
+                pages_count = (book_obj.get("media") or {}).get("pagesCount", 0) or db.get_book_page_count(b_id) or 0
+                if pages_count > 1 and page >= pages_count:
+                    return True
+                return False
 
-        # 2. Check direct readProgress object on book if present
+        # Check direct readProgress object on book if present
         prog = book_obj.get("readProgress")
         if isinstance(prog, dict):
             if prog.get("completed") is True:
@@ -1191,7 +1138,7 @@ class GrimmoryClient:
                 return True
             return False
 
-        # 3. Check Grimmory native raw status fields
+        # Check Grimmory native raw status fields
         read_status = str(book_obj.get("readStatus") or book_obj.get("status") or "").upper().strip()
         if read_status == "READ":
             return True
@@ -1233,14 +1180,22 @@ class GrimmoryClient:
         if not book_obj or not isinstance(book_obj, dict):
             return False
         b_id = str(book_obj.get("id"))
-        u = (user or "default").lower().strip()
-        p_key = f"{u}:{b_id}"
 
-        user_prog = progress or read_progress_cache.get(p_key) or (read_progress_cache.get(b_id) if u == "default" else None)
-        if user_prog is None:
-            user_prog = db.get_read_progress(u, b_id)
+        if user:
+            if self._is_book_finished(book_obj, user=user, progress=progress):
+                return False
+            u = str(user).lower().strip()
+            p_key = f"{u}:{b_id}"
+            user_prog = progress or read_progress_cache.get(p_key) or db.get_read_progress(u, b_id)
+            if isinstance(user_prog, dict):
+                if user_prog.get("completed") is True:
+                    return False
+                page = user_prog.get("page", 0)
+                if page > 1 or (page == 1 and user_prog.get("readDate")):
+                    return True
+                return False
 
-        if self._is_book_finished(book_obj, user=user, progress=user_prog):
+        if self._is_book_finished(book_obj, user=user, progress=progress):
             return False
 
         read_status = str(book_obj.get("readStatus") or book_obj.get("status") or "").upper().strip()
@@ -1250,15 +1205,6 @@ class GrimmoryClient:
             return False
         if read_status == "READING":
             return True
-
-        # Check user-scoped progress first
-        if isinstance(user_prog, dict):
-            if user_prog.get("completed") is True:
-                return False
-            page = user_prog.get("page", 0)
-            if page > 1 or (page == 1 and user_prog.get("readDate")):
-                return True
-            return False
 
         prog = book_obj.get("readProgress")
         if isinstance(prog, dict):
@@ -1354,15 +1300,17 @@ class GrimmoryClient:
                                     "deviceName": "Komic"
                                 }
                                 read_progress_cache[p_key] = prog_dto
-                                read_progress_cache[b_id] = prog_dto
+                                if b_id in read_progress_cache:
+                                    read_progress_cache[b_id] = prog_dto
                                 db.save_read_progress(u, b_id, count, True, now_iso, prog_dto)
-                                if u != "default":
+                                if db.get_read_progress("default", b_id) is not None:
                                     db.save_read_progress("default", b_id, count, True, now_iso, prog_dto)
                             elif read_status == "UNREAD" or (pct == 0 and not last_read):
                                 read_progress_cache.pop(p_key, None)
-                                read_progress_cache.pop(b_id, None)
+                                if b_id in read_progress_cache:
+                                    read_progress_cache.pop(b_id, None)
                                 db.delete_read_progress(u, b_id)
-                                if u != "default":
+                                if db.get_read_progress("default", b_id) is not None:
                                     db.delete_read_progress("default", b_id)
                             elif read_status == "READING" or pct > 0:
                                 page = max(1, round(pct * count / 100)) if pct > 0 else 1
@@ -1376,9 +1324,10 @@ class GrimmoryClient:
                                     "deviceName": "Komic"
                                 }
                                 read_progress_cache[p_key] = prog_dto
-                                read_progress_cache[b_id] = prog_dto
+                                if b_id in read_progress_cache:
+                                    read_progress_cache[b_id] = prog_dto
                                 db.save_read_progress(u, b_id, page, False, now_iso, prog_dto)
-                                if u != "default":
+                                if db.get_read_progress("default", b_id) is not None:
                                     db.save_read_progress("default", b_id, page, False, now_iso, prog_dto)
                     except Exception:
                         pass
@@ -1437,7 +1386,6 @@ class GrimmoryClient:
         matched_books = []
         u = (user or "default").lower().strip()
         user_prog_map = db.get_all_read_progress_map(u)
-        default_prog_map = db.get_all_read_progress_map("default") if u != "default" else {}
         for b in all_books:
             b_id = str(b.get("id"))
             if library_id:
@@ -1446,8 +1394,11 @@ class GrimmoryClient:
                     continue
             b_copy = dict(b)
             p_key = f"{u}:{b_id}"
-            u_prog = read_progress_cache.get(p_key) or user_prog_map.get(b_id) or (read_progress_cache.get(b_id) if u == "default" else None) or default_prog_map.get(b_id)
-            b_copy["readProgress"] = u_prog
+            u_prog = read_progress_cache.get(p_key) or user_prog_map.get(b_id)
+            if u_prog is not None:
+                b_copy["readProgress"] = u_prog
+            else:
+                u_prog = b_copy.get("readProgress")
 
             is_fin = self._is_book_finished(b_copy, user=user, progress=u_prog)
             is_inp = self._is_book_in_progress(b_copy, user=user, progress=u_prog)
@@ -1494,7 +1445,7 @@ class GrimmoryClient:
 
         await self.enrich_books_page_count(paged_content, user, pwd)
         for b in paged_content:
-            ensure_book_dto(b)
+            ensure_book_dto(b, user=user)
 
         return ensure_page_dto({
             "content": paged_content,
@@ -1622,7 +1573,6 @@ class GrimmoryClient:
         user_libs = await self.get_user_library_ids(user, pwd)
         active_series_ids = db.get_active_series_ids(user=u)
         u_map = db.get_all_read_progress_map(u)
-        default_map = db.get_all_read_progress_map("default") if u != "default" else {}
 
         ondeck_books = []
         seen_book_ids = set()
@@ -1652,9 +1602,11 @@ class GrimmoryClient:
                 b_id = str(b.get("id"))
                 b_copy = dict(b)
                 p_key = f"{u}:{b_id}"
-                prog = read_progress_cache.get(p_key) or u_map.get(b_id) or (read_progress_cache.get(b_id) if u == "default" else None) or default_map.get(b_id)
-                if prog:
+                prog = read_progress_cache.get(p_key) or u_map.get(b_id)
+                if prog is not None:
                     b_copy["readProgress"] = prog
+                else:
+                    prog = b_copy.get("readProgress")
 
                 if self._is_book_finished(b_copy, user=user, progress=prog):
                     highest_read_idx = max(highest_read_idx, idx)
@@ -1674,9 +1626,11 @@ class GrimmoryClient:
             elif highest_read_idx >= 0 and highest_read_idx + 1 < len(s_books):
                 candidate = dict(s_books[highest_read_idx + 1])
                 c_id = str(candidate.get("id"))
-                c_prog = read_progress_cache.get(f"{u}:{c_id}") or u_map.get(c_id) or (read_progress_cache.get(c_id) if u == "default" else None) or default_map.get(c_id)
-                if c_prog:
+                c_prog = read_progress_cache.get(f"{u}:{c_id}") or u_map.get(c_id)
+                if c_prog is not None:
                     candidate["readProgress"] = c_prog
+                else:
+                    c_prog = candidate.get("readProgress")
                 if not self._is_book_finished(candidate, user=user, progress=c_prog):
                     target_book = candidate
 

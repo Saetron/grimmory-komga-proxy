@@ -2553,6 +2553,123 @@ def test_ensure_book_dto_none_library_and_url():
     assert book["url"] == "/books/1/[Oshi no Ko] Spica the First Star.epub"
 
 
+def test_user_library_gating_isolation():
+    """Verify that users can only see and access libraries they have explicit permission for."""
+    auth_alice = {"Authorization": "Basic " + base64.b64encode(b"alice:alicepass").decode()}
+    auth_bob = {"Authorization": "Basic " + base64.b64encode(b"bob:bobpass").decode()}
+    token_cache["alice:alicepass"] = "alice-token"
+    token_cache["bob:bobpass"] = "bob-token"
+
+    alice_lib = [{"id": "1", "name": "Manga", "root": "/data/manga"}]
+    bob_lib = [{"id": "2", "name": "Comics", "root": "/data/comics"}]
+
+    async def mock_get_libraries(user, pwd):
+        if user == "alice":
+            return alice_lib
+        elif user == "bob":
+            return bob_lib
+        return []
+
+    with patch.object(grimmory_client, "get_libraries", side_effect=mock_get_libraries), \
+         patch.object(grimmory_client, "get_native_token", new_callable=AsyncMock, return_value="dummy-token"):
+
+        # 1. GET /api/v1/libraries
+        resp_a = client.get("/api/v1/libraries", headers=auth_alice)
+        assert resp_a.status_code == 200
+        libs_a = resp_a.json()
+        assert len(libs_a) == 1
+        assert libs_a[0]["id"] == "1"
+        assert libs_a[0]["name"] == "Manga"
+
+        resp_b = client.get("/api/v1/libraries", headers=auth_bob)
+        assert resp_b.status_code == 200
+        libs_b = resp_b.json()
+        assert len(libs_b) == 1
+        assert libs_b[0]["id"] == "2"
+        assert libs_b[0]["name"] == "Comics"
+
+        # 2. GET /api/v1/libraries/{id}
+        # Alice can access library 1, but gets 404 for library 2
+        assert client.get("/api/v1/libraries/1", headers=auth_alice).status_code == 200
+        assert client.get("/api/v1/libraries/2", headers=auth_alice).status_code == 404
+
+        # Bob can access library 2, but gets 404 for library 1
+        assert client.get("/api/v1/libraries/2", headers=auth_bob).status_code == 200
+        assert client.get("/api/v1/libraries/1", headers=auth_bob).status_code == 404
+
+        # 3. GET /api/v2/users/me
+        me_a = client.get("/api/v2/users/me", headers=auth_alice).json()
+        assert me_a["sharedLibrariesIds"] == ["1"]
+
+        me_b = client.get("/api/v2/users/me", headers=auth_bob).json()
+        assert me_b["sharedLibrariesIds"] == ["2"]
+
+
+def test_user_read_progress_ondeck_and_book_endpoint_isolation():
+    """Verify that read progress, book detail progress, and ondeck endpoints are isolated per user."""
+    auth_alice = {"Authorization": "Basic " + base64.b64encode(b"alice:alicepass").decode()}
+    auth_bob = {"Authorization": "Basic " + base64.b64encode(b"bob:bobpass").decode()}
+    token_cache["alice:alicepass"] = "alice-token"
+    token_cache["bob:bobpass"] = "bob-token"
+
+    # Books 701 and 702 in library 1
+    shared_books = [
+        {"id": "701", "name": "Book 701", "libraryId": "1", "seriesId": "s-1", "media": {"pagesCount": 100}},
+        {"id": "702", "name": "Book 702", "libraryId": "1", "seriesId": "s-1", "media": {"pagesCount": 100}},
+    ]
+    db.save_books_batch(shared_books)
+
+    # Alice reads Book 701 to page 40 (in progress) and Book 702 to page 100 (completed)
+    p_dto_701 = {"page": 40, "completed": False, "readDate": "2026-09-26T12:00:00Z"}
+    p_dto_702 = {"page": 100, "completed": True, "readDate": "2026-09-26T13:00:00Z"}
+    db.save_read_progress("alice", "701", 40, False, "2026-09-26T12:00:00Z", p_dto_701)
+    db.save_read_progress("alice", "702", 100, True, "2026-09-26T13:00:00Z", p_dto_702)
+    read_progress_cache["alice:701"] = p_dto_701
+    read_progress_cache["alice:702"] = p_dto_702
+
+    # Bob has NO progress on either book
+    async def mock_get_libraries(user, pwd):
+        return [{"id": "1", "name": "Manga", "root": "/data/manga"}]
+
+    async def mock_native_get(url, **kwargs):
+        return httpx.Response(404)
+
+    mock_client = AsyncMock()
+    mock_client.get = AsyncMock(side_effect=mock_native_get)
+
+    with patch.object(grimmory_client, "get_client", return_value=mock_client), \
+         patch.object(grimmory_client, "get_libraries", side_effect=mock_get_libraries), \
+         patch.object(grimmory_client, "get_native_token", new_callable=AsyncMock, return_value="dummy-token"):
+
+        # 1. Book 701: Alice sees page 40; Bob sees None
+        b_alice_701 = client.get("/api/v1/books/701", headers=auth_alice).json()
+        assert b_alice_701.get("readProgress") is not None
+        assert b_alice_701["readProgress"]["page"] == 40
+        assert b_alice_701["readProgress"]["completed"] is False
+
+        b_bob_701 = client.get("/api/v1/books/701", headers=auth_bob).json()
+        assert b_bob_701.get("readProgress") is None
+
+        # 2. Book 702: Alice sees completed; Bob sees None
+        b_alice_702 = client.get("/api/v1/books/702", headers=auth_alice).json()
+        assert b_alice_702.get("readProgress") is not None
+        assert b_alice_702["readProgress"]["completed"] is True
+
+        b_bob_702 = client.get("/api/v1/books/702", headers=auth_bob).json()
+        assert b_bob_702.get("readProgress") is None
+
+        # 3. GET /api/v1/books/ondeck
+        # Alice should see Book 701 (in progress), but NOT Book 702 (completed)
+        ondeck_a = client.get("/api/v1/books/ondeck", headers=auth_alice).json()["content"]
+        assert any(b["id"] == "701" for b in ondeck_a)
+        assert not any(b["id"] == "702" for b in ondeck_a)
+
+        # Bob should NOT see Book 701 or Book 702
+        ondeck_b = client.get("/api/v1/books/ondeck", headers=auth_bob).json()["content"]
+        assert not any(b["id"] == "701" for b in ondeck_b)
+        assert not any(b["id"] == "702" for b in ondeck_b)
+
+
 if __name__ == "__main__":
     pytest.main(["-v", __file__])
 

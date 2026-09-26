@@ -39,20 +39,21 @@ async def get_current_user(authorization: Optional[str] = Header(None)) -> Dict[
         )
 
     from app.db import db
-    user_libs = await grimmory_client.get_user_library_ids(user, pwd)
-    all_known_lib_ids = set()
-    if user_libs:
-        all_known_lib_ids.update(user_libs)
-    all_known_lib_ids.update(db.get_all_library_ids())
-    if not all_known_lib_ids:
-        all_known_lib_ids.add("1")
+    libraries = await grimmory_client.get_libraries(user, pwd)
+    if libraries:
+        shared_ids = sorted([str(l["id"]) for l in libraries if l.get("id")])
+    else:
+        all_ids = db.get_all_library_ids()
+        shared_ids = sorted(list(all_ids)) if all_ids else ["1"]
+
+    roles = ["ROLE_ADMIN", "ROLE_FILE_DOWNLOAD", "ROLE_PAGE_STREAMING", "USER", "ADMIN", "FILE_DOWNLOAD", "PAGE_STREAMING"]
 
     data = {
         "id": user,
         "email": f"{user}@grimmory.local" if "@" not in user else user,
-        "roles": ["ROLE_ADMIN", "ROLE_FILE_DOWNLOAD", "ROLE_PAGE_STREAMING", "USER", "ADMIN", "FILE_DOWNLOAD", "PAGE_STREAMING"],
+        "roles": roles,
         "sharedAllLibraries": True,
-        "sharedLibrariesIds": sorted(list(all_known_lib_ids)),
+        "sharedLibrariesIds": shared_ids,
         "labelsAllow": [],
         "labelsExclude": [],
         "ageRestriction": None
@@ -63,11 +64,6 @@ async def get_current_user(authorization: Optional[str] = Header(None)) -> Dict[
         sync_service.maybe_trigger_sync_on_login(user, pwd)
     except Exception:
         pass
-    roles = data.get("roles", [])
-    for standard_role in ["USER", "FILE_DOWNLOAD", "PAGE_STREAMING", "ADMIN"]:
-        if standard_role not in roles:
-            roles.append(standard_role)
-    data["roles"] = roles
 
     return data
 
