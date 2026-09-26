@@ -1,5 +1,19 @@
 import hashlib
 from typing import Dict, Any, List, Optional
+from urllib.parse import unquote
+
+
+def normalize_id(val: Any) -> str:
+    """Recursively URL-decode an identifier (series_id, book_id, etc.) to handle single or double-encoded path params."""
+    if not val:
+        return ""
+    cur = str(val).strip()
+    for _ in range(3):
+        dec = unquote(cur)
+        if dec == cur:
+            break
+        cur = dec
+    return cur
 
 
 def compute_unique_series_id(lib_id: str, series_name: str) -> str:

@@ -138,6 +138,13 @@ class Database:
                     updated_at REAL
                 );
                 CREATE INDEX IF NOT EXISTS idx_libraries_name ON libraries (name);
+
+                CREATE TABLE IF NOT EXISTS users (
+                    username TEXT PRIMARY KEY,
+                    password TEXT NOT NULL,
+                    last_login REAL,
+                    created_at REAL
+                );
             """)
 
             # Sanitize books table: remove any embedded readProgress from shared dto_json
@@ -365,13 +372,26 @@ class Database:
             )
 
     def get_series(self, series_id: str) -> Optional[Dict[str, Any]]:
+        s_id = str(series_id)
+        candidates = [s_id]
+        from urllib.parse import unquote
+        cur = s_id
+        for _ in range(3):
+            dec = unquote(cur)
+            if dec == cur:
+                break
+            if dec not in candidates:
+                candidates.append(dec)
+            cur = dec
+
         with self._get_connection() as conn:
-            row = conn.execute("SELECT dto_json FROM series WHERE id = ?", (str(series_id),)).fetchone()
-            if row:
-                try:
-                    return json.loads(row["dto_json"])
-                except Exception:
-                    pass
+            for cid in candidates:
+                row = conn.execute("SELECT dto_json FROM series WHERE id = ?", (cid,)).fetchone()
+                if row:
+                    try:
+                        return json.loads(row["dto_json"])
+                    except Exception:
+                        pass
         return None
 
     def get_all_series(self, library_id: Optional[Union[str, List[str], Set[str]]] = None) -> List[Dict[str, Any]]:
@@ -474,13 +494,26 @@ class Database:
                         conn.execute("DELETE FROM series WHERE id = ?", (s_id,))
 
     def get_book(self, book_id: str) -> Optional[Dict[str, Any]]:
+        b_id = str(book_id)
+        candidates = [b_id]
+        from urllib.parse import unquote
+        cur = b_id
+        for _ in range(3):
+            dec = unquote(cur)
+            if dec == cur:
+                break
+            if dec not in candidates:
+                candidates.append(dec)
+            cur = dec
+
         with self._get_connection() as conn:
-            row = conn.execute("SELECT dto_json FROM books WHERE id = ?", (str(book_id),)).fetchone()
-            if row:
-                try:
-                    return json.loads(row["dto_json"])
-                except Exception:
-                    pass
+            for cid in candidates:
+                row = conn.execute("SELECT dto_json FROM books WHERE id = ?", (cid,)).fetchone()
+                if row:
+                    try:
+                        return json.loads(row["dto_json"])
+                    except Exception:
+                        pass
         return None
 
     def _get_adjacent_book(self, book_id: str, direction: str) -> Optional[Dict[str, Any]]:
@@ -517,12 +550,27 @@ class Database:
         return self._get_adjacent_book(book_id, "next")
 
     def get_books_by_series(self, series_id: str) -> List[Dict[str, Any]]:
+        s_id = str(series_id)
+        candidates = [s_id]
+        from urllib.parse import unquote
+        cur = s_id
+        for _ in range(3):
+            dec = unquote(cur)
+            if dec == cur:
+                break
+            if dec not in candidates:
+                candidates.append(dec)
+            cur = dec
+
         with self._get_connection() as conn:
-            rows = conn.execute(
-                "SELECT dto_json FROM books WHERE series_id = ? ORDER BY number_sort ASC, name ASC, id ASC",
-                (str(series_id),)
-            ).fetchall()
-            return self._parse_dto_rows(rows)
+            for cid in candidates:
+                rows = conn.execute(
+                    "SELECT dto_json FROM books WHERE series_id = ? ORDER BY number_sort ASC, name ASC, id ASC",
+                    (cid,)
+                ).fetchall()
+                if rows:
+                    return self._parse_dto_rows(rows)
+            return []
 
     def get_all_books(self, library_id: Optional[Union[str, List[str], Set[str]]] = None) -> List[Dict[str, Any]]:
         lib_ids = self._normalize_library_ids(library_id)
@@ -586,23 +634,49 @@ class Database:
             )
 
     def get_book_pages(self, book_id: str) -> Optional[Tuple[List[Dict[str, Any]], int]]:
+        b_id = str(book_id)
+        candidates = [b_id]
+        from urllib.parse import unquote
+        cur = b_id
+        for _ in range(3):
+            dec = unquote(cur)
+            if dec == cur:
+                break
+            if dec not in candidates:
+                candidates.append(dec)
+            cur = dec
+
         with self._get_connection() as conn:
-            row = conn.execute("SELECT pages_json, pages_count FROM book_pages WHERE book_id = ?", (str(book_id),)).fetchone()
-            if row:
-                try:
-                    return json.loads(row["pages_json"]), int(row["pages_count"])
-                except Exception:
-                    pass
+            for cid in candidates:
+                row = conn.execute("SELECT pages_json, pages_count FROM book_pages WHERE book_id = ?", (cid,)).fetchone()
+                if row:
+                    try:
+                        return json.loads(row["pages_json"]), int(row["pages_count"])
+                    except Exception:
+                        pass
         return None
 
     def get_book_page_count(self, book_id: str) -> Optional[int]:
+        b_id = str(book_id)
+        candidates = [b_id]
+        from urllib.parse import unquote
+        cur = b_id
+        for _ in range(3):
+            dec = unquote(cur)
+            if dec == cur:
+                break
+            if dec not in candidates:
+                candidates.append(dec)
+            cur = dec
+
         with self._get_connection() as conn:
-            row = conn.execute("SELECT pages_count FROM book_pages WHERE book_id = ?", (str(book_id),)).fetchone()
-            if row:
-                return int(row["pages_count"])
-            row_book = conn.execute("SELECT pages_count FROM books WHERE id = ?", (str(book_id),)).fetchone()
-            if row_book and row_book["pages_count"] and row_book["pages_count"] > 1:
-                return int(row_book["pages_count"])
+            for cid in candidates:
+                row = conn.execute("SELECT pages_count FROM book_pages WHERE book_id = ?", (cid,)).fetchone()
+                if row:
+                    return int(row["pages_count"])
+                row_book = conn.execute("SELECT pages_count FROM books WHERE id = ?", (cid,)).fetchone()
+                if row_book and row_book["pages_count"] and row_book["pages_count"] > 1:
+                    return int(row_book["pages_count"])
         return None
 
     # --- Read Progress Operations ---
@@ -741,6 +815,42 @@ class Database:
                 rows = conn.execute("SELECT book_id FROM read_progress WHERE completed = 1").fetchall()
             return {str(r["book_id"]) for r in rows}
 
+    # --- User Authentication & Sync Storage ---
+    def save_user(self, username: str, password: str):
+        if not username or not password:
+            return
+        from app.config import settings
+        sync_u = (settings.SYNC_USERNAME or "").strip().lower()
+        u = str(username).lower().strip()
+        if sync_u and u == sync_u:
+            return  # Do not store sync user as a reader user
+        now = time.time()
+        with self._get_connection() as conn:
+            conn.execute(
+                "INSERT INTO users (username, password, last_login, created_at) VALUES (?, ?, ?, ?) "
+                "ON CONFLICT(username) DO UPDATE SET password=excluded.password, last_login=excluded.last_login",
+                (u, str(password), now, now)
+            )
+
+    def get_all_users(self) -> List[Dict[str, Any]]:
+        with self._get_connection() as conn:
+            rows = conn.execute("SELECT username, password, last_login, created_at FROM users").fetchall()
+            return [
+                {
+                    "username": str(r["username"]),
+                    "password": str(r["password"]),
+                    "last_login": r["last_login"],
+                    "created_at": r["created_at"]
+                }
+                for r in rows
+            ]
+
+    def delete_user_data(self, username: str):
+        u = str(username).lower().strip()
+        with self._get_connection() as conn:
+            conn.execute("DELETE FROM users WHERE username = ?", (u,))
+            conn.execute("DELETE FROM read_progress WHERE user = ?", (u,))
+
     def clear_all(self):
         with self._get_connection() as conn:
             conn.executescript("""
@@ -749,6 +859,7 @@ class Database:
                 DELETE FROM book_pages;
                 DELETE FROM read_progress;
                 DELETE FROM libraries;
+                DELETE FROM users;
             """)
 
 db = Database()

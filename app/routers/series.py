@@ -3,7 +3,7 @@ import httpx
 from fastapi import APIRouter, Header, Request, Response, HTTPException, status
 from typing import Optional, Dict, Any, List
 from app.grimmory_client import grimmory_client
-from app.dto_utils import ensure_page_dto, ensure_series_dto, ensure_book_dto, extract_search_filters, disambiguate_series_dto
+from app.dto_utils import ensure_page_dto, ensure_series_dto, ensure_book_dto, extract_search_filters, disambiguate_series_dto, normalize_id
 from app.db import db
 
 logger = logging.getLogger("grimmory-komga-bridge")
@@ -176,6 +176,7 @@ async def get_series(
     series_id: str,
     authorization: Optional[str] = Header(None)
 ) -> Dict[str, Any]:
+    series_id = normalize_id(series_id)
     user, pwd = grimmory_client.extract_credentials(authorization)
 
     # Handle virtual standalone series
@@ -257,6 +258,7 @@ async def get_series_collections(
     series_id: str,
     authorization: Optional[str] = Header(None)
 ) -> List[Dict[str, Any]]:
+    series_id = normalize_id(series_id)
     return []
 
 
@@ -266,6 +268,7 @@ async def get_series_books(
     request: Request,
     authorization: Optional[str] = Header(None)
 ) -> Dict[str, Any]:
+    series_id = normalize_id(series_id)
     user, pwd = grimmory_client.extract_credentials(authorization)
     params = dict(request.query_params)
     page = int(params.get("page", 0))
@@ -330,6 +333,8 @@ async def get_series_thumbnail(
     authorization: Optional[str] = Header(None)
 ) -> Response:
     from app.grimmory_client import thumbnail_cache
+    import urllib.parse
+    series_id = normalize_id(series_id)
     cache_key = f"s:{series_id}"
     if cache_key in thumbnail_cache:
         cached_content, cached_type = thumbnail_cache[cache_key]
@@ -386,13 +391,37 @@ async def get_series_thumbnail(
                 f"/api/v1/books/{first_b_id}/thumbnail",
             ])
 
+        # Try series endpoints (both URL-encoded and raw identifier)
+        enc_id = urllib.parse.quote(series_id, safe="")
         candidate_paths.extend([
-            f"/api/v1/media/series/{series_id}/thumbnail",
-            f"/api/v1/media/series/{series_id}/cover",
-            f"/api/v1/app/series/{series_id}/cover",
-            f"/api/v1/app/series/{series_id}/thumbnail",
-            f"/api/v1/series/{series_id}/thumbnail",
+            f"/api/v1/media/series/{enc_id}/thumbnail",
+            f"/api/v1/media/series/{enc_id}/cover",
+            f"/api/v1/app/series/{enc_id}/cover",
+            f"/api/v1/app/series/{enc_id}/thumbnail",
+            f"/api/v1/series/{enc_id}/thumbnail",
+            f"/api/v1/series/{enc_id}/cover",
         ])
+        if enc_id != series_id:
+            candidate_paths.extend([
+                f"/api/v1/media/series/{series_id}/thumbnail",
+                f"/api/v1/media/series/{series_id}/cover",
+                f"/api/v1/app/series/{series_id}/cover",
+                f"/api/v1/app/series/{series_id}/thumbnail",
+                f"/api/v1/series/{series_id}/thumbnail",
+                f"/api/v1/series/{series_id}/cover",
+            ])
+
+        db_s = db.get_series(series_id)
+        if db_s:
+            s_name = db_s.get("name") or db_s.get("metadata", {}).get("title")
+            if s_name:
+                enc_name = urllib.parse.quote(s_name, safe="")
+                candidate_paths.extend([
+                    f"/api/v1/app/series/{enc_name}/cover",
+                    f"/api/v1/app/series/{enc_name}/thumbnail",
+                    f"/api/v1/media/series/{enc_name}/thumbnail",
+                    f"/api/v1/media/series/{enc_name}/cover",
+                ])
 
         for path in candidate_paths:
             try:
@@ -429,6 +458,7 @@ async def update_series_read_progress(
     request: Request,
     authorization: Optional[str] = Header(None)
 ) -> Response:
+    series_id = normalize_id(series_id)
     user, pwd = grimmory_client.extract_credentials(authorization)
     try:
         body = await request.json()
@@ -452,6 +482,7 @@ async def delete_series_read_progress(
     series_id: str,
     authorization: Optional[str] = Header(None)
 ) -> Response:
+    series_id = normalize_id(series_id)
     user, pwd = grimmory_client.extract_credentials(authorization)
     books = db.get_books_by_series(series_id)
     for b in books:

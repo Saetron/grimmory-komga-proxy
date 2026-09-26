@@ -68,7 +68,9 @@ The bridge operates on a two-tier user model designed to keep shared library met
 2. **Connecting Client Users (e.g. Komic, Komelia)**:
    - Every client request must provide valid HTTP Basic Auth credentials (`Authorization: Basic <base64(user:pass)>`).
    - **Strict 401 Unauthorized**: Unauthenticated requests or invalid credentials immediately throw `HTTP 401 Unauthorized` (`WWW-Authenticate: Basic realm="Komga"`).
-   - Upon authentication, the bridge queries Grimmory to retrieve the connecting user's specific library permissions and live reading progress.
+   - **Automatic Credential Registration**: Upon successful authentication with Grimmory, the user's credentials are saved in SQLite (`users` table). The dedicated sync user is excluded.
+   - **Background Progress Synchronization**: During the periodic background sync cycle, the bridge iterates over all stored users and queries `/api/v1/app/books/continue-reading` to synchronize each user's reading state and On-Deck feed while they are offline.
+   - **Automatic 401 Eviction**: If Grimmory returns HTTP 401 Unauthorized for a stored user (e.g., password changed or account deleted in Grimmory), the bridge automatically deletes that user's record from `users`, purges their cached records from `read_progress`, and evicts their in-memory session tokens.
    - Users are strictly gated to their allowed libraries and their own reading progress.
 
 ### User Permissions & Library Gating
@@ -199,7 +201,8 @@ SQLite is located at `/app/data/bridge.db` and contains the following tables:
 - **`series`**: `(id TEXT PRIMARY KEY, library_id TEXT, name TEXT, books_count INTEGER, dto_json TEXT, updated_at REAL)`
 - **`books`**: `(id TEXT PRIMARY KEY, series_id TEXT, library_id TEXT, name TEXT, number_sort REAL, pages_count INTEGER, dto_json TEXT, updated_at REAL)`
 - **`book_pages`**: `(book_id TEXT PRIMARY KEY, page_count INTEGER, pages_json TEXT, updated_at REAL)`
-- **`read_progress`**: `(user TEXT, book_id TEXT, page INTEGER, completed INTEGER, progress_json TEXT, updated_at REAL, PRIMARY KEY (user, book_id))`
+- **`read_progress`**: `(user TEXT, book_id TEXT, page INTEGER, completed INTEGER, read_date TEXT, dto_json TEXT, updated_at REAL, PRIMARY KEY (user, book_id))`
+- **`users`**: `(username TEXT PRIMARY KEY, password TEXT NOT NULL, last_login REAL, created_at REAL)`
 - **`key_value`**: `(key TEXT PRIMARY KEY, value TEXT, updated_at REAL)`
 
 ---
@@ -217,3 +220,7 @@ SQLite is located at `/app/data/bridge.db` and contains the following tables:
 ### 3. Readium Error when opening EPUBs
 - **Cause**: Readium requires a local file with a valid `.epub` extension and valid ZIP structure.
 - **Solution**: The proxy forwards the raw binary stream from `/api/v1/books/{id}/content` with `Content-Type: application/epub+zip`.
+
+### 4. Series with Square Brackets or Special Characters Not Loading / Missing Covers
+- **Cause**: When series titles or directory names contain characters like brackets (e.g. `21-[oshi-no-ko]`), client HTTP frameworks (such as Komic on iOS or OkHttp) URL-encode brackets (`[` -> `%5B`, `]` -> `%5D`). Furthermore, when constructing request URLs, the `%` sign can be encoded again (`%255B`), delivering double-encoded path parameters (`21-%255Boshi-no-ko%255D`).
+- **Solution**: The proxy implements recursive URL decoding (`normalize_id`), automatically resolving single or double-encoded path and query parameters back to their canonical representation (`21-[oshi-no-ko]`). SQLite lookups check candidate encodings, and series thumbnail resolvers map to the series' underlying books to retrieve valid cover images from Grimmory.

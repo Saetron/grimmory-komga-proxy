@@ -48,6 +48,8 @@ class SyncService:
         # 1. Resolve credentials (dedicated background sync credentials)
         if not user or not pwd:
             user, pwd = self.get_sync_credentials()
+        elif user and pwd and user.lower() != (settings.SYNC_USERNAME or "").strip().lower():
+            db.save_user(user, pwd)
 
         if not user or not pwd:
             logger.info(
@@ -144,24 +146,10 @@ class SyncService:
             stats["booksCount"] = total_books_synced
             logger.info(f"[BackgroundSync] Validated {total_books_synced} books across all series.")
 
-            # 4. Sync Read Progress & Reconcile In-Progress with Grimmory
-            in_prog_count = 0
-            try:
-                in_prog_count = await grimmory_client.reconcile_read_progress(user, pwd)
-                native_headers = await grimmory_client.get_native_headers(user, pwd)
-                cr_resp = await grimmory_client.client.get("/api/v1/app/books/continue-reading?size=100", headers=native_headers)
-                if cr_resp.status_code == 200:
-                    cr_data = cr_resp.json()
-                    cr_books = cr_data if isinstance(cr_data, list) else cr_data.get("content", []) if isinstance(cr_data, dict) else []
-                    for b in cr_books:
-                        b_id = str(b.get("id"))
-                        if b_id:
-                            await grimmory_client.get_read_progress(b_id, user, pwd)
-                    in_prog_count = len(db.get_all_in_progress(user=user))
-            except Exception as e:
-                logger.debug(f"[BackgroundSync] Progress sync note: {e}")
-
-            stats["readProgressCount"] = in_prog_count
+            # 4. Sync Read Progress for All Logged-in Users
+            user_sync_stats = await self.sync_all_users_reading_state()
+            stats["userSync"] = user_sync_stats
+            stats["readProgressCount"] = user_sync_stats.get("syncedProgressCount", 0)
             duration = round(time.time() - start_time, 2)
             stats["durationSeconds"] = duration
             self.last_sync_time = time.time()
@@ -169,7 +157,7 @@ class SyncService:
             self.has_synced_successfully = True
             logger.info(
                 f"[BackgroundSync] Full sync complete in {duration}s: "
-                f"{stats['seriesCount']} series, {stats['booksCount']} books, {in_prog_count} in-progress."
+                f"{stats['seriesCount']} series, {stats['booksCount']} books, {stats['readProgressCount']} in-progress."
             )
             return stats
 
@@ -182,6 +170,44 @@ class SyncService:
             return stats
         finally:
             self.is_syncing = False
+
+    async def sync_all_users_reading_state(self) -> Dict[str, Any]:
+        """Iterate over all stored users and sync their reading progress in the background.
+        If a stored user returns 401 Unauthorized, automatically purge their credentials and reading progress.
+        """
+        users = db.get_all_users()
+        if not users:
+            return {"syncedUsers": 0, "deletedUsers": 0, "syncedProgressCount": 0}
+
+        sync_u = (settings.SYNC_USERNAME or "").strip().lower()
+        synced_users = 0
+        deleted_users = 0
+
+        for u_record in users:
+            u_name = u_record["username"]
+            u_pwd = u_record["password"]
+
+            if sync_u and u_name.lower() == sync_u.lower():
+                continue
+
+            success = await grimmory_client.sync_user_reading_state(u_name, u_pwd)
+            if not success:
+                logger.warning(
+                    f"[BackgroundSync] Authentication failed (401 Unauthorized) for saved user '{u_name}'. "
+                    f"Deleting user credentials and cached reading progress."
+                )
+                db.delete_user_data(u_name)
+                grimmory_client.evict_user_cache(u_name, u_pwd)
+                deleted_users += 1
+            else:
+                synced_users += 1
+                logger.info(f"[BackgroundSync] Successfully synced reading state for user '{u_name}'.")
+
+        return {
+            "syncedUsers": synced_users,
+            "deletedUsers": deleted_users,
+            "syncedProgressCount": len(db.get_all_in_progress())
+        }
 
     async def run_periodic_sync(self):
         """Infinite loop executing full sync every SYNC_INTERVAL_MINUTES."""

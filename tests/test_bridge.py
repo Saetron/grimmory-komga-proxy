@@ -2777,6 +2777,130 @@ def test_unauthorized_logins_and_library_restriction_gating():
         assert resp_lib20.status_code == 404
 
 
+@pytest.mark.anyio
+async def test_series_encoded_and_bracketed_ids():
+    """Verify that series with square brackets or encoded IDs like 21-[oshi-no-ko]
+    resolve correctly even when clients send URL-encoded (21-%5B...%5D) or
+    double-encoded (21-%255B...%255D) path parameters.
+    """
+    s_id = "21-[oshi-no-ko]"
+    b_id = "book-oshi-1"
+
+    db.save_series({
+        "id": s_id,
+        "libraryId": "21",
+        "name": "[Oshi no Ko]",
+        "booksCount": 1
+    })
+    db.save_book({
+        "id": b_id,
+        "seriesId": s_id,
+        "libraryId": "21",
+        "name": "[Oshi no Ko] Vol. 1",
+        "numberSort": 1.0,
+        "media": {"pagesCount": 200}
+    })
+
+    # Direct database lookups with unquoted and double-encoded variants
+    assert db.get_series("21-[oshi-no-ko]") is not None
+    assert db.get_series("21-%5Boshi-no-ko%5D") is not None
+    assert db.get_series("21-%255Boshi-no-ko%255D") is not None
+
+    books_direct = db.get_books_by_series("21-[oshi-no-ko]")
+    assert len(books_direct) == 1
+    assert db.get_books_by_series("21-%5Boshi-no-ko%5D") == books_direct
+    assert db.get_books_by_series("21-%255Boshi-no-ko%255D") == books_direct
+
+    # Mock Grimmory client thumbnail responses
+    dummy_img = b"\xff\xd8\xff\xe0\x00\x10JFIF"
+    mock_client = AsyncMock()
+    async def mock_get(url, **kwargs):
+        if f"/api/v1/media/book/{b_id}/thumbnail" in url or f"/api/v1/books/{b_id}/thumbnail" in url:
+            return httpx.Response(200, content=dummy_img, headers={"Content-Type": "image/jpeg"})
+        if "libraries" in url:
+            return httpx.Response(200, json=[{"id": "21", "name": "Manga"}])
+        return httpx.Response(404)
+    mock_client.get = AsyncMock(side_effect=mock_get)
+
+    with patch.object(grimmory_client, "get_client", return_value=mock_client), \
+         patch.object(grimmory_client, "get_native_token", new_callable=AsyncMock, return_value="dummy-token"):
+
+        # 1. GET /api/v1/series/{series_id} with double-encoded URL
+        resp_series = client.get("/api/v1/series/21-%255Boshi-no-ko%255D", headers=AUTH_HEADER)
+        assert resp_series.status_code == 200
+        assert resp_series.json()["id"] == s_id
+        assert resp_series.json()["name"] == "[Oshi no Ko]"
+
+        # 2. GET /api/v1/series/{series_id}/books with double-encoded URL
+        resp_books = client.get("/api/v1/series/21-%255Boshi-no-ko%255D/books", headers=AUTH_HEADER)
+        assert resp_books.status_code == 200
+        b_content = resp_books.json()["content"]
+        assert len(b_content) == 1
+        assert b_content[0]["id"] == b_id
+
+        # 3. GET /api/v1/series/{series_id}/thumbnail with double-encoded URL
+        resp_thumb = client.get("/api/v1/series/21-%255Boshi-no-ko%255D/thumbnail", headers=AUTH_HEADER)
+        assert resp_thumb.status_code == 200
+        assert resp_thumb.content == dummy_img
+        assert resp_thumb.headers["Content-Type"] == "image/jpeg"
+
+
+@pytest.mark.anyio
+async def test_user_storage_and_background_reading_state_sync():
+    """Verify that reader credentials are stored on login, used for periodic background sync,
+    and automatically purged upon HTTP 401 Unauthorized from Grimmory.
+    """
+    from app.sync_service import sync_service
+
+    # 1. Login with a new user saves their credentials to SQLite users table
+    mock_login_client = AsyncMock()
+    async def mock_login_post(url, **kwargs):
+        if "/api/v1/auth/login" in url:
+            return httpx.Response(200, json={"accessToken": "alice-jwt-token"})
+        return httpx.Response(404)
+    mock_login_client.post = AsyncMock(side_effect=mock_login_post)
+
+    with patch.object(grimmory_client, "get_client", return_value=mock_login_client):
+        token = await grimmory_client.get_native_token("alice", "secret123")
+        assert token == "alice-jwt-token"
+
+    all_users = db.get_all_users()
+    assert any(u["username"] == "alice" for u in all_users)
+
+    # 2. Background sync iterates over saved users and syncs their reading progress
+    mock_sync_client = AsyncMock()
+    cr_data = [{"id": "book-alice-1", "cbxProgress": {"page": 42, "percentage": 80}, "dateFinished": None}]
+    async def mock_sync_get(url, **kwargs):
+        if "continue-reading" in url:
+            return httpx.Response(200, json=cr_data)
+        if "progress" in url:
+            return httpx.Response(200, json={"cbxProgress": {"page": 42, "percentage": 80}, "dateFinished": None})
+        return httpx.Response(404)
+    mock_sync_client.get = AsyncMock(side_effect=mock_sync_get)
+
+    with patch.object(grimmory_client, "get_client", return_value=mock_sync_client), \
+         patch.object(grimmory_client, "get_native_token", new_callable=AsyncMock, return_value="alice-jwt-token"):
+
+        res = await sync_service.sync_all_users_reading_state()
+        assert res["syncedUsers"] >= 1
+        assert res["deletedUsers"] == 0
+
+        # Verify alice has read progress stored in DB
+        alice_prog = db.get_read_progress("alice", "book-alice-1")
+        assert alice_prog is not None
+        assert alice_prog["page"] == 42
+
+    # 3. If Grimmory returns 401 Unauthorized for alice (e.g. password changed/deleted),
+    # alice credentials and cached reading state are automatically purged
+    with patch.object(grimmory_client, "get_native_token", new_callable=AsyncMock, return_value=None):
+        res_401 = await sync_service.sync_all_users_reading_state()
+        assert res_401["deletedUsers"] >= 1
+
+        # Credentials and progress must be purged
+        assert not any(u["username"] == "alice" for u in db.get_all_users())
+        assert db.get_read_progress("alice", "book-alice-1") is None
+
+
 if __name__ == "__main__":
     pytest.main(["-v", __file__])
 

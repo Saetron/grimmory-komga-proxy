@@ -4,7 +4,7 @@ from fastapi import APIRouter, Header, Request, Response, HTTPException, status
 from fastapi.responses import StreamingResponse
 from typing import Optional, Dict, Any, List
 from app.grimmory_client import grimmory_client
-from app.dto_utils import ensure_page_dto, ensure_book_dto, extract_search_filters
+from app.dto_utils import ensure_page_dto, ensure_book_dto, extract_search_filters, normalize_id
 from app.db import db
 
 logger = logging.getLogger("grimmory-komga-bridge")
@@ -147,6 +147,7 @@ async def list_books(
     # If series_id is specified in query, Grimmory requires querying /series/{id}/books
     series_id = params.pop("series_id", None) or params.pop("seriesId", None)
     if series_id:
+        series_id = normalize_id(series_id)
         if read_status_param:
             statuses = [s.strip().upper() for s in str(read_status_param).split(",") if s.strip()]
             return await grimmory_client.get_books_by_read_status(
@@ -242,6 +243,7 @@ async def list_books_post(
     # 1. Check if filtering by series
     series_id = filters.get("series_id") or params.get("series_id") or params.get("seriesId")
     if series_id:
+        series_id = normalize_id(series_id)
         if statuses:
             return await grimmory_client.get_books_by_read_status(
                 statuses, user, pwd, page=page, size=size, series_id=series_id, library_id=library_id, sort=sort
@@ -341,6 +343,7 @@ async def get_book(
     book_id: str,
     authorization: Optional[str] = Header(None)
 ) -> Dict[str, Any]:
+    book_id = normalize_id(book_id)
     user, pwd = grimmory_client.extract_credentials(authorization)
     book = await grimmory_client.get_book_dto(book_id, user, pwd)
     if not book:
@@ -353,6 +356,7 @@ async def get_book_previous(
     book_id: str,
     authorization: Optional[str] = Header(None)
 ) -> Dict[str, Any]:
+    book_id = normalize_id(book_id)
     user, pwd = grimmory_client.extract_credentials(authorization)
     current_book = await grimmory_client.get_book_dto(book_id, user, pwd)
     s_id = current_book.get("seriesId", "") if current_book else ""
@@ -374,6 +378,7 @@ async def get_book_next(
     book_id: str,
     authorization: Optional[str] = Header(None)
 ) -> Dict[str, Any]:
+    book_id = normalize_id(book_id)
     user, pwd = grimmory_client.extract_credentials(authorization)
     # 1. Check SQLite DB first!
     next_book = db.get_next_book(book_id)
@@ -393,6 +398,7 @@ async def get_book_thumbnail(
     authorization: Optional[str] = Header(None)
 ) -> Response:
     from app.grimmory_client import thumbnail_cache
+    book_id = normalize_id(book_id)
     cache_key = f"b:{book_id}"
     if cache_key in thumbnail_cache:
         cached_content, cached_type = thumbnail_cache[cache_key]
@@ -441,6 +447,7 @@ async def get_book_pages(
     book_id: str,
     authorization: Optional[str] = Header(None)
 ) -> List[Dict[str, Any]]:
+    book_id = normalize_id(book_id)
     user, pwd = grimmory_client.extract_credentials(authorization)
     pages = await grimmory_client.get_book_pages_metadata(book_id, user, pwd)
     return pages
@@ -453,6 +460,7 @@ async def get_book_page(
     request: Request,
     authorization: Optional[str] = Header(None)
 ) -> StreamingResponse:
+    book_id = normalize_id(book_id)
     user, pwd = grimmory_client.extract_credentials(authorization)
     params = dict(request.query_params)
 
@@ -504,6 +512,7 @@ async def download_book_file(
 ) -> Response:
     import urllib.parse
     from unittest.mock import AsyncMock
+    book_id = normalize_id(book_id)
     user, pwd = grimmory_client.extract_credentials(authorization)
     clean_book_id = book_id.split("-")[-1] if "-standalone-" in book_id else book_id
 
@@ -663,6 +672,7 @@ async def get_read_progress(
     book_id: str,
     authorization: Optional[str] = Header(None)
 ) -> Optional[Dict[str, Any]]:
+    book_id = normalize_id(book_id)
     user, pwd = grimmory_client.extract_credentials(authorization)
     progress = await grimmory_client.get_read_progress(book_id, user, pwd)
     if progress:
@@ -678,6 +688,7 @@ async def update_read_progress(
     request: Request,
     authorization: Optional[str] = Header(None)
 ) -> Response:
+    book_id = normalize_id(book_id)
     user, pwd = grimmory_client.extract_credentials(authorization)
     try:
         body = await request.json()
@@ -697,6 +708,7 @@ async def delete_read_progress(
     book_id: str,
     authorization: Optional[str] = Header(None)
 ) -> Response:
+    book_id = normalize_id(book_id)
     user, pwd = grimmory_client.extract_credentials(authorization)
     await grimmory_client.reset_read_progress(book_id, user, pwd)
     return Response(status_code=status.HTTP_204_NO_CONTENT)
@@ -708,6 +720,7 @@ async def get_book_manifest(
     book_id: str,
     authorization: Optional[str] = Header(None)
 ) -> Dict[str, Any]:
+    book_id = normalize_id(book_id)
     user, pwd = grimmory_client.extract_credentials(authorization)
     book = await grimmory_client.get_book_dto(book_id, user, pwd)
     pages = await grimmory_client.get_book_pages_metadata(book_id, user, pwd)

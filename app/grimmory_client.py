@@ -248,10 +248,90 @@ class GrimmoryClient:
                 token = data.get("accessToken")
                 if token:
                     token_cache[cache_key] = token
+                    try:
+                        db.save_user(user, pwd)
+                    except Exception:
+                        pass
                     return token
+            elif resp.status_code == 401:
+                try:
+                    db.delete_user_data(user)
+                    self.evict_user_cache(user, pwd)
+                except Exception:
+                    pass
+                return None
         except Exception:
             pass
         return None
+
+    def evict_user_cache(self, user: str, pwd: Optional[str] = None):
+        """Purge all in-memory cache entries associated with a user."""
+        u = str(user).lower().strip()
+        if pwd:
+            token_cache.pop(f"{user}:{pwd}", None)
+            token_cache.pop(f"{u}:{pwd}", None)
+            self.user_libraries_cache.pop(f"{user}:{pwd}", None)
+            self.user_libraries_cache.pop(f"{u}:{pwd}", None)
+        else:
+            for k in list(token_cache.keys()):
+                if isinstance(k, str) and (k.startswith(f"{user}:") or k.startswith(f"{u}:")):
+                    token_cache.pop(k, None)
+            for k in list(self.user_libraries_cache.keys()):
+                if isinstance(k, str) and (k.startswith(f"{user}:") or k.startswith(f"{u}:")):
+                    self.user_libraries_cache.pop(k, None)
+
+        prefix = f"{u}:"
+        for k in list(read_progress_cache.keys()):
+            if isinstance(k, str) and k.startswith(prefix):
+                read_progress_cache.pop(k, None)
+        for k in list(book_cache.keys()):
+            if isinstance(k, str) and k.startswith(prefix):
+                book_cache.pop(k, None)
+
+    async def sync_user_reading_state(self, user: str, pwd: str) -> bool:
+        """Fetch and cache reading progress for a specific user from Grimmory.
+        Returns False if authentication failed (401), True otherwise.
+        """
+        u = str(user).lower().strip()
+        token = await self.get_native_token(user, pwd)
+        if not token:
+            logger.warning(f"[UserSync] Failed to authenticate user '{u}' (token is None).")
+            return False
+
+        native_headers = {"Authorization": f"Bearer {token}"}
+        try:
+            resp = await self.client.get("/api/v1/app/books/continue-reading", params={"size": 100}, headers=native_headers, timeout=10.0)
+            if resp.status_code == 401:
+                token_cache.pop(f"{user}:{pwd}", None)
+                token = await self.get_native_token(user, pwd)
+                if not token:
+                    return False
+                native_headers = {"Authorization": f"Bearer {token}"}
+                resp = await self.client.get("/api/v1/app/books/continue-reading", params={"size": 100}, headers=native_headers, timeout=10.0)
+                if resp.status_code == 401:
+                    return False
+
+            if resp.status_code == 200:
+                data = resp.json()
+                items = data if isinstance(data, list) else data.get("content", []) if isinstance(data, dict) else []
+                for item in items:
+                    b_id = str(item.get("id"))
+                    if b_id:
+                        dto = raw_app_book_to_dto(item)
+                        prog = dto.get("readProgress")
+                        if isinstance(prog, dict):
+                            page = prog.get("page", 1)
+                            comp = prog.get("completed", False)
+                            r_date = prog.get("readDate") or time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+                            db.save_read_progress(u, b_id, page, comp, r_date, prog)
+                            read_progress_cache[f"{u}:{b_id}"] = prog
+
+            # Reconcile in-progress books against Grimmory
+            await self.reconcile_read_progress(user, pwd)
+            return True
+        except Exception as e:
+            logger.debug(f"[UserSync] Error syncing reading state for '{u}': {e}")
+            return True
 
     async def get_native_headers(self, user: str, pwd: str) -> Dict[str, str]:
         token = await self.get_native_token(user, pwd)
@@ -1309,12 +1389,25 @@ class GrimmoryClient:
                             last_read = data.get("lastReadTime") or date_fin
 
                             pct = 0
+                            page_from_data = None
                             if "readProgress" in data and isinstance(data["readProgress"], (int, float)):
                                 pct_val = float(data["readProgress"])
                                 pct = round(pct_val * 100) if pct_val <= 1.0 else round(pct_val)
                             elif "koreaderProgress" in data and isinstance(data["koreaderProgress"], dict):
                                 k_pct = float(data["koreaderProgress"].get("percentage", 0))
                                 pct = round(k_pct * 100) if k_pct <= 1.0 else round(k_pct)
+                            else:
+                                for prog_key in ("cbxProgress", "pdfProgress", "epubProgress"):
+                                    if prog_key in data and isinstance(data[prog_key], dict):
+                                        p_obj = data[prog_key]
+                                        p_val = p_obj.get("percentage")
+                                        if p_val is not None:
+                                            pct = round(float(p_val) * 100) if float(p_val) <= 1.0 else round(float(p_val))
+                                        if "page" in p_obj:
+                                            page_from_data = int(p_obj["page"])
+                                        if not last_read:
+                                            last_read = p_obj.get("lastRead") or p_obj.get("readDate")
+                                        break
 
                             is_completed = (
                                 read_status == "READ" or date_fin or pct >= 100 or
@@ -1341,15 +1434,18 @@ class GrimmoryClient:
                                 db.save_read_progress(u, b_id, count, True, now_iso, prog_dto)
                                 if db.get_read_progress("default", b_id) is not None:
                                     db.save_read_progress("default", b_id, count, True, now_iso, prog_dto)
-                            elif read_status == "UNREAD" or (pct == 0 and not last_read):
+                            elif read_status == "UNREAD" or (pct == 0 and not last_read and not page_from_data):
                                 read_progress_cache.pop(p_key, None)
                                 if b_id in read_progress_cache:
                                     read_progress_cache.pop(b_id, None)
                                 db.delete_read_progress(u, b_id)
                                 if db.get_read_progress("default", b_id) is not None:
                                     db.delete_read_progress("default", b_id)
-                            elif read_status == "READING" or pct > 0:
-                                page = max(1, round(pct * count / 100)) if pct > 0 else 1
+                            elif read_status == "READING" or pct > 0 or (page_from_data and page_from_data > 0):
+                                if page_from_data and page_from_data > 0:
+                                    page = page_from_data
+                                else:
+                                    page = max(1, round(pct * count / 100)) if pct > 0 else 1
                                 prog_dto = {
                                     "page": page,
                                     "completed": False,
