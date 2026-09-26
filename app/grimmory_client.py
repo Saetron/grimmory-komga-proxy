@@ -190,24 +190,20 @@ class GrimmoryClient:
         return self.get_client()
 
     def extract_credentials(self, auth_header: Optional[str]) -> Tuple[str, str]:
-        """Extract username and password from Authorization header (Basic auth) or default settings."""
+        """Extract username and password from Authorization header (Basic auth).
+        Client requests only use their explicit credentials and never use background sync credentials.
+        """
         if auth_header and auth_header.startswith("Basic "):
             try:
                 decoded = base64.b64decode(auth_header[6:]).decode("utf-8")
                 if ":" in decoded:
                     user, pwd = decoded.split(":", 1)
                     if user in settings.USER_MAPPINGS:
-                        mapped_user, mapped_pwd = settings.USER_MAPPINGS[user]
-                        self.last_credentials = (mapped_user, mapped_pwd)
-                        return mapped_user, mapped_pwd
-                    if user and pwd:
-                        self.last_credentials = (user, pwd)
+                        return settings.USER_MAPPINGS[user]
                     return user, pwd
             except Exception:
                 pass
-        if self.last_credentials:
-            return self.last_credentials
-        return settings.DEFAULT_USERNAME, settings.DEFAULT_PASSWORD
+        return "", ""
 
     def get_basic_auth_header(self, user: str, pwd: str) -> Dict[str, str]:
         if not user:

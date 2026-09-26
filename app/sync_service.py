@@ -1,7 +1,7 @@
 import asyncio
 import logging
 import time
-from typing import Dict, Any, Optional
+from typing import Dict, Any, Optional, Tuple
 from app.config import settings
 from app.grimmory_client import grimmory_client
 from app.db import db
@@ -20,11 +20,24 @@ class SyncService:
     def stop(self):
         self._stop_event.set()
 
+    def get_sync_credentials(self) -> Tuple[str, str]:
+        """Get dedicated background sync credentials. Strictly used for background sync."""
+        u = settings.SYNC_USERNAME or settings.DEFAULT_USERNAME
+        p = settings.SYNC_PASSWORD or settings.DEFAULT_PASSWORD
+        return u.strip(), p.strip()
+
     def maybe_trigger_sync_on_login(self, user: str, pwd: str):
-        """If no successful background sync has completed yet, trigger it now with user's validated credentials."""
-        if not self.has_synced_successfully and not self.is_syncing and user and pwd:
-            logger.info(f"[BackgroundSync] Authenticated user '{user}' detected. Starting initial background sync...")
-            asyncio.create_task(self.run_full_sync(user=user, pwd=pwd))
+        """If no successful background sync has completed yet, trigger it now.
+        Always prefers dedicated sync credentials if configured.
+        """
+        if not self.has_synced_successfully and not self.is_syncing:
+            sync_user, sync_pwd = self.get_sync_credentials()
+            if sync_user and sync_pwd:
+                logger.info(f"[BackgroundSync] Triggering background sync using dedicated sync user '{sync_user}'...")
+                asyncio.create_task(self.run_full_sync(user=sync_user, pwd=sync_pwd))
+            elif user and pwd:
+                logger.info(f"[BackgroundSync] Authenticated user '{user}' detected (no dedicated sync user configured). Starting initial background sync...")
+                asyncio.create_task(self.run_full_sync(user=user, pwd=pwd))
 
     async def run_full_sync(self, user: Optional[str] = None, pwd: Optional[str] = None) -> Dict[str, Any]:
         """Perform a full check of Grimmory and validate/update the SQLite cache."""
@@ -32,18 +45,18 @@ class SyncService:
             logger.info("[BackgroundSync] Sync already in progress, skipping duplicate run.")
             return {"status": "in_progress", "message": "Sync already in progress"}
 
-        # 1. Resolve credentials
+        # 1. Resolve credentials (dedicated background sync credentials)
         if not user or not pwd:
-            user, pwd = grimmory_client.extract_credentials(None)
+            user, pwd = self.get_sync_credentials()
 
         if not user or not pwd:
             logger.info(
-                "[BackgroundSync] No Grimmory credentials configured (GRIMMORY_USERNAME / GRIMMORY_PASSWORD). "
+                "[BackgroundSync] No sync credentials configured (SYNC_USERNAME / SYNC_PASSWORD). "
                 "Background sync paused until credentials are provided in environment or a user connects via Komic."
             )
             return {
                 "status": "skipped",
-                "message": "No Grimmory credentials configured yet"
+                "message": "No Grimmory credentials configured yet (SYNC_USERNAME / SYNC_PASSWORD)"
             }
 
         self.is_syncing = True

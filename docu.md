@@ -66,6 +66,7 @@ Komga clients authenticate via standard HTTP `Authorization: Basic <base64(user:
 ### User Permissions & Isolation
 - User details (`GET /api/v1/users/me` and `GET /api/v2/users/me`) populate `sharedAllLibraries: true` and all accessible `sharedLibrariesIds` as string arrays.
 - Reading progress is strictly segregated in the SQLite database and in-memory caches using the authenticated username as a namespace (e.g. `username:bookId`).
+- Client requests only use their explicit Basic Auth credentials. Background sync credentials are never used for client sessions or unauthenticated requests.
 
 ---
 
@@ -85,8 +86,9 @@ Komic and other native iOS apps are written in Swift using `Codable` structs:
 
 ## 4. Series & Book Management
 
-### Persistent Caching & Synchronization
-- **Background Sync**: Every 30 minutes (configurable via `SYNC_INTERVAL_MINUTES`), the proxy queries Grimmory for updated books and series and reconciles them in SQLite.
+### Persistent Caching & Background Sync
+- **Dedicated Sync Account (`SYNC_USERNAME` / `SYNC_PASSWORD`)**: The background sync service uses its own dedicated credentials (typically an administrator account with access to all libraries). These credentials are used strictly and exclusively by the background sync service to build and validate the SQLite metadata cache (`bridge.db`), and are completely isolated from client API calls and client reading progress.
+- **Background Sync Schedule**: Every 30 minutes (configurable via `SYNC_INTERVAL_MINUTES`), the proxy queries Grimmory for updated books, page counts, and series and reconciles them in SQLite.
 - **Sub-Second Response**: Complex queries (`GET /api/v1/series`, `POST /api/v1/series/list`, `GET /api/v1/books`, `POST /api/v1/books/list`) query indexed SQLite tables, eliminating latency.
 
 ### Full-Text Search & Complex Filter Conditions

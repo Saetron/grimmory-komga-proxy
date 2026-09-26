@@ -79,14 +79,17 @@ docker run -d \
 | Variable | Default | Description |
 | :--- | :--- | :--- |
 | `GRIMMORY_URL` | `http://localhost:8080` | URL of your Grimmory instance (without trailing slash) |
+| `SYNC_USERNAME` | *(empty)* | **Dedicated username for background sync** (e.g. an admin account with access to all libraries to cache series/books). Strictly isolated from client reading sessions. |
+| `SYNC_PASSWORD` | *(empty)* | **Dedicated password for background sync**. Strictly isolated from client reading sessions. |
+| `SYNC_INTERVAL_MINUTES` | `30` | Interval in minutes between background metadata sync cycles (`0` to disable periodic sync) |
+| `SYNC_ON_STARTUP` | `true` | Whether to trigger a background sync on startup |
+| `SYNC_CONCURRENCY` | `6` | Concurrency limit for background series/book page inspection |
 | `DATABASE_PATH` | `/app/data/bridge.db` | Path to persistent SQLite cache database |
-| `THUMBNAIL_DIR` | `/app/data/thumbnails` | Path to disk cache for cover thumbnails |
+| `THUMBNAILS_DIR` | `/app/data/thumbnails` | Path to disk cache for cover thumbnails |
 | `PORT` | `8080` | Port the proxy listens on inside the container |
 | `HOST` | `0.0.0.0` | Bind host address |
 | `CACHE_TTL` | `300` | TTL in seconds for in-memory page metadata caches |
 | `LOG_LEVEL` | `info` | Logging verbosity (`debug`, `info`, `warning`, `error`) |
-| `GRIMMORY_USERNAME` | *(empty)* | Optional default username fallback if client doesn't send Basic Auth |
-| `GRIMMORY_PASSWORD` | *(empty)* | Optional default password fallback |
 
 ---
 

@@ -67,6 +67,25 @@ class Settings:
     HOST: str = os.getenv("HOST", "0.0.0.0")
     PORT: int = int(os.getenv("PORT", "8080"))
     CACHE_TTL: int = int(os.getenv("CACHE_TTL", "300"))
+    # Dedicated background sync credentials (strictly isolated from client API sessions)
+    SYNC_USERNAME: str = (
+        os.getenv("SYNC_USERNAME")
+        or os.getenv("SYNC_USER")
+        or os.getenv("BACKGROUND_SYNC_USERNAME")
+        or os.getenv("BACKGROUND_SYNC_USER")
+        or os.getenv("GRIMMORY_SYNC_USERNAME")
+        or os.getenv("GRIMMORY_SYNC_USER")
+        or ""
+    )
+    SYNC_PASSWORD: str = (
+        os.getenv("SYNC_PASSWORD")
+        or os.getenv("SYNC_PASS")
+        or os.getenv("BACKGROUND_SYNC_PASSWORD")
+        or os.getenv("BACKGROUND_SYNC_PASS")
+        or os.getenv("GRIMMORY_SYNC_PASSWORD")
+        or os.getenv("GRIMMORY_SYNC_PASS")
+        or ""
+    )
     DEFAULT_USERNAME: str = (
         os.getenv("GRIMMORY_USERNAME")
         or os.getenv("GRIMMORY_USER")

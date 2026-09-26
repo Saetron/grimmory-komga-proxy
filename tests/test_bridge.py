@@ -2670,6 +2670,59 @@ def test_user_read_progress_ondeck_and_book_endpoint_isolation():
         assert not any(b["id"] == "702" for b in ondeck_b)
 
 
+@pytest.mark.anyio
+async def test_dedicated_sync_credentials_isolation():
+    """Verify SYNC_USERNAME and SYNC_PASSWORD are used exclusively by background sync and never for client requests."""
+    from app.config import settings
+    from app.sync_service import sync_service
+
+    old_sync_u = settings.SYNC_USERNAME
+    old_sync_p = settings.SYNC_PASSWORD
+    old_def_u = settings.DEFAULT_USERNAME
+    old_def_p = settings.DEFAULT_PASSWORD
+
+    try:
+        settings.SYNC_USERNAME = "dedicated_sync_admin"
+        settings.SYNC_PASSWORD = "secret_sync_pass"
+        settings.DEFAULT_USERNAME = ""
+        settings.DEFAULT_PASSWORD = ""
+
+        # 1. extract_credentials(None) MUST NOT return the sync credentials
+        u, p = grimmory_client.extract_credentials(None)
+        assert u == ""
+        assert p == ""
+
+        # 2. An unauthenticated request to /api/v2/users/me MUST NOT inherit sync credentials
+        resp_unauth = client.get("/api/v2/users/me")
+        assert resp_unauth.status_code == 401
+
+        # 3. sync_service.get_sync_credentials() returns the dedicated credentials
+        sync_u, sync_p = sync_service.get_sync_credentials()
+        assert sync_u == "dedicated_sync_admin"
+        assert sync_p == "secret_sync_pass"
+
+        # 4. sync_service.run_full_sync() uses dedicated sync credentials
+        synced_user = None
+        async def mock_get_libraries(user, pwd):
+            nonlocal synced_user
+            synced_user = user
+            return [{"id": "1", "name": "All Libraries"}]
+
+        with patch.object(grimmory_client, "get_libraries", side_effect=mock_get_libraries), \
+             patch.object(grimmory_client, "get_all_series", new_callable=AsyncMock, return_value=[]), \
+             patch.object(grimmory_client, "get_native_token", new_callable=AsyncMock, return_value="sync-token"):
+
+            stats = await sync_service.run_full_sync()
+            assert stats["status"] == "success"
+            assert synced_user == "dedicated_sync_admin"
+
+    finally:
+        settings.SYNC_USERNAME = old_sync_u
+        settings.SYNC_PASSWORD = old_sync_p
+        settings.DEFAULT_USERNAME = old_def_u
+        settings.DEFAULT_PASSWORD = old_def_p
+
+
 if __name__ == "__main__":
     pytest.main(["-v", __file__])
 
