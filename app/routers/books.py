@@ -494,18 +494,23 @@ async def get_book_page(
     raise HTTPException(status_code=404, detail="Page not found")
 
 
-@router.get("/{book_id}/file")
+@router.api_route("/{book_id}/file", methods=["GET", "HEAD"])
+@router.api_route("/{book_id}/file/{filename}", methods=["GET", "HEAD"])
 async def download_book_file(
     book_id: str,
+    filename: Optional[str] = None,
     authorization: Optional[str] = Header(None)
 ) -> Response:
+    import urllib.parse
     user, pwd = grimmory_client.extract_credentials(authorization)
-    book = await grimmory_client.get_book_dto(book_id, user, pwd)
+    clean_book_id = book_id.split("-")[-1] if "-standalone-" in book_id else book_id
+
+    book = await grimmory_client.get_book_dto(book_id, user, pwd) or await grimmory_client.get_book_dto(clean_book_id, user, pwd)
     ext = "cbz"
     m_type = "application/x-cbz"
-    name = f"book-{book_id}"
+    name = f"book-{clean_book_id}"
     if book:
-        name = book.get("name") or f"book-{book_id}"
+        name = book.get("name") or f"book-{clean_book_id}"
         media_type = str(book.get("media", {}).get("mediaType", "")).lower()
         if "epub" in media_type:
             ext = "epub"
@@ -517,8 +522,17 @@ async def download_book_file(
             ext = "cbr"
             m_type = "application/x-cbr"
 
-    safe_name = "".join(c for c in name if c.isalnum() or c in (" ", "-", "_", ".")).strip() or f"book-{book_id}"
-    filename = safe_name if safe_name.lower().endswith(f".{ext}") else f"{safe_name}.{ext}"
+    # Use provided filename if present, otherwise compute clean filename
+    if not filename:
+        safe_name = "".join(c for c in name if c.isalnum() or c in (" ", "-", "_", ".", "[", "]", "(", ")")).strip() or f"book-{clean_book_id}"
+        filename = safe_name if safe_name.lower().endswith(f".{ext}") else f"{safe_name}.{ext}"
+
+    # Generate RFC 6266 / RFC 5987 compliant Content-Disposition with both ASCII and UTF-8 filenames
+    ascii_safe = "".join(c for c in filename if c.isascii() and (c.isalnum() or c in (" ", "-", "_", "."))).strip() or f"book-{clean_book_id}.{ext}"
+    if not ascii_safe.lower().endswith(f".{ext}"):
+        ascii_safe = f"{ascii_safe}.{ext}"
+    encoded_utf8 = urllib.parse.quote(filename, encoding="utf-8")
+    content_disposition = f'attachment; filename="{ascii_safe}"; filename*=UTF-8\'\'{encoded_utf8}'
 
     def is_valid_file_response(resp: httpx.Response) -> bool:
         if resp.status_code != 200 or len(resp.content) == 0:
@@ -535,12 +549,12 @@ async def download_book_file(
     native_headers = await grimmory_client.get_native_headers(user, pwd)
     token = await grimmory_client.get_native_token(user, pwd)
     candidate_paths = [
-        f"/api/v1/books/{book_id}/content",
-        f"/api/v1/books/{book_id}/download",
-        f"/api/v1/app/books/{book_id}/file",
-        f"/api/v1/app/books/{book_id}/download",
-        f"/api/v1/books/{book_id}/files/primary",
-        f"/api/v1/app/books/{book_id}/files/primary",
+        f"/api/v1/books/{clean_book_id}/content",
+        f"/api/v1/books/{clean_book_id}/download",
+        f"/api/v1/app/books/{clean_book_id}/file",
+        f"/api/v1/app/books/{clean_book_id}/download",
+        f"/api/v1/books/{clean_book_id}/files/primary",
+        f"/api/v1/app/books/{clean_book_id}/files/primary",
     ]
     for path in candidate_paths:
         try:
@@ -550,16 +564,19 @@ async def download_book_file(
                 params={"token": token} if token else None
             )
             if is_valid_file_response(native_resp):
-                cd = native_resp.headers.get("Content-Disposition") or f'attachment; filename="{filename}"'
                 ct = native_resp.headers.get("Content-Type") or m_type
                 if "text/" in ct:
                     ct = m_type
-                return StreamingResponse(
-                    iter([native_resp.content]),
+                return Response(
+                    content=native_resp.content,
                     status_code=200,
+                    media_type=ct,
                     headers={
                         "Content-Type": ct,
-                        "Content-Disposition": cd
+                        "Content-Disposition": content_disposition,
+                        "Content-Length": str(len(native_resp.content)),
+                        "Accept-Ranges": "bytes",
+                        "Cache-Control": "private, max-age=3600"
                     }
                 )
         except Exception:

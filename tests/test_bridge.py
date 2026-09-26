@@ -2492,6 +2492,52 @@ def test_libraries_discovery_and_string_id_normalization():
         assert "99" in ids
 
 
+def test_download_book_content_disposition_and_url_format():
+    """Verify that book file downloads return proper Content-Disposition, and BookDto url contains extension."""
+    epub_book = {
+        "id": "10153",
+        "libraryId": "14",
+        "name": "[Oshi no Ko] Spica the First Star",
+        "media": {"mediaType": "application/epub+zip", "pagesCount": 200}
+    }
+    db.save_book(epub_book)
+
+    # 1. Verify BookDto url contains file extension and filename
+    resp_dto = client.get("/api/v1/books/10153", headers=AUTH_HEADER)
+    assert resp_dto.status_code == 200
+    dto_data = resp_dto.json()
+    assert dto_data["url"].endswith(".epub")
+    assert "[Oshi no Ko] Spica the First Star.epub" in dto_data["url"]
+
+    # 2. Verify GET /api/v1/books/{id}/file
+    fake_epub_content = b"PK\x03\x04oshi-no-ko-content"
+
+    async def mock_get(path, **kwargs):
+        if "/content" in path or "/download" in path or "/file" in path:
+            return httpx.Response(200, content=fake_epub_content, headers={"Content-Type": "application/epub+zip"})
+        return httpx.Response(404)
+
+    mock_client = AsyncMock()
+    mock_client.get = AsyncMock(side_effect=mock_get)
+
+    with patch.object(grimmory_client, "get_client", return_value=mock_client), \
+         patch.object(grimmory_client, "get_native_token", new_callable=AsyncMock, return_value="dummy-token"):
+        resp = client.get("/api/v1/books/10153/file", headers=AUTH_HEADER)
+        assert resp.status_code == 200
+        assert resp.content == fake_epub_content
+        cd = resp.headers.get("Content-Disposition", "")
+        # Must have both filename="..." for simple/iOS parsers and filename*=UTF-8''... for RFC 6266
+        assert 'filename="' in cd
+        assert 'filename*=' in cd
+        assert ".epub" in cd
+        assert resp.headers.get("Accept-Ranges") == "bytes"
+        assert resp.headers.get("Content-Length") == str(len(fake_epub_content))
+
+        # 3. Verify HEAD request also succeeds
+        resp_head = client.head("/api/v1/books/10153/file", headers=AUTH_HEADER)
+        assert resp_head.status_code == 200
+
+
 if __name__ == "__main__":
     pytest.main(["-v", __file__])
 

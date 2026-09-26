@@ -178,7 +178,15 @@ def ensure_book_dto(book: Dict[str, Any], user: Optional[str] = None) -> Dict[st
     book.setdefault("fileHash", "")
     book.setdefault("number", 1)
     book.setdefault("name", "Untitled")
-    book.setdefault("url", f"/api/v1/books/{book.get('id', '')}")
+    media = book.get("media") or {}
+    m_type = str(media.get("mediaType", "")).lower()
+    ext = "epub" if "epub" in m_type else "pdf" if "pdf" in m_type else "cbz"
+    b_name = book.get("name") or f"book-{book.get('id', '')}"
+    safe_name = "".join(c for c in b_name if c.isalnum() or c in (" ", "-", "_", ".", "[", "]", "(", ")")).strip() or f"book-{book.get('id', '')}"
+    if not safe_name.lower().endswith(f".{ext}"):
+        safe_name = f"{safe_name}.{ext}"
+    lib_id = str(book.get("libraryId", "1"))
+    book.setdefault("url", f"/books/{lib_id}/{safe_name}")
 
     # Fallback series info for standalone books (or books without a series)
     b_title = str(book.get("name") or (book.get("metadata") or {}).get("title") or f"Book {book.get('id', '0')}").strip()
@@ -409,13 +417,18 @@ def raw_app_book_to_dto(raw: Dict[str, Any], series_id_override: Optional[str] =
             "deviceName": "Komic"
         }
 
+    safe_title = "".join(c for c in title if c.isalnum() or c in (" ", "-", "_", ".", "[", "]", "(", ")")).strip() or f"book-{b_id}"
+    ext = "cbz" if file_type == "CBX" else "pdf" if file_type == "PDF" else "epub"
+    if not safe_title.lower().endswith(f".{ext}"):
+        safe_title = f"{safe_title}.{ext}"
+
     dto = {
         "id": b_id,
         "seriesId": series_id,
         "seriesTitle": series_name,
         "libraryId": lib_id,
         "name": title,
-        "url": f"/api/v1/books/{b_id}",
+        "url": f"/books/{lib_id}/{safe_title}",
         "number": int(num) if isinstance(num, (int, float)) and num == int(num) else num,
         "created": added_on,
         "lastModified": raw.get("coverUpdatedOn") or added_on,
