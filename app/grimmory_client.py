@@ -245,19 +245,35 @@ class GrimmoryClient:
         return self.get_basic_auth_header(user, pwd)
 
     async def get_libraries(self, user: str, pwd: str) -> List[Dict[str, Any]]:
-        """Fetch libraries via Grimmory native API."""
+        """Fetch libraries via Grimmory native API with token renewal and SQLite caching."""
         native_headers = await self.get_native_headers(user, pwd)
         for path in ["/api/v1/libraries", "/api/v1/app/libraries"]:
             try:
                 resp = await self.client.get(path, headers=native_headers)
+                if resp.status_code == 401:
+                    # Token may have expired, pop from cache and retry with fresh token
+                    cache_key = f"{user}:{pwd}"
+                    token_cache.pop(cache_key, None)
+                    native_headers = await self.get_native_headers(user, pwd)
+                    resp = await self.client.get(path, headers=native_headers)
+
                 if resp.status_code == 200:
                     data = resp.json()
-                    if isinstance(data, list):
-                        return data
-                    elif isinstance(data, dict) and "content" in data:
-                        return data["content"]
+                    raw_list = data if isinstance(data, list) else data.get("content", []) if isinstance(data, dict) else []
+                    if raw_list:
+                        from app.routers.libraries import ensure_library_dto
+                        dtos = [ensure_library_dto(l) for l in raw_list]
+                        db.save_libraries_batch(dtos)
+                        return dtos
             except Exception:
                 pass
+
+        # Fallback to SQLite cached libraries
+        db_libs = db.get_all_libraries()
+        if db_libs:
+            from app.routers.libraries import ensure_library_dto
+            return [ensure_library_dto(l) for l in db_libs]
+
         return []
 
     async def get_user_library_ids(self, user: str, pwd: str) -> Optional[Set[str]]:
@@ -270,8 +286,14 @@ class GrimmoryClient:
             libs = await self.get_libraries(user, pwd)
             if libs and isinstance(libs, list):
                 lib_ids = {str(lib.get("id")) for lib in libs if lib.get("id")}
-                self.user_libraries_cache[cache_key] = lib_ids
-                return lib_ids
+                if lib_ids:
+                    self.user_libraries_cache[cache_key] = lib_ids
+                    return lib_ids
+            # Also check DB
+            all_db_ids = db.get_all_library_ids()
+            if all_db_ids:
+                self.user_libraries_cache[cache_key] = all_db_ids
+                return all_db_ids
         except Exception:
             pass
 
@@ -1676,8 +1698,9 @@ class GrimmoryClient:
                     if b_id and b_id not in seen_book_ids and not self._is_book_finished(item, user=user):
                         dto = raw_app_book_to_dto(item)
                         if not self._is_book_finished(dto, user=user):
-                            if user_libs is None or str(dto.get("libraryId") or dto.get("library_id", "")) in user_libs:
-                                if not library_id or str(dto.get("libraryId") or dto.get("library_id")) == str(library_id):
+                            dto_lib = str(dto.get("libraryId") or dto.get("library_id") or "").strip()
+                            if user_libs is None or not dto_lib or dto_lib in user_libs:
+                                if not library_id or dto_lib == str(library_id):
                                     ondeck_books.append(dto)
                                     seen_book_ids.add(b_id)
         except Exception:
@@ -1690,8 +1713,9 @@ class GrimmoryClient:
                 if str(b_id) not in seen_book_ids and not prog.get("completed"):
                     cached_b = await self.get_book_dto(str(b_id), user, pwd)
                     if cached_b and not self._is_book_finished(cached_b, user=user):
-                        if user_libs is None or str(cached_b.get("libraryId") or cached_b.get("library_id", "")) in user_libs:
-                            if not library_id or str(cached_b.get("libraryId") or cached_b.get("library_id")) == str(library_id):
+                        b_lib = str(cached_b.get("libraryId") or cached_b.get("library_id") or "").strip()
+                        if user_libs is None or not b_lib or b_lib in user_libs:
+                            if not library_id or b_lib == str(library_id):
                                 ondeck_books.append(cached_b)
                                 seen_book_ids.add(str(b_id))
         except Exception:
@@ -1711,8 +1735,9 @@ class GrimmoryClient:
             if b_id not in seen_book_ids:
                 cached_b = await self.get_book_dto(b_id, user, pwd)
                 if cached_b and not self._is_book_finished(cached_b, user=user):
-                    if user_libs is None or str(cached_b.get("libraryId") or cached_b.get("library_id", "")) in user_libs:
-                        if not library_id or str(cached_b.get("libraryId") or cached_b.get("library_id")) == str(library_id):
+                    b_lib = str(cached_b.get("libraryId") or cached_b.get("library_id") or "").strip()
+                    if user_libs is None or not b_lib or b_lib in user_libs:
+                        if not library_id or b_lib == str(library_id):
                             ondeck_books.append(cached_b)
                             seen_book_ids.add(b_id)
 
@@ -1804,11 +1829,10 @@ class GrimmoryClient:
         user_libs = await self.get_user_library_ids(user, pwd)
         valid_released_books = []
         for b in candidate_books:
-            if user_libs is not None and str(b.get("libraryId") or b.get("library_id", "")) in user_libs:
-                pass
-            elif user_libs is not None:
+            b_lib = str(b.get("libraryId") or b.get("library_id") or "").strip()
+            if user_libs is not None and b_lib and b_lib not in user_libs:
                 continue
-            if library_id and str(b.get("libraryId") or b.get("library_id")) != str(library_id):
+            if library_id and b_lib != str(library_id):
                 continue
             rd = b.get("metadata", {}).get("releaseDate")
             if rd and str(rd).strip() not in ("", "null", "None"):
@@ -1849,7 +1873,11 @@ class GrimmoryClient:
         if db_books:
             user_libs = await self.get_user_library_ids(user, pwd)
             if user_libs is not None:
-                db_books = [b for b in db_books if str(b.get("libraryId") or b.get("library_id", "")) in user_libs]
+                db_books = [
+                    b for b in db_books
+                    if not (b.get("libraryId") or b.get("library_id"))
+                    or str(b.get("libraryId") or b.get("library_id")) in user_libs
+                ]
             total = len(db_books)
             start = page * size
             page_items = db_books[start:start + size]
@@ -1874,7 +1902,8 @@ class GrimmoryClient:
                     if user_libs is not None:
                         raw_books = [
                             b for b in raw_books
-                            if str(b.get("libraryId") or b.get("library_id", "")) in user_libs
+                            if not (b.get("libraryId") or b.get("library_id"))
+                            or str(b.get("libraryId") or b.get("library_id")) in user_libs
                         ]
                     if library_id:
                         raw_books = [
@@ -1927,7 +1956,11 @@ class GrimmoryClient:
 
         user_libs = await self.get_user_library_ids(user, pwd)
         if user_libs is not None:
-            all_series = [s for s in all_series if str(s.get("libraryId") or s.get("library_id", "")) in user_libs]
+            all_series = [
+                s for s in all_series
+                if not (s.get("libraryId") or s.get("library_id"))
+                or str(s.get("libraryId") or s.get("library_id")) in user_libs
+            ]
 
         recent_series_names = []
         recent_books = db.get_latest_books(library_id=library_id, limit=200)
@@ -2004,7 +2037,11 @@ class GrimmoryClient:
 
         user_libs = await self.get_user_library_ids(user, pwd)
         if user_libs is not None:
-            all_series = [s for s in all_series if str(s.get("libraryId") or s.get("library_id", "")) in user_libs]
+            all_series = [
+                s for s in all_series
+                if not (s.get("libraryId") or s.get("library_id"))
+                or str(s.get("libraryId") or s.get("library_id")) in user_libs
+            ]
 
         self.all_series_cache[cache_key] = all_series
         return all_series
@@ -2034,7 +2071,11 @@ class GrimmoryClient:
 
         user_libs = await self.get_user_library_ids(user, pwd)
         if user_libs is not None:
-            matching = [s for s in matching if str(s.get("libraryId") or s.get("library_id", "")) in user_libs]
+            matching = [
+                s for s in matching
+                if not (s.get("libraryId") or s.get("library_id"))
+                or str(s.get("libraryId") or s.get("library_id")) in user_libs
+            ]
 
         # If DB had no matches, only then try upstream Grimmory series
         if not matching:
@@ -2044,7 +2085,11 @@ class GrimmoryClient:
                 if q_lower in (s.get("name") or "").lower() or q_lower in (s.get("metadata", {}).get("title") or "").lower()
             ]
             if user_libs is not None:
-                matching = [s for s in matching if str(s.get("libraryId") or s.get("library_id", "")) in user_libs]
+                matching = [
+                    s for s in matching
+                    if not (s.get("libraryId") or s.get("library_id"))
+                    or str(s.get("libraryId") or s.get("library_id")) in user_libs
+                ]
 
         total = len(matching)
         start = page * size
@@ -2111,7 +2156,8 @@ class GrimmoryClient:
         if user_libs is not None:
             matching_books = [
                 b for b in matching_books
-                if str(b.get("libraryId") or b.get("library_id", "")) in user_libs
+                if not (b.get("libraryId") or b.get("library_id"))
+                or str(b.get("libraryId") or b.get("library_id")) in user_libs
             ]
 
         total = len(matching_books)

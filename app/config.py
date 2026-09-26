@@ -45,6 +45,23 @@ def parse_user_mappings(raw_str: str) -> Dict[str, Tuple[str, str]]:
             mappings[parts[0].strip()] = (parts[1].strip(), parts[2].strip())
     return mappings
 
+def parse_library_mappings(raw_str: str) -> Dict[str, str]:
+    """Parse LIBRARIES / LIBRARY_MAP env var e.g. '14:Manga,16:Comics,25:Novels'."""
+    mappings: Dict[str, str] = {}
+    if not raw_str or not raw_str.strip():
+        return mappings
+    for entry in raw_str.split(","):
+        entry = entry.strip()
+        if not entry:
+            continue
+        if ":" in entry:
+            k, v = entry.split(":", 1)
+            mappings[k.strip()] = v.strip()
+        elif "=" in entry:
+            k, v = entry.split("=", 1)
+            mappings[k.strip()] = v.strip()
+    return mappings
+
 class Settings:
     GRIMMORY_URL: str = os.getenv("GRIMMORY_URL", "http://localhost:8080").rstrip("/")
     HOST: str = os.getenv("HOST", "0.0.0.0")
@@ -68,6 +85,9 @@ class Settings:
     )
     USER_MAPPINGS: Dict[str, Tuple[str, str]] = parse_user_mappings(
         os.getenv("USER_MAPPING") or os.getenv("USER_MAPPINGS") or os.getenv("USER_MAP") or ""
+    )
+    CUSTOM_LIBRARY_NAMES: Dict[str, str] = parse_library_mappings(
+        os.getenv("LIBRARIES") or os.getenv("LIBRARY_MAP") or os.getenv("CUSTOM_LIBRARIES") or ""
     )
     LOG_LEVEL: str = os.getenv("LOG_LEVEL", "info")
     DATA_DIR: str = os.getenv("DATA_DIR", "data")

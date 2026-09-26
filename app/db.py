@@ -130,6 +130,14 @@ class Database:
                 );
                 CREATE INDEX IF NOT EXISTS idx_read_progress_user ON read_progress (user);
                 CREATE INDEX IF NOT EXISTS idx_read_progress_completed ON read_progress (user, completed);
+
+                CREATE TABLE IF NOT EXISTS libraries (
+                    id TEXT PRIMARY KEY,
+                    name TEXT,
+                    dto_json TEXT,
+                    updated_at REAL
+                );
+                CREATE INDEX IF NOT EXISTS idx_libraries_name ON libraries (name);
             """)
 
     # --- Private Helpers ---
@@ -192,6 +200,107 @@ class Database:
             query += f" ORDER BY {order_by}"
 
         return conn.execute(query, params).fetchall()
+
+    # --- Library Operations ---
+    def save_library(self, lib: Dict[str, Any]) -> None:
+        lib_id = str(lib.get("id", ""))
+        if not lib_id:
+            return
+        name = str(lib.get("name") or f"Library {lib_id}")
+        now = time.time()
+        with self._get_connection() as conn:
+            conn.execute(
+                """
+                INSERT INTO libraries (id, name, dto_json, updated_at)
+                VALUES (?, ?, ?, ?)
+                ON CONFLICT(id) DO UPDATE SET
+                    name = excluded.name,
+                    dto_json = excluded.dto_json,
+                    updated_at = excluded.updated_at
+                """,
+                (lib_id, name, json.dumps(lib), now)
+            )
+
+    def save_libraries_batch(self, libs: List[Dict[str, Any]]) -> None:
+        if not libs:
+            return
+        now = time.time()
+        rows = []
+        for lib in libs:
+            lib_id = str(lib.get("id", ""))
+            if not lib_id:
+                continue
+            name = str(lib.get("name") or f"Library {lib_id}")
+            rows.append((lib_id, name, json.dumps(lib), now))
+        if not rows:
+            return
+        with self._get_connection() as conn:
+            conn.executemany(
+                """
+                INSERT INTO libraries (id, name, dto_json, updated_at)
+                VALUES (?, ?, ?, ?)
+                ON CONFLICT(id) DO UPDATE SET
+                    name = excluded.name,
+                    dto_json = excluded.dto_json,
+                    updated_at = excluded.updated_at
+                """,
+                rows
+            )
+
+    def get_library(self, lib_id: str) -> Optional[Dict[str, Any]]:
+        with self._get_connection() as conn:
+            row = conn.execute("SELECT dto_json FROM libraries WHERE id = ?", (str(lib_id),)).fetchone()
+            if row:
+                try:
+                    return json.loads(row["dto_json"])
+                except Exception:
+                    pass
+            row_chk = conn.execute(
+                "SELECT 1 FROM books WHERE library_id = ? UNION SELECT 1 FROM series WHERE library_id = ?",
+                (str(lib_id), str(lib_id))
+            ).fetchone()
+            if row_chk:
+                name = settings.CUSTOM_LIBRARY_NAMES.get(str(lib_id), f"Library {lib_id}")
+                return {"id": str(lib_id), "name": name}
+        return None
+
+    def get_all_libraries(self) -> List[Dict[str, Any]]:
+        with self._get_connection() as conn:
+            cursor = conn.execute("SELECT dto_json FROM libraries ORDER BY name ASC, id ASC")
+            libs = []
+            for row in cursor.fetchall():
+                try:
+                    libs.append(json.loads(row["dto_json"]))
+                except Exception:
+                    pass
+            existing_ids = {str(l.get("id")) for l in libs if l.get("id")}
+            cursor = conn.execute(
+                """
+                SELECT DISTINCT library_id FROM books WHERE library_id IS NOT NULL AND library_id != ''
+                UNION
+                SELECT DISTINCT library_id FROM series WHERE library_id IS NOT NULL AND library_id != ''
+                """
+            )
+            for row in cursor.fetchall():
+                l_id = str(row["library_id"])
+                if l_id and l_id not in existing_ids:
+                    name = settings.CUSTOM_LIBRARY_NAMES.get(l_id, f"Library {l_id}")
+                    libs.append({"id": l_id, "name": name})
+                    existing_ids.add(l_id)
+            return libs
+
+    def get_all_library_ids(self) -> Set[str]:
+        with self._get_connection() as conn:
+            cursor = conn.execute(
+                """
+                SELECT id FROM libraries
+                UNION
+                SELECT DISTINCT library_id FROM books WHERE library_id IS NOT NULL AND library_id != ''
+                UNION
+                SELECT DISTINCT library_id FROM series WHERE library_id IS NOT NULL AND library_id != ''
+                """
+            )
+            return {str(r[0]) for r in cursor.fetchall() if r[0]}
 
     # --- Series Operations ---
     def _extract_series_fields(self, s: Dict[str, Any]) -> tuple:
@@ -559,6 +668,7 @@ class Database:
                 DELETE FROM books;
                 DELETE FROM book_pages;
                 DELETE FROM read_progress;
+                DELETE FROM libraries;
             """)
 
 db = Database()

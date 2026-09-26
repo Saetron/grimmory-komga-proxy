@@ -2462,6 +2462,36 @@ def test_book_pagination_and_sorting_deterministic():
         assert post_ids == [f"sort-book-{i:02d}" for i in reversed(range(5, 10))]
 
 
+def test_libraries_discovery_and_string_id_normalization():
+    """Verify that integer library IDs from Grimmory are converted to string IDs, and fallback discovery works."""
+    raw_grimmory_libs = [
+        {"id": 14, "name": "Manga"},
+        {"id": 16, "name": "Comics"},
+    ]
+    with patch.object(grimmory_client, "get_native_token", new_callable=AsyncMock, return_value="fake-token"), \
+         patch.object(grimmory_client, "get_libraries", new_callable=AsyncMock, return_value=raw_grimmory_libs):
+        resp = client.get("/api/v1/libraries", headers=AUTH_HEADER)
+        assert resp.status_code == 200
+        libs = resp.json()
+        assert len(libs) >= 2
+        for lib in libs:
+            # Swift Codable strict type requirement: id MUST be String
+            assert isinstance(lib["id"], str)
+            assert isinstance(lib["name"], str)
+            assert isinstance(lib["unavailable"], bool)
+            assert isinstance(lib["scanInterval"], str)
+
+    # Test auto-discovery from books/series when Grimmory returns empty
+    db.save_series({"id": "s-discovered", "libraryId": "99", "name": "Auto Discovered Series"})
+    with patch.object(grimmory_client, "get_native_token", new_callable=AsyncMock, return_value="fake-token"), \
+         patch.object(grimmory_client, "get_libraries", new_callable=AsyncMock, return_value=[]):
+        resp_fallback = client.get("/api/v1/libraries", headers=AUTH_HEADER)
+        assert resp_fallback.status_code == 200
+        fallback_libs = resp_fallback.json()
+        ids = [l["id"] for l in fallback_libs]
+        assert "99" in ids
+
+
 if __name__ == "__main__":
     pytest.main(["-v", __file__])
 

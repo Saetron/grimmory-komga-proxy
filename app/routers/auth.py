@@ -38,13 +38,21 @@ async def get_current_user(authorization: Optional[str] = Header(None)) -> Dict[
             headers={"WWW-Authenticate": "Basic realm=\"Komga\""}
         )
 
+    from app.db import db
+    user_libs = await grimmory_client.get_user_library_ids(user, pwd)
+    all_known_lib_ids = set()
+    if user_libs:
+        all_known_lib_ids.update(user_libs)
+    all_known_lib_ids.update(db.get_all_library_ids())
+    if not all_known_lib_ids:
+        all_known_lib_ids.add("1")
+
     data = {
         "id": user,
         "email": f"{user}@grimmory.local" if "@" not in user else user,
         "roles": ["ROLE_ADMIN", "ROLE_FILE_DOWNLOAD", "ROLE_PAGE_STREAMING", "USER", "ADMIN", "FILE_DOWNLOAD", "PAGE_STREAMING"],
         "sharedAllLibraries": True,
-        "sharedLibrariesIds": [],
-        "sharedLibrariesExcludedIds": [],
+        "sharedLibrariesIds": sorted(list(all_known_lib_ids)),
         "labelsAllow": [],
         "labelsExclude": [],
         "ageRestriction": None
@@ -60,10 +68,6 @@ async def get_current_user(authorization: Optional[str] = Header(None)) -> Dict[
         if standard_role not in roles:
             roles.append(standard_role)
     data["roles"] = roles
-
-    user_libs = await grimmory_client.get_user_library_ids(user, pwd)
-    if user_libs:
-        data["sharedLibrariesIds"] = sorted(list(user_libs))
 
     return data
 
