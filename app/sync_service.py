@@ -88,63 +88,19 @@ class SyncService:
                 self.last_sync_stats = stats
                 return stats
 
-            # 3. Sync all series from Grimmory (Komga + custom disambiguated)
-            await grimmory_client.fetch_and_cache_native_books(user, pwd)
+            # 3. Sync all series and books from Grimmory catalog in bulk (pure metadata, zero archive unpacking)
+            all_books = await grimmory_client.fetch_and_cache_native_books(user, pwd)
             all_series = await grimmory_client.get_all_series(user, pwd)
             stats["seriesCount"] = len(all_series)
             if all_series:
                 db.save_series_batch(all_series)
-            logger.info(f"[BackgroundSync] Validated {len(all_series)} series from Grimmory.")
 
-            # 3. For each series, validate and sync books & page counts concurrently
-            total_books_synced = 0
-            completed_series_count = 0
-            total_series = len(all_series)
-            concurrency = max(1, settings.SYNC_CONCURRENCY)
-            sem = asyncio.Semaphore(concurrency)
-            lock = asyncio.Lock()
-
-            async def _sync_single_series(idx: int, s: Dict[str, Any]):
-                nonlocal total_books_synced, completed_series_count
-                async with sem:
-                    if self._stop_event.is_set():
-                        return
-                    s_id = str(s.get("id"))
-                    s_name = s.get("name") or s.get("metadata", {}).get("title") or s_id
-                    try:
-                        series_books = await grimmory_client.get_series_books_custom(s_id, user, pwd)
-                        if not series_books:
-                            series_books = db.get_books_by_series(s_id)
-
-                        if series_books:
-                            await grimmory_client.enrich_books_page_count(series_books, user, pwd)
-                            for b in series_books:
-                                ensure_book_dto(b)
-                            db.save_books_batch(series_books, save_progress=False)
-
-                        async with lock:
-                            completed_series_count += 1
-                            total_books_synced += len(series_books)
-                            pct = int((completed_series_count / total_series) * 100) if total_series > 0 else 100
-                            logger.info(
-                                f"[BackgroundSync] Progress: [{completed_series_count}/{total_series}] ({pct}%) "
-                                f"- Synced series '{s_name}' ({len(series_books)} books, total books: {total_books_synced})"
-                            )
-                    except Exception as err:
-                        async with lock:
-                            completed_series_count += 1
-                            pct = int((completed_series_count / total_series) * 100) if total_series > 0 else 100
-                            logger.warning(
-                                f"[BackgroundSync] Progress: [{completed_series_count}/{total_series}] ({pct}%) "
-                                f"- Error syncing series '{s_name}': {err}"
-                            )
-
-            if all_series:
-                logger.info(f"[BackgroundSync] Starting concurrent sync of {total_series} series with concurrency={concurrency}...")
-                await asyncio.gather(*[_sync_single_series(i, s) for i, s in enumerate(all_series, start=1)], return_exceptions=True)
-
+            total_books_synced = len(all_books) if all_books else len(db.get_all_books())
             stats["booksCount"] = total_books_synced
-            logger.info(f"[BackgroundSync] Validated {total_books_synced} books across all series.")
+            logger.info(
+                f"[BackgroundSync] Bulk catalog sync complete: {stats['seriesCount']} series and "
+                f"{total_books_synced} books indexed into SQLite without unpacking archive files."
+            )
 
             # 4. Sync Read Progress for All Logged-in Users
             user_sync_stats = await self.sync_all_users_reading_state()

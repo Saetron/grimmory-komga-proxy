@@ -679,8 +679,8 @@ class GrimmoryClient:
             pass
         return pages
 
-    async def get_book_page_count(self, book_id: str, user: str, pwd: str) -> int:
-        """Get the page count for a book, using cache or querying Grimmory endpoints."""
+    async def get_book_page_count(self, book_id: str, user: str, pwd: str, allow_unpack: bool = True) -> int:
+        """Get the page count for a book, using metadata first and archive unpack only if allowed."""
         if book_id in page_count_cache:
             return page_count_cache[book_id]
         if book_id in page_cache and len(page_cache[book_id]) > 0:
@@ -693,62 +693,17 @@ class GrimmoryClient:
             page_count_cache[book_id] = db_count
             return db_count
 
+        # Check existing book record in DB
+        db_b = db.get_book(book_id)
+        if db_b:
+            m_pc = (db_b.get("media") or {}).get("pagesCount", 0)
+            if isinstance(m_pc, int) and m_pc > 1:
+                page_count_cache[book_id] = m_pc
+                return m_pc
+
         native_headers = await self.get_native_headers(user, pwd)
 
-        # 1. Try CBX pages: /api/v1/cbx/{book_id}/pages returns [1, 2, ...]
-        try:
-            resp = await self.client.get(f"/api/v1/cbx/{book_id}/pages", headers=native_headers)
-            if resp.status_code == 200:
-                data = resp.json()
-                if isinstance(data, list) and len(data) > 0:
-                    count = len(data)
-                    page_count_cache[book_id] = count
-                    return count
-        except Exception:
-            pass
-
-        # 2. Try CBX page-dimensions
-        try:
-            resp = await self.client.get(f"/api/v1/cbx/{book_id}/page-dimensions", headers=native_headers)
-            if resp.status_code == 200:
-                data = resp.json()
-                if isinstance(data, list) and len(data) > 0:
-                    count = len(data)
-                    page_count_cache[book_id] = count
-                    return count
-        except Exception:
-            pass
-
-        # 3. Try PDF pages: /api/v1/pdf/{book_id}/pages
-        try:
-            resp = await self.client.get(f"/api/v1/pdf/{book_id}/pages", headers=native_headers)
-            if resp.status_code == 200:
-                data = resp.json()
-                count = data if isinstance(data, int) else len(data) if isinstance(data, list) else 0
-                if count > 0:
-                    page_count_cache[book_id] = count
-                    return count
-        except Exception:
-            pass
-
-        # 4. Try EPUB pages/chapters/spine: /api/v1/epub/{book_id}/pages, /chapters, /spine
-        for epub_path in [
-            f"/api/v1/epub/{book_id}/pages",
-            f"/api/v1/epub/{book_id}/chapters",
-            f"/api/v1/epub/{book_id}/spine"
-        ]:
-            try:
-                resp = await self.client.get(epub_path, headers=native_headers)
-                if resp.status_code == 200:
-                    data = resp.json()
-                    count = data if isinstance(data, int) else len(data) if isinstance(data, list) else 0
-                    if count > 0:
-                        page_count_cache[book_id] = count
-                        return count
-            except Exception:
-                pass
-
-        # 5. Try native app book info: /api/v1/app/books/{book_id}
+        # 1. Try native app book info: /api/v1/app/books/{book_id} (pure DB query, ZERO archive unpacking)
         try:
             resp = await self.client.get(f"/api/v1/app/books/{book_id}", headers=native_headers)
             if resp.status_code == 200:
@@ -779,8 +734,7 @@ class GrimmoryClient:
         except Exception:
             pass
 
-
-        # 7. Check if cached book or DB has sizeBytes and is EPUB
+        # 2. Check if cached book or DB has sizeBytes and is EPUB
         if book_id in book_cache:
             b = book_cache[book_id]
             m_type = str(b.get("media", {}).get("mediaType", "")).lower()
@@ -792,7 +746,6 @@ class GrimmoryClient:
                     page_count_cache[book_id] = calc
                     return calc
 
-        db_b = db.get_book(book_id)
         if db_b:
             m_type = str(db_b.get("media", {}).get("mediaType", "")).lower()
             if "epub" in m_type:
@@ -803,10 +756,45 @@ class GrimmoryClient:
                     page_count_cache[book_id] = calc
                     return calc
 
+        # 3. If allowed, query archive endpoints
+        if allow_unpack:
+            try:
+                resp = await self.client.get(f"/api/v1/cbx/{book_id}/pages", headers=native_headers)
+                if resp.status_code == 200:
+                    data = resp.json()
+                    if isinstance(data, list) and len(data) > 0:
+                        count = len(data)
+                        page_count_cache[book_id] = count
+                        return count
+            except Exception:
+                pass
+
+            try:
+                resp = await self.client.get(f"/api/v1/cbx/{book_id}/page-dimensions", headers=native_headers)
+                if resp.status_code == 200:
+                    data = resp.json()
+                    if isinstance(data, list) and len(data) > 0:
+                        count = len(data)
+                        page_count_cache[book_id] = count
+                        return count
+            except Exception:
+                pass
+
+            try:
+                resp = await self.client.get(f"/api/v1/pdf/{book_id}/pages", headers=native_headers)
+                if resp.status_code == 200:
+                    data = resp.json()
+                    count = data if isinstance(data, int) else len(data) if isinstance(data, list) else 0
+                    if count > 0:
+                        page_count_cache[book_id] = count
+                        return count
+            except Exception:
+                pass
+
         return 1
 
-    async def enrich_books_page_count(self, books: List[Dict[str, Any]], user: str, pwd: str) -> None:
-        """Concurrently populate accurate pagesCount and readProgress for a list of book DTOs."""
+    async def enrich_books_page_count(self, books: List[Dict[str, Any]], user: str, pwd: str, allow_unpack: bool = True) -> None:
+        """Concurrently populate accurate pagesCount and readProgress for a list of book DTOs without unpacking archives."""
         if not books:
             return
 
@@ -816,7 +804,7 @@ class GrimmoryClient:
             book_id = str(book.get("id"))
             if not book_id or book_id == "None":
                 return
-            count = await self.get_book_page_count(book_id, user, pwd)
+            count = await self.get_book_page_count(book_id, user, pwd, allow_unpack=allow_unpack)
             if "media" not in book or not isinstance(book["media"], dict):
                 book["media"] = {"status": "READY", "mediaType": "application/x-cbz", "mediaProfile": "DIVINA"}
             if count > 0:

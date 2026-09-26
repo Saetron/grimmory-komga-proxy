@@ -1473,6 +1473,10 @@ async def test_sync_service_full_sync():
         assert cached_books[0]["id"] == "sync-b-1"
         assert cached_books[1]["id"] == "sync-b-2"
 
+        # Verify that background sync NEVER called archive-extracting endpoints (/cbx/.../pages)
+        requested_urls = [call.args[0] for call in mock_client.get.call_args_list if call.args]
+        assert not any("/cbx/" in url and "/pages" in url for url in requested_urls)
+
         # Verify read progress is stored in SQLite DB
         prog = db.get_read_progress("testuser", "sync-b-1")
         assert prog is not None

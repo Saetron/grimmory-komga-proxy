@@ -100,7 +100,8 @@ Komic and other native iOS apps are written in Swift using `Codable` structs:
 
 ### Persistent Caching & Background Sync
 - **Dedicated Sync Account**: The background sync service uses `SYNC_USERNAME` and `SYNC_PASSWORD` to populate `bridge.db`.
-- **Background Sync Schedule**: Every 30 minutes (configurable via `SYNC_INTERVAL_MINUTES`), the proxy queries Grimmory for updated books, page counts, and series and reconciles them in SQLite.
+- **Zero-Unpack Catalog Sync (SSD Protection)**: The background sync leverages Grimmory's bulk metadata endpoint `/api/v1/app/books?size=1000` to ingest all series, books, file sizes, and metadata directly from Grimmory's database in seconds. It strictly avoids invoking archive inspection endpoints (`/api/v1/cbx/{id}/pages` or `/page-dimensions`) during background sync, completely eliminating archive unzipping into temporary cache directories and preventing premature SSD wear.
+- **Background Sync Schedule**: Every 30 minutes (configurable via `SYNC_INTERVAL_MINUTES`), the proxy queries Grimmory for updated books and series, reconciling them in SQLite.
 - **Sub-Second Response**: Complex queries (`GET /api/v1/series`, `POST /api/v1/series/list`, `GET /api/v1/books`, `POST /api/v1/books/list`) query indexed SQLite tables, eliminating latency.
 
 ### Series Naming & Book Disambiguation (Preventing "Book XXXXX" Fallback)
@@ -118,8 +119,10 @@ Books in Grimmory that do not belong to an official series are automatically wra
 ## 5. Page Streaming & Aspect Ratio Synthesizer
 
 For comic and manga readers (CBZ, CBR, PDF):
-1. **Page Metadata (`GET /api/v1/books/{id}/pages`)**:
+1. **Lazy Page Metadata (`GET /api/v1/books/{id}/pages`)**:
+   - Page dimensions and counts are extracted **on-demand** only when a user actually opens a comic to read it.
    - Queries Grimmory's `/api/v1/cbx/{id}/page-dimensions` to obtain the exact pixel dimensions (`width`, `height`) of every page.
+   - Results are cached in memory and in SQLite (`media.pagesCount`) so that subsequent reads and client requests never trigger duplicate archive extractions.
    - Synthesizes an array of `PageDto` objects with accurate `mediaType`, page numbers, and dimensions.
 2. **Page Image Streaming (`GET /api/v1/books/{id}/pages/{pageNumber}`)**:
    - Fetches the raw image from Grimmory's `/api/v1/cbx/{id}/page/{pageNumber}` or `/api/v1/pdf/{id}/page/{pageNumber}`.
